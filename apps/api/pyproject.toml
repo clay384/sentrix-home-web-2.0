@@ -39,6 +39,10 @@ dependencies = [
     # 纯 CPU 部署是合法形态，但要**显式**声明：``FACE_PROVIDERS=CPUExecutionProvider``
     # （``RETINAFACE_PROVIDERS`` 同）。
     "onnxruntime-gpu==1.30.0",
+    # insightface 只约束 ``onnxruntime>=x``,解析器会拉最新版把命名空间覆盖成 1.31——
+    # 「两个都钉同一个版本」的设计(见上)要求 CPU 版同样钉死,否则 face_provider_guard
+    # 的「修复命令版本号 == pyproject pin」用例当场红(2026-10-23 uv 实测)。
+    "onnxruntime==1.30.0",
     "insightface==1.0.1",
     # headless：服务端不装 GUI 那份，1.0 两份都装了是因为它还要在开发机上跑预览。
     "opencv-python-headless>=4.10,<6",
