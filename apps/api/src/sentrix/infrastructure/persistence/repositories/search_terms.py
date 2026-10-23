@@ -154,11 +154,18 @@ class SqliteLexicalIndex:
         if asset is None:
             return ()
         place = self._places.get(observation.asset_id)
-        return anchor_terms(
+        terms = anchor_terms(
             file_name=asset.file_name,
             captured_at=asset.captured_at.isoformat() if asset.captured_at else "",
             place_text=place.searchable_text() if place is not None else "",
         )
+        if asset.source_location:
+            terms += (
+                AnchorTerm(
+                    "source_location", normalize_text(asset.source_location), "imported_source_metadata", 1.0
+                ),
+            )
+        return terms
 
     def rebuild_scope(self, scope_id: str) -> int:
         """按 scope 重建。**先按 scope 删**，不清整表。

@@ -94,6 +94,7 @@ from sentrix.infrastructure.media.svd_scene_planner import SVDLowRankScenePlanne
 from sentrix.infrastructure.media.video_keyframes import FfmpegVideoKeyframeExtractor
 from sentrix.infrastructure.media.video_metadata import FfprobeVideoMetadataReader
 from sentrix.infrastructure.media.video_transcode import FfmpegVideoTranscoder
+from sentrix.infrastructure.media.visual_provenance import configure_visual_provenance
 from sentrix.infrastructure.media.vlm_observer import OpenAIVlmObserver
 from sentrix.infrastructure.models.face_adapter import FaceAdapter
 from sentrix.infrastructure.models.face_detector import RetinaFaceTiledDetector
@@ -258,6 +259,7 @@ class Container:
 
     @classmethod
     def build(cls, settings: Settings) -> Container:
+        configure_visual_provenance(settings.visual_source_manifest)
         video_algorithm = os.getenv("SENTRIX_VIDEO_KEYFRAME_ALGORITHM", "window").strip().lower()
         video_scene_planner = None
         if video_algorithm == "svd_lowrank":
@@ -368,6 +370,8 @@ class Container:
                 settings.vlm_base_url,
                 served_model,
                 timeout_s=settings.vlm_timeout_s,
+                output_tokens=settings.vlm_output_tokens,
+                enable_thinking=settings.vlm_enable_thinking,
             ),
             person_crop_renderer=PillowPersonCropRenderer(),
             person_preview_renderer=PillowPersonPreviewRenderer(),
@@ -381,16 +385,21 @@ class Container:
                 timeout_s=settings.chat_timeout_s,
                 # 端点自报的窗口优先；它没报（探测失败）才用配置值。
                 context_tokens=served_context or settings.vlm_context_tokens,
+                output_tokens=settings.chat_output_tokens,
             ),
             vlm_observer=OpenAIVlmObserver(
                 settings.vlm_base_url,
                 served_model,
                 timeout_s=settings.vlm_timeout_s,
+                output_tokens=settings.vlm_output_tokens,
+                enable_thinking=settings.vlm_enable_thinking,
             ),
             photo_inspector=OpenAIPhotoInspector(
                 settings.vlm_base_url,
                 served_model,
                 timeout_s=settings.vlm_timeout_s,
+                output_tokens=settings.vlm_output_tokens,
+                enable_thinking=settings.vlm_enable_thinking,
             ),
             conversation_repository=SqliteConversationRepository(database),
             turn_repository=SqliteTurnRepository(database),

@@ -2,6 +2,8 @@
 
 家庭相册记忆系统：照片/视频导入 → 记忆构建 → 自然语言检索与问答 → PhotoBench 评测。
 
+纯文本与图片/文本混合资料接入见[通用 benchmark 适配说明](docs/runbooks/comindx-benchmark-adaptation.md)，包含接口、改动原因、默认兼容和测试依据。
+
 ---
 
 ## ⚠️ 修改代码前必读（强制）

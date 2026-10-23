@@ -79,10 +79,18 @@ class GoalPlanner:
             else max(1, int(os.getenv("SENTRIX_PLANNER_MAX_ATTEMPTS", str(DEFAULT_MAX_ATTEMPTS))))
         )
 
-    def declare(self, question: str, *, scope_id: str, history: str = "") -> PlannerResult:
+    def declare(
+        self,
+        question: str,
+        *,
+        scope_id: str,
+        history: str = "",
+        text_mode: bool = False,
+        mixed_mode: bool = False,
+    ) -> PlannerResult:
         # 历史折进 system 文本，不再插一条 system 消息——严格 chat template 要求 system
         # 必须在开头（1.0 ``goal_planner.py:115-117``，实测 24 题因此失败）。
-        system = build_prompt() + history_prompt_suffix(history)
+        system = build_prompt(text_mode=text_mode, mixed_mode=mixed_mode) + history_prompt_suffix(history)
         base = [ChatMessage(ChatRole.SYSTEM, system), ChatMessage(ChatRole.USER, question)]
 
         messages = list(base)

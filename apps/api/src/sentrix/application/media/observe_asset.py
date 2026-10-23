@@ -11,11 +11,13 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from sentrix.domain.media.models import Asset, MediaType, Observation
 from sentrix.domain.media.ports import (
     AssetObserver,
+    MediaStorage,
     ObservationRepository,
     ObservationSemantics,
     VlmObserver,
@@ -23,13 +25,27 @@ from sentrix.domain.media.ports import (
 
 
 class ObserveAsset(AssetObserver):
-    def __init__(self, *, observer: VlmObserver, observations: ObservationRepository) -> None:
+    def __init__(
+        self,
+        *,
+        observer: VlmObserver | None,
+        observations: ObservationRepository,
+        storage: MediaStorage | None = None,
+    ) -> None:
+        self._storage = storage
         self._observer = observer
         self._observations = observations
 
     def prepare(self, asset: Asset) -> ObservationSemantics | None:
         """第一段：只打模型。**不写库**，所以它可以离开串行侧（见 ``AssetObserver``）。"""
-        if asset.media_type is not MediaType.IMAGE:
+        if asset.media_type is MediaType.TEXT and self._storage is not None:
+            try:
+                text = self._storage.read(asset.id).decode("utf-8")
+            except (OSError, UnicodeError):
+                logging.getLogger(__name__).warning("Text source unreadable: asset=%s", asset.id)
+                return None
+            return ObservationSemantics(source_text=text, confidence=1.0) if text.strip() else None
+        if asset.media_type is not MediaType.IMAGE or self._observer is None:
             return None
         return self._observer.observe(Path(asset.path))
 

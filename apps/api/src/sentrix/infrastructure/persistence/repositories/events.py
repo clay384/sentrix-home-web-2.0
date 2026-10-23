@@ -11,7 +11,7 @@ import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
-from sentrix.domain.memories.events import EventRecord
+from sentrix.domain.memories.events import EventRecord, event_times_compatible
 from sentrix.infrastructure.persistence.database import Database
 
 _COLUMNS = (
@@ -25,6 +25,11 @@ _COLUMNS = (
 DEFAULT_EVENT_TITLE = "待总结事件"
 DEFAULT_EVENT_TYPE = "待判断"
 DEFAULT_EVENT_PLACE = "其他或不确定"
+
+
+def _require_compatible_times(*values: datetime | None) -> None:
+    if not event_times_compatible(*values):
+        raise ValueError("Cannot merge naive and timezone-aware event times without a known timezone")
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -99,6 +104,7 @@ class SqliteEventRepository:
         aggregation_score: float,
         aggregation_breakdown: dict[str, object],
     ) -> EventRecord:
+        _require_compatible_times(time_start, time_end)
         now = datetime.now(UTC).isoformat()
         with self._database.connect() as connection, connection:
             connection.execute(
@@ -256,6 +262,7 @@ class SqliteEventRepository:
         current = self.get(event_id)
         if current is None:
             raise KeyError(event_id)
+        _require_compatible_times(current.time_start, current.time_end, time_start, time_end)
         merged_activity = current.activity or activity
         merged_summary = current.summary
         if summary and summary not in merged_summary:
@@ -301,6 +308,7 @@ class SqliteEventRepository:
         target = self.get(target_event_id)
         if source is None or target is None:
             raise KeyError(source_event_id if source is None else target_event_id)
+        _require_compatible_times(source.time_start, source.time_end, target.time_start, target.time_end)
         with self._database.connect() as connection, connection:
             connection.execute(
                 "UPDATE OR IGNORE event_observations SET event_id = ? WHERE event_id = ?",

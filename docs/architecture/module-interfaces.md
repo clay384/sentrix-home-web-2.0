@@ -850,6 +850,13 @@ def test_chat_model_maps_prompt_too_long():
 | `SENTRIX_LEGACY_CLIP_TIMEOUT_S` | chinese-clip 超时 | `30` | legacy 视觉 | 否 |
 | `SENTRIX_TEXT_EMBEDDER_TIMEOUT_S` | bge 超时 | `10` | legacy 文本 | 否 |
 | `SENTRIX_CHAT_TIMEOUT_S` | 对话超时 | `120` | ChatModel | 否 |
+| `SENTRIX_AGENT_MAX_STEPS` | 回合模型步骤上限 | `8`，范围1–64 | Agent；工具限额不变 | 否 |
+| `SENTRIX_CHAT_OUTPUT_TOKENS` | 助手/规划/L2单次输出上限 | `2048`，范围256–32768 | ChatModel，仍受上下文余量限制 | 否 |
+| `SENTRIX_VLM_OUTPUT_TOKENS` | 观察/图片复核/人物视觉单次输出上限 | `2048`，范围256–32768 | 三个视觉客户端 | 否 |
+| `SENTRIX_VLM_ENABLE_THINKING` | 视觉端点可选思考扩展 | `null`：不发送 | 三个视觉客户端，不控制Chat/L2 | 否 |
+| `SENTRIX_CORPUS_READ_ONLY` | 拒绝资料HTTP写入，保留问答 | `false` | HTTP写入边界 | 否 |
+| `SENTRIX_CORPUS_SOURCE_ALLOWLIST` | 已发布来源ID的JSON清单路径 | `null` | 助手工具读取范围；不是认证系统 | 否 |
+| `SENTRIX_VISUAL_SOURCE_MANIFEST` | 原图身份/路径/哈希清单 | `null` | 显式启用固定编码和视觉血缘 | 否 |
 | `SENTRIX_VLM_TIMEOUT_S` | 视觉超时 | `180` | VLM/PersonVision/PhotoInspector | 否 |
 | `SENTRIX_VLM_CONTEXT_TOKENS` | 单槽窗口兜底 | `6144` | ChatModel | 否（探测优先） |
 | `SENTRIX_ALBUM_WORKERS` | 导入预取并发 | `4` | 导入流水线 | 否 |
@@ -1240,3 +1247,38 @@ Judge一致性v3进一步限定为明确“模型/助手的回答/答案/结论�
 保留同步 `POST /api/v1/imports`，新增可选 `operation_id` 和独立 `GET /api/v1/imports/{operation_id}/progress`。产品仅输出通用处理事实；`completed = imported + deduplicated + failed`，`total` 为实际扫描并应用 limit 后的支持媒体数，扫描前为 null。媒体计数完成后仍依次进行事件总结、参与者刷新、家庭图谱、人物画像，只有同步请求完成才终态。updated_at 是步骤更新时间，observed_at 是查询时间，不能互换。查询不会重放导入。
 
 由 domain ImportProgressStore 端口、application TrackImport 和 bootstrap 装配的有界进程内适配器实现；最多32个活跃跟踪、128条终态，重启或淘汰后404。重复在册ID409，容量不足429，均发生在副作用前。此能力不是持久作业队列，不承诺跨进程查询或取消产品执行。PhotoBench 使用运行快照中的同一客户端，每秒轮询、单次3秒超时，保存最后事实及查询故障；不盲重试导入POST。旧服务无进度时明确不可用。
+## 文本资料扩展（2026-10-22）
+
+`Observation` 与 `ObservationSemantics` 增加默认空串的 `source_text`。UTF-8 文本资产由
+`ObserveAsset` 通过 `MediaStorage.read(asset_id)` 读取，不经过图片观察模型；照片继续走原有路径。
+原文存入观察仓储，经 `IndexObservationText` 进入现有双空间文本向量索引，并进入词法字段
+`source_text`。迁移 `0014_source_text.sql` 对已有观察回填空串。
+
+`AssistantToolbox.is_text_scope(scope_id)` 仅在范围非空且资产均为文本时启用通用资料规划提示。
+新增证据类型 `source_text` 和精读工具 `read_source_text(result_set_id, asset_handle)`；工具先检查
+结果集、范围、handle 和资产类型，再返回 `full_text`，不截断原文。它沿用原有 expensive 工具计数。
+原文证据不要求照片附件，最终回答、L1 检查和 L2 审查仍走原生回合逻辑。
+
+新增配置 `agent_max_steps`（默认8，上限64）、`chat_output_tokens`（默认2048，上限32768）和
+`corpus_read_only`（默认false）。只读模式拒绝资料及记忆写入，允许查询、创建问答会话及回合；
+会话与轨迹仍可落库。公开 `StartTurnRequest.message` 字符上限扩大为131072，保留输入原文；
+模型端输入预算另行执行，字符上限不等同于 token 预算。OpenAPI 同步更新。
+
+验收：`apps/api/tests/integration/test_text_sources.py` 覆盖全文保存、幂等、索引、权限、长问题、
+文本证据、原生答题与审查、只读配置及旧默认值。模块与能力地图同时登记扩展。
+
+## 导入来源与混合资料接口
+
+`ImportRequest` 与 `Asset` 可携带 `external_source_id`、`source_timestamp`、`source_location` 和
+`source_metadata`。来源身份按 scope 唯一；相同身份和原文、文件名、媒体类型及来源元数据重复
+导入时复用已有资产，任一冲突返回 `external_source_conflict`（409）。相同内容的不同来源身份
+独立保存；不提供身份的旧上传继续按内容哈希去重。来源时间只接受无时区的 ISO 时间，保留原串，
+优先于 EXIF；来源地点与视觉观察地点分别保存。SQLite 唯一索引竞争由仓储报告胜出资产，用例
+执行相同的幂等或冲突判定；不把其它完整性错误当作幂等命中，也不使已处理的竞争回滚外层事务。
+
+混合 scope 使用原生融合检索，按资产类型选择 `read_source_text` 或 `inspect_photo`。
+预览、正文与图片复核返回中性来源字段；工具同时检查 scope、结果集、资产类型，以及可选的
+`corpus_source_allowlist`。该清单只是部署提供的来源身份集合，未替代权限系统或内容哈希校验。
+`Database.transaction()` 为多个仓储提供共享 SQLite 事务；媒体文件、模型请求和派生索引
+仍由调用方单独管理。验收见 `test_mixed_sources.py`、`test_import_source_transactions.py`、
+`test_source_identity_races.py` 与 `test_import_sources.py`。

@@ -99,6 +99,16 @@ def _turn_summary(record: TurnRecord) -> TurnSummary:
 
 
 def _run_turn(container: Container) -> RunTurn:
+    allowlist_path = getattr(container.settings, "corpus_source_allowlist", None)
+    frozen_source_ids = None
+    if allowlist_path is not None:
+        payload = json.loads(allowlist_path.read_text(encoding="utf-8"))
+        source_ids = payload.get("source_ids") if isinstance(payload, dict) else None
+        if not isinstance(source_ids, list) or any(
+            not isinstance(item, str) or not item for item in source_ids
+        ):
+            raise ValueError("corpus source allowlist must contain a source_ids array of nonempty strings")
+        frozen_source_ids = frozenset(source_ids)
     return RunTurn(
         model=container.chat_model,
         conversations=container.conversation_repository,
@@ -125,12 +135,14 @@ def _run_turn(container: Container) -> RunTurn:
             # preview 的 ``place`` 取自这里（导入期 EXIF GPS 反解出来的行政地名），
             # 不是 ``observations.place``（VLM 的场景描述）——理由见 ``_place_label``。
             asset_places=container.asset_place_repository,
+            frozen_source_ids=frozen_source_ids,
         ),
         # 墙钟是部署事实：Mac/CPU 上 4 并发时一次 inspect 就可能 30-60s，
         # 180s 的默认值会把正常回合截成 timeout。由 Settings 注入，153 仍用 180。
         profile=replace(
             DEFAULT_PROFILE,
             wall_time_s=container.settings.agent_wall_time_s,
+            max_steps=container.settings.agent_max_steps,
         ),
     )
 

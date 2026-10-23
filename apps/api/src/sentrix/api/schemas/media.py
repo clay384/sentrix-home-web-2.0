@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ImportResponse(BaseModel):
@@ -44,6 +44,10 @@ class AssetSummary(BaseModel):
     derived_kind: str | None = None
     parent_asset_id: str | None = None
     source_timestamp_sec: float | None = None
+    external_source_id: str | None = None
+    source_timestamp: str | None = None
+    source_location: str = ""
+    source_metadata: dict[str, object] = Field(default_factory=dict)
 
 
 class AssetListResponse(BaseModel):

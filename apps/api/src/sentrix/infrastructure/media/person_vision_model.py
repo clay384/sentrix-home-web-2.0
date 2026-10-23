@@ -26,6 +26,10 @@
 2. **``_core_vision_options`` 不搬**（1.0 ``:1097-1105`` 的 ``think`` / ``num_ctx`` /
    ``num_predict`` 是 llama.cpp 与 ollama 的私有字段）。``chat_json`` 发的是
    ``MAX_ANSWER_TOKENS``，与 ``VlmObserver`` 同一个预算。
+部署启用冻结视觉来源清单时，三条入口统一使用 EXIF 转正、RGB、最长边 512（不放大）、
+JPEG90，并提交原图或受限裁剪血缘；没有清单时保持旧编码行为。输出预算及思考策略
+可显式配置，默认仍共用旧预算且不新增思考字段。
+
 3. **返回里没有 ``"model"``。** 1.0 的 ``analyze_person_appearance`` 回 ``self.model``
    （``:1350``），2.0 把它提到端口的 ``model_id`` 上——与 ``VlmObserver.model_id``
    同一条口径（1.0 ``analyze_image`` 的 ``parsed["model"]`` 在 2.0 也是这么处理的）。
@@ -48,6 +52,7 @@ from typing import Any
 
 from sentrix.domain.identity.moments import PERSON_MOMENT_PROMPT, normalize_person_moments
 from sentrix.domain.identity.portrait import PERSON_PORTRAIT_PROMPT, normalize_writer_output
+from sentrix.infrastructure.assistant.chat_client import MAX_ANSWER_TOKENS
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
 from sentrix.infrastructure.media.vlm_observer import _encode_image, chat_json
 
@@ -108,10 +113,20 @@ def _confidence(value: object) -> float:
 class OpenAIPersonVision:
     """实现 ``PersonVision`` 端口。模型进程的生命周期不归 2.0 管。"""
 
-    def __init__(self, base_url: str, model: ServedModel, *, timeout_s: float = 180.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: ServedModel,
+        *,
+        timeout_s: float = 180.0,
+        output_tokens: int = MAX_ANSWER_TOKENS,
+        enable_thinking: bool | None = None,
+    ) -> None:
         self._endpoint = f"{base_url.rstrip('/')}/chat/completions"
         self._model = model
         self._timeout = timeout_s
+        self._output_tokens = output_tokens
+        self._enable_thinking = enable_thinking
 
     @property
     def model_id(self) -> str:
@@ -172,4 +187,12 @@ class OpenAIPersonVision:
         }
 
     def _chat(self, prompt: str, image: str | None) -> dict[str, Any] | None:
-        return chat_json(self._endpoint, self._model, prompt, image, self._timeout)
+        return chat_json(
+            self._endpoint,
+            self._model,
+            prompt,
+            image,
+            self._timeout,
+            output_tokens=self._output_tokens,
+            enable_thinking=self._enable_thinking,
+        )

@@ -69,8 +69,22 @@ def audio_mime_type(file_name: str, declared: str | None) -> str:
     return AUDIO_MIME_BY_SUFFIX.get(suffix) or declared or GENERIC_MIME
 
 
+class SourceIdentityCollision(Exception):
+    """Another import already owns this scope and external source identity.
+
+    The repository reports the winner; the import use case decides whether its
+    content and source metadata make this an idempotent revisit or a conflict.
+    """
+
+    def __init__(self, existing: Asset) -> None:
+        self.existing = existing
+        super().__init__("The external source identity already exists")
+
+
 class AssetRepository(Protocol):
-    def add(self, asset: Asset) -> None: ...
+    def add(self, asset: Asset) -> None:
+        """Insert an asset, raising SourceIdentityCollision for a source-ID race."""
+        ...
 
     def get(self, asset_id: str) -> Asset | None: ...
 
@@ -83,6 +97,8 @@ class AssetRepository(Protocol):
         ...
 
     def find_by_hash(self, scope_id: str, content_sha256: str) -> Asset | None: ...
+
+    def find_by_external_source_id(self, scope_id: str, external_source_id: str) -> Asset | None: ...
 
     def update_status(self, asset_id: str, status: AssetStatus) -> None: ...
 
@@ -180,6 +196,7 @@ class ObservationSemantics:
     # 事实。用户裁决④选了「按 1.0 原样：模型自报」，这个字段就是那条来源。
     facts: tuple[ObservationFact, ...] = ()
     confidence: float = 0.0
+    source_text: str = ""
 
 
 class VlmObserver(Protocol):

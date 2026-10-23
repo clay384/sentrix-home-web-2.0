@@ -34,7 +34,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import re
@@ -49,6 +48,7 @@ from sentrix.domain.media.models import MODEL_FACT_CONFIDENCE, ObservationFact
 from sentrix.domain.media.ports import ObservationSemantics
 from sentrix.infrastructure.assistant.chat_client import MAX_ANSWER_TOKENS
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
+from sentrix.infrastructure.media.visual_provenance import encode_visual_image, image_provenance
 
 log = logging.getLogger(__name__)
 
@@ -93,12 +93,10 @@ objects、clothing、ocr_text、facts（每项仍只含 subject、predicate、ob
 
 def _encode_image(path: Path) -> str | None:
     try:
-        payload = path.read_bytes()
-    except OSError as error:
-        log.warning("观察用的图片读不了: %s (%s)", path, error)
+        return encode_visual_image(path)
+    except (OSError, ValueError) as error:
+        log.warning("观察图片读取或来源校验失败: %s (%s)", path, error)
         return None
-    mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
-    return f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
 
 
 def _text(value: object) -> str:
@@ -185,6 +183,9 @@ def chat_json(
     prompt: str,
     image: str | Sequence[str] | None,
     timeout_s: float,
+    *,
+    output_tokens: int = MAX_ANSWER_TOKENS,
+    enable_thinking: bool | None = None,
 ) -> dict[str, Any] | None:
     """一次「提示词（+ 一张或多张图）→ JSON 对象」的往返。任何失败都返回 ``None``。
 
@@ -200,14 +201,20 @@ def chat_json(
     ``OpenAIPersonVision`` 的调用点一个字都不用改。
     """
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    for url in [image] if isinstance(image, str) else list(image or ()):
+    urls = [image] if isinstance(image, str) else list(image or ())
+    for url in urls:
         content.append({"type": "image_url", "image_url": {"url": url}})
     try:
         body = {
             "model": model.current(),
             "messages": [{"role": "user", "content": content}],
-            "max_tokens": MAX_ANSWER_TOKENS,
+            "max_tokens": output_tokens,
         }
+        if enable_thinking is not None:
+            body["enable_thinking"] = enable_thinking
+        provenance = image_provenance(urls)
+        if provenance is not None and urls:
+            body["sentrix_image_provenance"] = provenance
         response = httpx.post(endpoint, json=body, timeout=timeout_s)
         response.raise_for_status()
         payload = response.json()
@@ -220,10 +227,20 @@ def chat_json(
 class OpenAIVlmObserver:
     """实现 ``VlmObserver`` 端口。模型进程的生命周期不归 2.0 管。"""
 
-    def __init__(self, base_url: str, model: ServedModel, *, timeout_s: float = 180.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: ServedModel,
+        *,
+        timeout_s: float = 180.0,
+        output_tokens: int = MAX_ANSWER_TOKENS,
+        enable_thinking: bool | None = None,
+    ) -> None:
         self._endpoint = f"{base_url.rstrip('/')}/chat/completions"
         self._model = model
         self._timeout = timeout_s
+        self._output_tokens = output_tokens
+        self._enable_thinking = enable_thinking
 
     @property
     def model_id(self) -> str:
@@ -264,7 +281,15 @@ class OpenAIVlmObserver:
         return semantics_from_payload(parsed)
 
     def _chat(self, prompt: str, image: str | None) -> dict[str, Any] | None:
-        return chat_json(self._endpoint, self._model, prompt, image, self._timeout)
+        return chat_json(
+            self._endpoint,
+            self._model,
+            prompt,
+            image,
+            self._timeout,
+            output_tokens=self._output_tokens,
+            enable_thinking=self._enable_thinking,
+        )
 
 
 def _first_content(payload: object) -> str:

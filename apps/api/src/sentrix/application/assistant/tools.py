@@ -28,7 +28,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -43,7 +43,7 @@ from sentrix.domain.assistant.result_set import ResultSet, ResultSetEntry
 from sentrix.domain.assistant.tools import MAX_DELIVERED_PHOTOS
 from sentrix.domain.identity.ports import FaceRepository, PersonCropRenderer
 from sentrix.domain.media.inspection import CERTAINTY_SUPPORTED
-from sentrix.domain.media.models import Observation
+from sentrix.domain.media.models import Asset, Observation
 from sentrix.domain.media.ports import AssetRepository, ObservationRepository, PhotoInspector
 from sentrix.domain.places.ports import AssetPlaceRepository
 from sentrix.domain.retrieval.fact_query import FactRejection
@@ -111,6 +111,8 @@ def _observation_summary(observation: Observation | None) -> str:
     """
     if observation is None:
         return ""
+    if observation.source_text:
+        return observation.source_text[:_SUMMARY_TEXT_LIMIT]
     parts: list[str] = []
     for value in (observation.caption, observation.activity, observation.place):
         text = (value or "").strip()
@@ -177,6 +179,7 @@ class AssistantToolbox:
         photo_inspector: PhotoInspector,
         person_crops: PersonCropRenderer,
         asset_places: AssetPlaceRepository | None = None,
+        frozen_source_ids: Collection[str] | None = None,
     ) -> None:
         self._retrieval = retrieval
         self._assets = assets
@@ -194,6 +197,39 @@ class AssistantToolbox:
         # 头肩裁剪件。裁剪走端口而不是在这里 import PIL——domain-purity 把 PIL 点名禁了。
         self._photo_inspector = photo_inspector
         self._crops = person_crops
+        # None preserves ordinary uploads. An explicitly supplied empty set permits no sources.
+        self._frozen_source_ids = None if frozen_source_ids is None else frozenset(frozen_source_ids)
+        self._frozen_scope_media_kinds: dict[str, frozenset[str]] = {}
+
+    def _asset_access_failure(
+        self, asset: Asset | None, *, scope_id: str, media_types: Collection[str] | None = None
+    ) -> ToolOutcome | None:
+        if asset is None or asset.scope_id != scope_id:
+            return _failure("scope_mismatch", "该资料不属于当前资料范围。")
+        if (
+            self._frozen_source_ids is not None
+            and getattr(asset, "external_source_id", "") not in self._frozen_source_ids
+        ):
+            return _failure("source_not_frozen", "该来源未包含在已发布的资料快照中。")
+        if media_types is not None and asset.media_type.value not in media_types:
+            return _failure("unsupported_media_type", "该工具不支持这类资料。")
+        return None
+
+    @staticmethod
+    def _source_fields(asset: Asset) -> Mapping[str, str]:
+        return {
+            "external_source_id": getattr(asset, "external_source_id", "") or "",
+            "source_timestamp": getattr(asset, "source_timestamp", "") or "",
+            "source_location": getattr(asset, "source_location", "") or "",
+        }
+
+    def _scope_snapshot_complete(self, scope_id: str) -> bool:
+        if self._frozen_source_ids is None:
+            return True
+        return all(
+            self._asset_access_failure(asset, scope_id=scope_id) is None
+            for asset in self._assets.list_by_scope(scope_id, limit=100000)
+        )
 
     def execute(
         self,
@@ -212,6 +248,8 @@ class AssistantToolbox:
             return self._photo_people(arguments, scope_id=scope_id)
         if name == "inspect_photo":
             return self._inspect_photo(arguments, scope_id=scope_id, question=question)
+        if name == "read_source_text":
+            return self._read_source_text(arguments, scope_id=scope_id)
         if name == "read_photo_text":
             return self._read_photo_text(arguments, scope_id=scope_id)
         if name == "get_person_profile":
@@ -229,6 +267,8 @@ class AssistantToolbox:
         被当成「检索没找到」。不会——``final_guard`` 先按 ``RETRIEVAL_TOOLS`` 过滤工具名，
         而本工具不在那个集合里，所以「拒绝」与「空结果」在那一边是分开的。
         """
+        if not self._scope_snapshot_complete(scope_id):
+            return _failure("source_not_frozen", "当前资料范围尚未全部发布，不能读取聚合统计。")
         answer = self._memory_facts.execute(
             arguments,
             scope_id=scope_id,
@@ -262,13 +302,18 @@ class AssistantToolbox:
         result = self._retrieval.execute(
             EvidenceRequest(text=query, scope_id=scope_id, limit=_clamp_limit(arguments.get("limit")))
         )
+        hits = [
+            hit
+            for hit in result.hits
+            if self._asset_access_failure(self._assets.get(hit.asset_id), scope_id=scope_id) is None
+        ]
         result_set = ResultSet(
             id=f"rs_{uuid.uuid4().hex[:12]}",
             scope_id=scope_id,
             query=query,
-            asset_ids=tuple(hit.asset_id for hit in result.hits),
+            asset_ids=tuple(hit.asset_id for hit in hits),
             created_at=now,
-            evidence_classes={hit.asset_id: hit.evidence_class for hit in result.hits},
+            evidence_classes={hit.asset_id: hit.evidence_class for hit in hits},
         )
         self._result_sets.add(result_set)
         return self._page_outcome(
@@ -300,6 +345,10 @@ class AssistantToolbox:
         self, result_set: ResultSet, *, page_no: int, extra: Mapping[str, Any] | None = None
     ) -> ToolOutcome:
         page = result_set.page(page_no)
+        for asset_id in result_set.asset_ids:
+            failure = self._asset_access_failure(self._assets.get(asset_id), scope_id=result_set.scope_id)
+            if failure is not None:
+                return failure
         preview = [self._preview(entry) for entry in page.entries]
         # 1.0 ``_RETRIEVAL_TOP_KEEP`` 里那三个 ``group_photo_*`` 的等价物，**判据换了**
         # （见 ``_group_photo_rows``）。
@@ -394,6 +443,7 @@ class AssistantToolbox:
         latest = observations[0] if observations else None
         return {
             "handle": entry.handle,
+            **(self._source_fields(asset) if asset else {}),
             "file_name": asset.file_name if asset else "",
             "media_kind": asset.media_type.value if asset else "",
             # **这一条是视频抽出来的帧，还是一张真照片。** 派生物的 ``media_type`` 就是
@@ -404,7 +454,13 @@ class AssistantToolbox:
             # 取 ``derived_kind``（``video_keyframe``）而不是 ``parent_asset_id``：
             # 模型需要的是「这是什么」，不是「它爸爸是谁」——后者会把整条视频血缘
             # 带进上下文，而回答一个问题只需要前者。
-            "source_kind": (asset.derived_kind if asset and asset.derived_kind else "photo"),
+            "source_kind": (
+                "text"
+                if asset and asset.media_type.value == "text"
+                else asset.derived_kind
+                if asset and asset.derived_kind
+                else "photo"
+            ),
             "captured_at": asset.captured_at.isoformat() if asset and asset.captured_at else "",
             "level": _LEVEL_BY_EVIDENCE_CLASS.get(entry.evidence_class, ""),
             # **地点取 GPS 反解，不取 VLM 的场景描述。** 1.0 的 preview ``place``
@@ -502,6 +558,12 @@ class AssistantToolbox:
                 log.warning("交付的 handle 指向一个已不存在的资产，已丢弃: %s", asset_id)
                 rejected.append(handle)
                 continue
+            if (
+                self._asset_access_failure(asset, scope_id=scope_id, media_types={"image", "video"})
+                is not None
+            ):
+                rejected.append(handle)
+                continue
             attachments.append(
                 Attachment(
                     handle=handle,
@@ -569,6 +631,11 @@ class AssistantToolbox:
                 "bad_handle",
                 "这个 handle 不在当前结果集里。请只用 search_memories / get_result_page 返回的 handle。",
             )
+
+        asset = self._assets.get(asset_id)
+        failure = self._asset_access_failure(asset, scope_id=scope_id, media_types={"image"})
+        if failure is not None:
+            return failure
 
         identities = self._faces.list_photo_identities(asset_id)
         snapshot = self._observations.latest_people_snapshot(asset_id)
@@ -658,7 +725,11 @@ class AssistantToolbox:
             )
 
         asset = self._assets.get(asset_id)
-        if asset is None or not Path(asset.path).is_file():
+        failure = self._asset_access_failure(asset, scope_id=scope_id, media_types={"image"})
+        if failure is not None:
+            return failure
+        assert asset is not None
+        if not Path(asset.path).is_file():
             return ToolOutcome(
                 observation={"failure_reason": "file_unavailable", "asset_id": asset_id},
                 model_visible={"error": "file_unavailable", "message": "照片文件不可用。"},
@@ -763,6 +834,7 @@ class AssistantToolbox:
                 "target_bbox": target_bbox,
                 "confirms_visual_only": not identities,
                 "unconfirmed_people_count": unconfirmed,
+                **self._source_fields(asset),
             },
             model_visible={
                 "asset_handle": handle,
@@ -774,6 +846,64 @@ class AssistantToolbox:
                 "photo_identities": photo_identities,
                 "face_candidates": face_candidates,
                 "unconfirmed_people_count": unconfirmed,
+                **self._source_fields(asset),
+            },
+        )
+
+    def is_text_scope(self, scope_id: str) -> bool:
+        return self._scope_media_kinds(scope_id) == {"text"}
+
+    def is_mixed_scope(self, scope_id: str) -> bool:
+        kinds = self._scope_media_kinds(scope_id)
+        return "text" in kinds and bool(kinds - {"text"})
+
+    def _scope_media_kinds(self, scope_id: str) -> frozenset[str]:
+        if scope_id in self._frozen_scope_media_kinds:
+            return self._frozen_scope_media_kinds[scope_id]
+        kinds = frozenset(
+            item.media_type.value
+            for item in self._assets.list_by_scope(scope_id, limit=100000)
+            if self._asset_access_failure(item, scope_id=scope_id) is None
+        )
+        if self._frozen_source_ids is not None:
+            self._frozen_scope_media_kinds[scope_id] = kinds
+        return kinds
+
+    def _read_source_text(self, arguments: Mapping[str, Any], *, scope_id: str) -> ToolOutcome:
+        result_set = self._result_sets.get(str(arguments.get("result_set_id") or ""))
+        if result_set is None:
+            return _failure("unknown_result_set", "结果集不存在。请先检索。")
+        if result_set.scope_id != scope_id:
+            return _failure("scope_mismatch", "结果集不属于当前资料范围。")
+        handle = str(arguments.get("asset_handle") or "")
+        asset_id = result_set.resolve(handle)
+        if asset_id is None:
+            return _failure("bad_handle", "该 handle 不在当前结果集中。")
+        asset = self._assets.get(asset_id)
+        failure = self._asset_access_failure(asset, scope_id=scope_id, media_types={"text"})
+        if failure is not None:
+            return failure
+        assert asset is not None
+        rows = self._observations.list_by_asset(asset.id)
+        text = rows[0].source_text if rows else ""
+        if not text:
+            return _failure("source_text_unavailable", "该资产没有可读取的原文。")
+        return ToolOutcome(
+            observation={
+                "asset_ids": [asset.id],
+                "result_set_id": result_set.id,
+                "asset_handle": handle,
+                "source": "imported_source_text",
+                "full_text": text,
+                "certainty": "supported",
+                **self._source_fields(asset),
+            },
+            model_visible={
+                "asset_handle": handle,
+                "full_text": text,
+                "source": "imported_source_text",
+                "certainty": "supported",
+                **self._source_fields(asset),
             },
         )
 
@@ -811,6 +941,11 @@ class AssistantToolbox:
                 "这个 handle 不在当前结果集里。请只用 search_memories / get_result_page 返回的 handle。",
             )
 
+        asset = self._assets.get(asset_id)
+        failure = self._asset_access_failure(asset, scope_id=scope_id, media_types={"image"})
+        if failure is not None:
+            return failure
+        assert asset is not None
         text = self._observations.latest_ocr_text(asset_id)
         if not text:
             return _failure(
@@ -825,6 +960,7 @@ class AssistantToolbox:
                 "asset_id": asset_id,
                 "source": "ingestion_ocr",
                 "full_text": text,
+                **self._source_fields(asset),
             },
             model_visible={
                 "asset_handle": handle,
@@ -839,12 +975,15 @@ class AssistantToolbox:
                 "certainty": CERTAINTY_SUPPORTED,
                 "source": "ingestion_ocr",
                 "note": "这些字是导入时从画面里读出来并保存的。",
+                **self._source_fields(asset),
             },
         )
 
     # ---- get_person_profile -------------------------------------------------
 
     def _person(self, arguments: Mapping[str, Any], *, scope_id: str) -> ToolOutcome:
+        if not self._scope_snapshot_complete(scope_id):
+            return _failure("source_not_frozen", "当前资料范围尚未全部发布，不能读取聚合人物档案。")
         name = str(arguments.get("person") or "").strip()
         if not name:
             return _failure("empty_person", "person 不能为空。")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 
@@ -48,6 +49,10 @@ def to_summary(asset: Asset) -> AssetSummary:
         derived_kind=asset.derived_kind,
         parent_asset_id=asset.parent_asset_id,
         source_timestamp_sec=asset.source_timestamp_sec,
+        external_source_id=asset.external_source_id,
+        source_timestamp=asset.source_timestamp,
+        source_location=asset.source_location,
+        source_metadata=dict(asset.source_metadata),
     )
 
 
@@ -55,6 +60,10 @@ def to_summary(asset: Asset) -> AssetSummary:
 async def import_media(
     file: UploadFile = File(...),
     scope_id: str = Form("home-default"),
+    external_source_id: str | None = Form(None),
+    source_timestamp: str | None = Form(None),
+    source_location: str = Form(""),
+    source_metadata: str = Form("{}"),
     container: Container = Depends(get_container),
 ) -> ImportResponse:
     content = await file.read()
@@ -62,14 +71,23 @@ async def import_media(
         raise HTTPException(status_code=400, detail="empty file")
 
     use_case = build_import_assets(container, observe=False)
-    result = use_case.execute(
-        ImportRequest(
+    try:
+        metadata = json.loads(source_metadata)
+        if not isinstance(metadata, dict):
+            raise ValueError("source_metadata must be a JSON object")
+        request = ImportRequest(
             scope_id=scope_id,
             file_name=file.filename or "unnamed",
             content_type=file.content_type,
             content=content,
+            external_source_id=external_source_id,
+            source_timestamp=source_timestamp,
+            source_location=source_location,
+            source_metadata=metadata,
         )
-    )
+    except (ValueError, TypeError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    result = use_case.execute(request)
     return ImportResponse(
         asset_id=result.asset_id,
         observation_id=result.observation_id,
@@ -172,11 +190,10 @@ def _build_importer(
         ),
         observer=(
             ObserveAsset(
-                observer=container.vlm_observer,
+                observer=container.vlm_observer if observe else None,
                 observations=container.observation_repository,
+                storage=container.media_storage,
             )
-            if observe
-            else None
         ),
         event_assigner=lambda observation: _event_id(assigner, observation),
         # 关键帧的强制归属（S8b T513）。**不受 ``observe`` 影响**：只要有人给了

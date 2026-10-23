@@ -80,12 +80,14 @@ S8c 追加一条：**音频走同一条链，但不转码、不转写**（用户
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from sentrix.domain.errors import DomainError
 from sentrix.domain.identity.ports import FaceEnroller, PreparedFaces
 from sentrix.domain.media.models import Asset, AssetStatus, MediaType, Observation
 from sentrix.domain.media.ports import (
@@ -98,6 +100,7 @@ from sentrix.domain.media.ports import (
     MetadataReader,
     ObservationRepository,
     ObservationSemantics,
+    SourceIdentityCollision,
     VideoMetadataReader,
     VideoProbe,
     VideoRepository,
@@ -111,12 +114,36 @@ from sentrix.domain.spaces.ports import SpaceRepository
 log = logging.getLogger("sentrix.media.import_assets")
 
 
+class SourceConflictError(DomainError):
+    code = "external_source_conflict"
+    status_code = 409
+
+
 @dataclass(frozen=True, slots=True)
 class ImportRequest:
     scope_id: str
     file_name: str
     content_type: str | None
     content: bytes
+    external_source_id: str | None = None
+    source_timestamp: str | None = None
+    source_location: str = ""
+    source_metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.external_source_id is not None and not self.external_source_id.strip():
+            raise ValueError("external_source_id must be nonempty when provided")
+        self.parsed_source_timestamp()
+        json.dumps(dict(self.source_metadata), allow_nan=False)
+
+    def parsed_source_timestamp(self) -> datetime | None:
+        """Preserve the source's wall clock; never infer a missing timezone."""
+        if not self.source_timestamp:
+            return None
+        value = datetime.fromisoformat(self.source_timestamp)
+        if value.tzinfo is not None:
+            raise ValueError("source_timestamp must be a naive wall-clock timestamp")
+        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,7 +337,13 @@ class ImportAssets:
         content_sha256 = hashlib.sha256(request.content).hexdigest()
         media_type = MediaType.from_upload(request.content_type, request.file_name)
 
-        existing = self._assets.find_by_hash(request.scope_id, content_sha256)
+        if request.external_source_id is not None:
+            existing = self._assets.find_by_external_source_id(request.scope_id, request.external_source_id)
+            if existing is not None:
+                return self._existing_source_result(request, existing, content_sha256, media_type)
+            existing = None
+        else:
+            existing = self._assets.find_by_hash(request.scope_id, content_sha256)
         if existing is not None:
             return ImportResult(
                 asset_id=existing.id,
@@ -373,6 +406,10 @@ class ImportAssets:
         )
 
         now = self._clock()
+        if request.source_timestamp is not None:
+            captured_at = request.parsed_source_timestamp()
+        elif captured_at is None and request.external_source_id is None:
+            captured_at = now
         asset = Asset(
             id=asset_id,
             scope_id=request.scope_id,
@@ -383,12 +420,19 @@ class ImportAssets:
             size_bytes=len(request.content),
             status=AssetStatus.PROCESSED,
             content_sha256=content_sha256,
-            captured_at=captured_at or now,
+            captured_at=captured_at,
             captured_location=gps,
             created_at=now,
             updated_at=now,
+            external_source_id=request.external_source_id,
+            source_timestamp=request.source_timestamp,
+            source_location=request.source_location,
+            source_metadata=dict(request.source_metadata),
         )
-        self._assets.add(asset)
+        try:
+            self._assets.add(asset)
+        except SourceIdentityCollision as collision:
+            return self._existing_source_result(request, collision.existing, content_sha256, media_type)
 
         # 探测结果落库**必须在资产行之后**：它写的是 ``assets.metadata_json``。
         if video_probe is not None and self._video_repository is not None:
@@ -402,6 +446,27 @@ class ImportAssets:
             video_probe=video_probe,
             audio_probe=audio_probe,
             video_started=video_started,
+        )
+
+    def _existing_source_result(
+        self, request: ImportRequest, existing: Asset, content_sha256: str, media_type: MediaType
+    ) -> ImportResult:
+        if (
+            existing.content_sha256 != content_sha256
+            or existing.media_type is not media_type
+            or existing.file_name != request.file_name
+            or existing.source_timestamp != request.source_timestamp
+            or existing.source_location != request.source_location
+            or dict(existing.source_metadata) != dict(request.source_metadata)
+        ):
+            raise SourceConflictError("The existing source identity has different content or metadata")
+        observations = self._observations.list_by_asset(existing.id)
+        return ImportResult(
+            asset_id=existing.id,
+            observation_id=observations[0].id if observations else None,
+            media_type=existing.media_type,
+            status=existing.status,
+            deduplicated=True,
         )
 
     def finish(self, staged: StagedImport, prepared: PreparedImage) -> ImportResult:
@@ -459,7 +524,11 @@ class ImportAssets:
         return PreparedImage(
             visual=self._visual_indexer.prepare(asset) if self._visual_indexer is not None else None,
             semantics=self._observer.prepare(asset) if self._observer is not None else None,
-            faces=self._face_enroller.prepare(asset.path) if self._face_enroller is not None else None,
+            faces=(
+                self._face_enroller.prepare(asset.path)
+                if self._face_enroller is not None and asset.media_type is MediaType.IMAGE
+                else None
+            ),
         )
 
     def commit_image(

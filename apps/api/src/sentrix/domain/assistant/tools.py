@@ -432,12 +432,30 @@ READ_PHOTO_TEXT = ToolSpec(
 )
 
 
+READ_SOURCE_TEXT = ToolSpec(
+    name="read_source_text",
+    brief="读取当前检索结果中一个文本资产的完整原文。",
+    description="读取已导入的文本原文。只能读取当前 scope 与结果集内的 text 资产；不会调用视觉模型。",
+    parameters=_object_schema(
+        {
+            "result_set_id": {"type": "string"},
+            "asset_handle": {"type": "string"},
+        },
+        ["result_set_id", "asset_handle"],
+    ),
+    satisfies=(EvidenceType.SOURCE_TEXT,),
+    required=("result_set_id", "asset_handle"),
+    cost_class=CostClass.EXPENSIVE,
+)
+
+
 TOOL_SPECS: tuple[ToolSpec, ...] = (
     SEARCH_MEMORIES,
     QUERY_MEMORY_FACTS,
     QUERY_PHOTO_PEOPLE,
     INSPECT_PHOTO,
     READ_PHOTO_TEXT,
+    READ_SOURCE_TEXT,
     GET_RESULT_PAGE,
     GET_PERSON_PROFILE,
     FINAL_ANSWER,

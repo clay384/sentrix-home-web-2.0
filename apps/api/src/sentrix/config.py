@@ -71,6 +71,12 @@ class Settings(BaseSettings):
                 "wemm_url",
                 "agent_wall_time_s",
                 "chat_timeout_s",
+                "agent_max_steps",
+                "chat_output_tokens",
+                "vlm_timeout_s",
+                "vlm_output_tokens",
+                "vlm_enable_thinking",
+                "corpus_read_only",
                 "face_providers",
                 "retinaface_providers",
             )
@@ -109,6 +115,11 @@ class Settings(BaseSettings):
     # 单个 Agent 回合的墙钟上限。180 是 153（GPU）的默认；Mac/CPU 上 4 并发时
     # 一次 inspect_photo 就可能 30-60s，正常回合会被截成 timeout，可放宽到 600。
     agent_wall_time_s: float = 180.0
+    agent_max_steps: int = Field(default=8, ge=1, le=64)
+    chat_output_tokens: int = Field(default=2048, ge=256, le=32768)
+    corpus_read_only: bool = False
+    corpus_source_allowlist: Path | None = None
+    visual_source_manifest: Path | None = None
 
     # **模型名不在这里。** 8100 上跑 llama.cpp 还是 vLLM、名字叫什么，由部署方决定，而且
     # 会在 2.0 运行期间被换掉——2026-09-24 实测：8100 从 llama.cpp 换成 vLLM，2.0 配的
@@ -135,6 +146,8 @@ class Settings(BaseSettings):
     # 一张图最多 3 次调用（首轮 / 补全 / 中文化），每次是一次带图的推理，比纯文本慢得多；
     # 整册导入是**串行**的（单卡 GPU），所以这个超时按单次调用算，不是按一张图算。
     vlm_timeout_s: float = 180.0
+    vlm_output_tokens: int = Field(default=2048, ge=256, le=32768)
+    vlm_enable_thinking: bool | None = None
 
     # 整册导入的预取窗口：同时在飞的**推理**数（视觉嵌入 / VLM 观察 / 人脸检测）。
     # 1 就是原先的逐张串行。默认 4 是 1.0 在同一类机器上的实测值

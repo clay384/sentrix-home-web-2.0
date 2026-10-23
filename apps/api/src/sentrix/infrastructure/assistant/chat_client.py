@@ -280,6 +280,7 @@ class OpenAIChatModel:
         *,
         timeout_s: float = 120.0,
         context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+        output_tokens: int = MAX_ANSWER_TOKENS,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
@@ -287,6 +288,7 @@ class OpenAIChatModel:
         # 单个并发槽的窗口。**必须由部署方给**（``Settings.vlm_context_tokens``），
         # 默认值只是让测试与本地起得来，不代表生产。
         self._context_tokens = context_tokens
+        self._output_tokens = output_tokens
 
     def complete(self, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> ModelReply:
         if not messages or messages[0].role is not ChatRole.SYSTEM:
@@ -439,4 +441,4 @@ class OpenAIChatModel:
         available = (
             self._context_tokens - self.estimate_prompt_tokens(messages, tools) - CONTEXT_SAFETY_TOKENS
         )
-        return min(MAX_ANSWER_TOKENS, available)
+        return min(self._output_tokens, available)

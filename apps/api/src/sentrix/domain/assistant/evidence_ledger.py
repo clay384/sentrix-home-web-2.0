@@ -34,6 +34,7 @@ class EvidenceType(StrEnum):
     这条需求在权威模式下**没有任何门禁保护**。2.0 把它变成一等证据类型。
     """
 
+    SOURCE_TEXT = "source_text"
     PHOTO_SET = "photo_set"
     DELIVERED_PHOTO = "delivered_photo"
     PERSON_PROFILE = "person_profile"

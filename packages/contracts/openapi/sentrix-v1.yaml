@@ -2236,6 +2236,24 @@ components:
           - type: number
           - type: 'null'
           title: Source Timestamp Sec
+        external_source_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: External Source Id
+        source_timestamp:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source Timestamp
+        source_location:
+          type: string
+          title: Source Location
+          default: ''
+        source_metadata:
+          additionalProperties: true
+          type: object
+          title: Source Metadata
       type: object
       required:
       - id
@@ -2374,6 +2392,24 @@ components:
           type: string
           title: Scope Id
           default: home-default
+        external_source_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: External Source Id
+        source_timestamp:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source Timestamp
+        source_location:
+          type: string
+          title: Source Location
+          default: ''
+        source_metadata:
+          type: string
+          title: Source Metadata
+          default: '{}'
       type: object
       required:
       - file
@@ -5710,7 +5746,7 @@ components:
       properties:
         message:
           type: string
-          maxLength: 2000
+          maxLength: 131072
           minLength: 1
           title: Message
         conversation_id:

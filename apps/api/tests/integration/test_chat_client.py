@@ -180,6 +180,7 @@ def test_the_tools_field_carries_standard_json_schema(server: str):
         "query_photo_people",
         "inspect_photo",
         "read_photo_text",
+        "read_source_text",
         "get_result_page",
         "get_person_profile",
         "final_answer",

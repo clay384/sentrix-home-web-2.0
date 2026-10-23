@@ -16,13 +16,14 @@ from sentrix.domain.media.models import (
     Observation,
     ObservationFact,
 )
-from sentrix.domain.media.ports import ObservationSemantics, PeopleSnapshotEntry
+from sentrix.domain.media.ports import ObservationSemantics, PeopleSnapshotEntry, SourceIdentityCollision
 from sentrix.infrastructure.persistence.database import Database
 
 _ASSET_COLUMNS = (
     "id, scope_id, file_name, media_type, path, mime_type, size_bytes, status,"
     " content_sha256, captured_at, gps_latitude, gps_longitude, created_at, updated_at,"
-    " derived_kind, parent_asset_id, source_timestamp_sec"
+    " derived_kind, parent_asset_id, source_timestamp_sec, external_source_id,"
+    " source_timestamp, source_location, source_metadata_json"
 )
 
 
@@ -53,6 +54,10 @@ def _row_to_asset(row: sqlite3.Row) -> Asset:
         derived_kind=row["derived_kind"],
         parent_asset_id=row["parent_asset_id"],
         source_timestamp_sec=row["source_timestamp_sec"],
+        external_source_id=row["external_source_id"],
+        source_timestamp=row["source_timestamp"],
+        source_location=row["source_location"],
+        source_metadata=json.loads(row["source_metadata_json"]),
     )
 
 
@@ -69,28 +74,57 @@ class SqliteAssetRepository:
         一次写齐。所以 ``_ASSET_COLUMNS``（读）比这里的 INSERT 列清单多三列是**有意**的——
         读要带回派生物的血缘，写只服务非派生物。
         """
+        conflict: Asset | None = None
         with self._database.connect() as connection, connection:
-            connection.execute(
-                "INSERT INTO assets (id, scope_id, file_name, media_type, path, mime_type,"
-                " size_bytes, status, content_sha256, captured_at, gps_latitude, gps_longitude,"
-                " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    asset.id,
-                    asset.scope_id,
-                    asset.file_name,
-                    asset.media_type.value,
-                    asset.path,
-                    asset.mime_type,
-                    asset.size_bytes,
-                    asset.status.value,
-                    asset.content_sha256,
-                    asset.captured_at.isoformat() if asset.captured_at else None,
-                    asset.captured_location.latitude if asset.captured_location else None,
-                    asset.captured_location.longitude if asset.captured_location else None,
-                    asset.created_at.isoformat(),
-                    asset.updated_at.isoformat(),
-                ),
-            )
+            try:
+                connection.execute(
+                    "INSERT INTO assets (id, scope_id, file_name, media_type, path, mime_type,"
+                    " size_bytes, status, content_sha256, captured_at, gps_latitude, gps_longitude,"
+                    " created_at, updated_at, external_source_id, source_timestamp, source_location,"
+                    " source_metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        asset.id,
+                        asset.scope_id,
+                        asset.file_name,
+                        asset.media_type.value,
+                        asset.path,
+                        asset.mime_type,
+                        asset.size_bytes,
+                        asset.status.value,
+                        asset.content_sha256,
+                        asset.captured_at.isoformat() if asset.captured_at else None,
+                        asset.captured_location.latitude if asset.captured_location else None,
+                        asset.captured_location.longitude if asset.captured_location else None,
+                        asset.created_at.isoformat(),
+                        asset.updated_at.isoformat(),
+                        asset.external_source_id,
+                        asset.source_timestamp,
+                        asset.source_location,
+                        json.dumps(
+                            dict(asset.source_metadata), ensure_ascii=False, sort_keys=True, allow_nan=False
+                        ),
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                # A concurrent writer can win after find_by_external_source_id.
+                # Do not disguise primary-key, foreign-key or unrelated failures.
+                if (
+                    asset.external_source_id is None
+                    or error.sqlite_errorcode != sqlite3.SQLITE_CONSTRAINT_UNIQUE
+                    or str(error) != "UNIQUE constraint failed: assets.scope_id, assets.external_source_id"
+                ):
+                    raise
+                row = connection.execute(
+                    f"SELECT {_ASSET_COLUMNS} FROM assets WHERE scope_id = ? AND external_source_id = ?",
+                    (asset.scope_id, asset.external_source_id),
+                ).fetchone()
+                if row is None:
+                    raise
+                conflict = _row_to_asset(row)
+        # Raise after the connection contexts have exited normally. A handled
+        # identity collision must not poison an enclosing unit of work.
+        if conflict is not None:
+            raise SourceIdentityCollision(conflict)
 
     def get(self, asset_id: str) -> Asset | None:
         with self._database.connect() as connection:
@@ -130,11 +164,19 @@ class SqliteAssetRepository:
                 (status.value, asset_id),
             )
 
+    def find_by_external_source_id(self, scope_id: str, external_source_id: str) -> Asset | None:
+        with self._database.connect() as connection:
+            row = connection.execute(
+                f"SELECT {_ASSET_COLUMNS} FROM assets WHERE scope_id = ? AND external_source_id = ?",
+                (scope_id, external_source_id),
+            ).fetchone()
+        return _row_to_asset(row) if row else None
+
 
 _OBSERVATION_COLUMNS = (
     "id, scope_id, asset_id, source_type, captured_at, confidence, caption, place, activity,"
     " event_type, ocr_text, objects_json, clothing_json, people_json, facts_json, revision,"
-    " created_at, updated_at"
+    " created_at, updated_at, source_text"
 )
 
 
@@ -243,6 +285,7 @@ def row_to_observation(row: sqlite3.Row) -> Observation:
         people=_json_people(row["people_json"]),
         facts=_json_facts(row["facts_json"]),
         revision=row["revision"],
+        source_text=row["source_text"] or "",
     )
 
 
@@ -255,8 +298,8 @@ class SqliteObservationRepository:
             connection.execute(
                 "INSERT INTO observations (id, scope_id, asset_id, source_type, captured_at,"
                 " confidence, caption, place, activity, event_type, ocr_text, objects_json,"
-                " clothing_json, people_json, facts_json, revision, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " clothing_json, people_json, facts_json, revision, created_at, updated_at, source_text)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     observation.id,
                     observation.scope_id,
@@ -279,6 +322,7 @@ class SqliteObservationRepository:
                     observation.revision,
                     observation.created_at.isoformat(),
                     observation.updated_at.isoformat(),
+                    observation.source_text,
                 ),
             )
 
@@ -340,7 +384,7 @@ class SqliteObservationRepository:
         with self._database.connect() as connection, connection:
             connection.execute(
                 "UPDATE observations SET caption = ?, place = ?, activity = ?, event_type = ?,"
-                " ocr_text = ?, objects_json = ?, clothing_json = ?, facts_json = ?,"
+                " ocr_text = ?, source_text = ?, objects_json = ?, clothing_json = ?, facts_json = ?,"
                 " confidence = MAX(confidence, ?), revision = revision + 1,"
                 " updated_at = datetime('now') WHERE id = ?",
                 (
@@ -349,6 +393,7 @@ class SqliteObservationRepository:
                     semantics.activity,
                     semantics.event_type,
                     semantics.ocr_text,
+                    semantics.source_text,
                     json.dumps(list(semantics.objects), ensure_ascii=False),
                     json.dumps(list(semantics.clothing), ensure_ascii=False),
                     json.dumps([dataclasses.asdict(item) for item in semantics.facts], ensure_ascii=False),

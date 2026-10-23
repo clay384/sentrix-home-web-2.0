@@ -10,13 +10,15 @@ from sentrix.infrastructure.thread_limits import configure_thread_environment
 configure_thread_environment()
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import APIRouter, FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException
-from starlette.responses import Response
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 from starlette.types import Scope
 
 from sentrix import __version__
@@ -142,6 +144,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     container.database.migrate()
 
     app = FastAPI(title="Sentrix Home API", version=__version__, docs_url=None, redoc_url=None)
+    if settings.corpus_read_only:
+
+        @app.middleware("http")
+        async def protect_corpus(
+            request: Request, call_next: Callable[[Request], Awaitable[Response]]
+        ) -> Response:
+            path = request.url.path
+            conversation_write = request.method == "POST" and (
+                path == "/api/v1/assistant/conversations"
+                or (path.startswith("/api/v1/assistant/conversations/") and path.endswith("/turns"))
+            )
+            if request.method not in {"GET", "HEAD", "OPTIONS"} and not conversation_write:
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "code": "corpus_read_only",
+                        "message": "资料已冻结，只允许查询和问答。",
+                        "detail": {},
+                    },
+                )
+            return await call_next(request)
+
     app.state.container = container
     app.add_exception_handler(DomainError, domain_error_handler)
 

@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from sentrix.domain.media.inspection import build_inspect_prompt
+from sentrix.infrastructure.assistant.chat_client import MAX_ANSWER_TOKENS
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
 from sentrix.infrastructure.media.vlm_observer import _encode_image, chat_json
 
@@ -41,10 +42,20 @@ from sentrix.infrastructure.media.vlm_observer import _encode_image, chat_json
 class OpenAIPhotoInspector:
     """实现 ``PhotoInspector`` 端口。模型进程的生命周期不归 2.0 管。"""
 
-    def __init__(self, base_url: str, model: ServedModel, *, timeout_s: float = 180.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: ServedModel,
+        *,
+        timeout_s: float = 180.0,
+        output_tokens: int = MAX_ANSWER_TOKENS,
+        enable_thinking: bool | None = None,
+    ) -> None:
         self._endpoint = f"{base_url.rstrip('/')}/chat/completions"
         self._model = model
         self._timeout = timeout_s
+        self._output_tokens = output_tokens
+        self._enable_thinking = enable_thinking
 
     @property
     def model_id(self) -> str:
@@ -78,4 +89,12 @@ class OpenAIPhotoInspector:
         和 ``OpenAIPersonVision._chat`` 同一个手法，用例据此断言发出去的提示词与图的次序，
         而不必起 HTTP 服务。
         """
-        return chat_json(self._endpoint, self._model, prompt, images, self._timeout)
+        return chat_json(
+            self._endpoint,
+            self._model,
+            prompt,
+            images,
+            self._timeout,
+            output_tokens=self._output_tokens,
+            enable_thinking=self._enable_thinking,
+        )

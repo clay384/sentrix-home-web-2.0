@@ -30,6 +30,7 @@ from sentrix.domain.places.aliases import PlaceAliases
 from sentrix.domain.places.matching import place_text_matches
 from sentrix.domain.places.models import Place
 from sentrix.domain.places.ports import AssetPlaceRepository
+from sentrix.domain.retrieval.lexical import normalize_text
 from sentrix.domain.retrieval.models import CandidateHit
 
 CHANNEL = "metadata"
@@ -127,6 +128,8 @@ class RetrieveMetadata:
         「本来就没有 GPS」→ 放行。1.0 对这三种情况一视同仁地放行，这才是它把整个
         scope 灌进 metadata 通道的根因。
         """
+        if asset.source_location:
+            return normalize_text(place) in normalize_text(asset.source_location)
         if resolved is not None:
             return place_text_matches(place, resolved, self._aliases)
         return not self._recognize_place(asset.id)
@@ -141,6 +144,10 @@ def _within(bounds: tuple[datetime, datetime], captured_at: datetime | None) -> 
     """
     if captured_at is None:
         return True
+    # A source wall clock and a known instant have no safe ordering until the
+    # source timezone is known. Do not invent one or discard either offset.
+    if len({value.utcoffset() is not None for value in (*bounds, captured_at)}) > 1:
+        return False
     return bounds[0] <= captured_at < bounds[1]
 
 

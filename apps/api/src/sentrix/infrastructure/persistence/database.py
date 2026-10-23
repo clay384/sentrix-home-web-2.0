@@ -11,13 +11,39 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from pathlib import Path
+from types import TracebackType
+from typing import Literal
 
 BUSY_TIMEOUT_MS = 30_000
 
 
 class MigrationError(RuntimeError):
     """迁移不可执行——宁可启动失败，也不静默跑出一个没有 schema 的库。"""
+
+
+class TransactionError(RuntimeError):
+    """A repository failure prevents the enclosing unit of work from committing."""
+
+
+class _ManagedConnection(sqlite3.Connection):
+    """Repository ``with connection`` blocks cannot commit an enclosing unit of work."""
+
+    managed = False
+    rollback_only = False
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        if self.managed:
+            if exc_type is not None:
+                self.rollback_only = True
+            return False
+        return super().__exit__(exc_type, exc_value, traceback)
 
 
 def _statements(sql_text: str) -> list[str]:
@@ -35,16 +61,74 @@ class Database:
     def __init__(self, path: Path, migrations_dir: Path) -> None:
         self.path = Path(path)
         self.migrations_dir = Path(migrations_dir)
+        self._transaction_connection: ContextVar[_ManagedConnection | None] = ContextVar(
+            f"sentrix_transaction_{id(self)}", default=None
+        )
+        self._savepoint_sequence = 0
 
-    @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
+    def _open(self) -> _ManagedConnection:
+        connection = sqlite3.connect(self.path, factory=_ManagedConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        return connection
+
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        active = self._transaction_connection.get()
+        if active is not None:
+            try:
+                yield active
+            except BaseException:
+                active.rollback_only = True
+                raise
+            return
+        connection = self._open()
         try:
             yield connection
         finally:
+            connection.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Share one connection across repositories, with nested savepoint isolation.
+
+        This covers SQLite writes only. Media files, cloud journals and derived
+        indexes remain the caller's separately managed resources.
+        """
+        active = self._transaction_connection.get()
+        if active is not None:
+            self._savepoint_sequence += 1
+            name = f"sentrix_uow_{self._savepoint_sequence}"
+            previous_rollback_only = active.rollback_only
+            active.execute(f"SAVEPOINT {name}")
+            try:
+                yield active
+                if active.rollback_only and not previous_rollback_only:
+                    raise TransactionError("A nested repository operation failed")
+                active.execute(f"RELEASE SAVEPOINT {name}")
+            except BaseException:
+                active.execute(f"ROLLBACK TO SAVEPOINT {name}")
+                active.execute(f"RELEASE SAVEPOINT {name}")
+                active.rollback_only = previous_rollback_only
+                raise
+            return
+
+        connection = self._open()
+        connection.managed = True
+        token = self._transaction_connection.set(connection)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            if connection.rollback_only:
+                raise TransactionError("A repository operation failed; the unit of work was rolled back")
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            self._transaction_connection.reset(token)
             connection.close()
 
     def migrations(self) -> list[tuple[str, Path]]:

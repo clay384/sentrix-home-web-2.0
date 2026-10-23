@@ -61,6 +61,9 @@ JUDGE_SYSTEM = """你是 Sentrix 家庭记忆助手的“事实一致性评审�
 - search_memories 返回 total=0（无候选）时，回答里出现“已为您找到/找到 N 张照片”这类明确交付断言是编造；
   但如实说“没有找到”正确。
 - search_memories 返回 total>0（有候选）时，回答里出现“没有找到任何相关照片”是漏报。
+- read_source_text 返回的 imported_source_text 是文本原文证据；文本资料不要求图片交付。
+- external_source_id 是工具提供的来源身份，可在用户要求来源ID时引用；
+  source_timestamp 和 source_location 是原始资料元数据，不要求由图片复核重新识别。
 - read_photo_text / inspect_photo 返回 supported 的观察中直接读出的内容（价格/文字/颜色/年份/电话/店名）
   是照片复核层证据，模型引用这些细节回答不算编造；不要因为检索层只是 partial/candidate
   就要求模型把这些已读出的细节改成“还不能确认”。

@@ -269,15 +269,28 @@ class EventCandidateScore:
         }
 
 
+def event_times_compatible(*values: datetime | None) -> bool:
+    """Missing timezone information cannot establish an instant or a distance.
+
+    Keep source wall clocks and existing aware timestamps unchanged. Values
+    within either family remain comparable using Python's existing semantics.
+    """
+    return len({value.utcoffset() is not None for value in values if value is not None}) <= 1
+
+
 def within_candidate_window(anchor_at: datetime | None, event_at: datetime | None) -> bool:
     """1.0 ``db.py:1967``：时间差超过 6 小时的活动事件连打分都不打。"""
     if anchor_at is None or event_at is None:
         return True
+    if not event_times_compatible(anchor_at, event_at):
+        return False
     return abs((anchor_at - event_at).total_seconds()) <= CANDIDATE_WINDOW_HOURS * 3600
 
 
 def _time_score(anchor_at: datetime | None, event_at: datetime | None) -> float:
     if anchor_at and event_at:
+        if not event_times_compatible(anchor_at, event_at):
+            return 0.0
         minutes = abs((anchor_at - event_at).total_seconds()) / 60.0
         return _decay(minutes, TIME_DECAY_MINUTES)
     return MISSING_TIME_SCORE

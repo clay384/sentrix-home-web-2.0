@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from sentrix.domain.identity.appearance import expanded_person_crop
+from sentrix.infrastructure.media.visual_provenance import register_visual_derivation
 
 # 1.0 ``person_moments.py:100-113`` 的原值。红框、线宽 3、标签画在框上方 14px。
 BOX_OUTLINE = "red"
@@ -84,6 +85,12 @@ def render_numbered_preview(
     # 也关掉句柄」由语言保证，不靠调用顺序。
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as handle:
         image.save(handle.name, format="JPEG", quality=JPEG_QUALITY)
+        register_visual_derivation(
+            handle.name,
+            asset_path,
+            "numbered_preview",
+            {"bboxes": [list(face.get("bbox") or [])[:4] for face in faces]},
+        )
         return handle.name, label_map
 
 
@@ -147,4 +154,5 @@ def render_person_crop(
     # 还在，with 保证异常路径上句柄也关得掉。
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as handle:
         crop.save(handle.name, format="JPEG", quality=JPEG_QUALITY)
+        register_visual_derivation(handle.name, asset_path, "crop", {"bbox": crop_bbox})
         return handle.name, crop_bbox

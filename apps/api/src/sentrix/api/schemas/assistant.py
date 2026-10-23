@@ -68,7 +68,7 @@ class StartTurnRequest(BaseModel):
     """
 
     # 一条空消息不是「一轮空对话」，是一次调用方错误，所以这里直接挡在 422。
-    message: str = Field(min_length=1, max_length=2000)
+    message: str = Field(min_length=1, max_length=131072)
     conversation_id: str = ""
 
 

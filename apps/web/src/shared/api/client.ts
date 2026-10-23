@@ -14,6 +14,11 @@ export interface AssetSummary {
   parent_asset_id?: string | null;
   /** 派生关键帧在源视频里的秒数；用它把 `<video>` 定位到命中帧。 */
   source_timestamp_sec?: number | null;
+  /** 可选的外部来源身份及原始元数据；旧服务可能不返回。 */
+  external_source_id?: string | null;
+  source_timestamp?: string | null;
+  source_location?: string;
+  source_metadata?: Record<string, unknown>;
   /**
    * 后端**目前不返回**。若将来 `/assets` 带上它，资料库就能按相册聚合；
    * 现在消费方必须按「可能为空」处理，不能把它当成一册一个值。

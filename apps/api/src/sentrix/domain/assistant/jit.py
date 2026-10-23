@@ -28,12 +28,13 @@ from sentrix.domain.assistant.tools import FINAL_ANSWER_TOOL, TOOL_SPECS, ToolSp
 #: 三个照片级工具都要一个**来自当前结果集**的 handle（``result_set_id`` 是它们的必填
 #: 参数）。没有结果集时给出它们，等于发一个注定以 ``unknown_result_set`` 失败的调用。
 #: 1.0 用同一条判据（``jit_prompt.py:113`` 的 ``asset_handle_in_current_preview``）。
-_PHOTO_LEVEL_TOOLS = frozenset({"inspect_photo", "read_photo_text", "query_photo_people"})
+_PHOTO_LEVEL_TOOLS = frozenset({"inspect_photo", "read_photo_text", "query_photo_people", "read_source_text"})
 
 #: 需求类型 -> 能满足它的工具。与 ``ToolSpec.satisfies`` 是同一条映射的两个方向，
 #: 但**不能反过来从 ``satisfies`` 现算**：``final_answer`` 也声明了 ``delivered_photo``，
 #: 而它是终止动作、永远在表里，让它出现在「满足这个需求的工具」里只会把规则绕回去。
 _TOOLS_BY_REQUIREMENT: dict[EvidenceType, frozenset[str]] = {
+    EvidenceType.SOURCE_TEXT: frozenset({"read_source_text"}),
     EvidenceType.VISIBLE_TEXT: frozenset({"read_photo_text"}),
     EvidenceType.VISUAL_OBSERVATION: frozenset({"inspect_photo"}),
     EvidenceType.PHOTO_IDENTITY: frozenset({"query_photo_people"}),
@@ -47,6 +48,7 @@ def select_tools(
     *,
     has_result_set: bool,
     tools_exhausted: bool,
+    mixed_mode: bool = False,
 ) -> tuple[ToolSpec, ...]:
     """这一步发给模型的工具集，**描述已经换成 ``brief``**。返回空元组是合法结果。
 
@@ -59,9 +61,30 @@ def select_tools(
     （模型照答，只是每次都多付两千多 token）。
     """
     return tuple(
-        replace(spec, description=spec.brief)
-        for spec in _select_offered(ledger, has_result_set=has_result_set, tools_exhausted=tools_exhausted)
+        _brief_spec(spec, mixed_mode=mixed_mode)
+        for spec in _select_offered(
+            ledger, has_result_set=has_result_set, tools_exhausted=tools_exhausted, mixed_mode=mixed_mode
+        )
     )
+
+
+def _brief_spec(spec: ToolSpec, *, mixed_mode: bool) -> ToolSpec:
+    if not mixed_mode:
+        return replace(spec, description=spec.brief)
+    brief = {
+        "search_memories": "检索整个资料范围的图片和文本，返回时间、地点、来源ID与节选。",
+        "get_result_page": "查看同一混合结果集的下一页；不要改词重搜。",
+        "final_answer": "遵守用户语言与格式给出最终答案；仅在展示图片时选择handles。",
+    }.get(spec.name, spec.brief)
+    parameters = spec.parameters
+    if spec.name == FINAL_ANSWER_TOOL:
+        properties = dict(parameters["properties"])
+        properties["answer"] = {
+            **properties["answer"],
+            "description": "最终回答，遵守用户要求的语言和答案格式。",
+        }
+        parameters = {**parameters, "properties": properties}
+    return replace(spec, description=brief, parameters=parameters)
 
 
 def _select_offered(
@@ -69,6 +92,7 @@ def _select_offered(
     *,
     has_result_set: bool,
     tools_exhausted: bool,
+    mixed_mode: bool = False,
 ) -> tuple[ToolSpec, ...]:
     if tools_exhausted:
         return ()
@@ -94,5 +118,11 @@ def _select_offered(
         # （``search_memories`` 一页 6 条、结果集最多 12 条）。1.0 的模型在任何时候都能
         # 调它；在 2.0 剪掉它就等于把「看第 7–12 张」这个能力整个拿掉。
         offered.add("get_result_page")
+        if any(item.evidence_type is EvidenceType.SOURCE_TEXT for item in ledger.requirements):
+            offered.add("read_source_text")
+        if mixed_mode:
+            # A text hit may complement an image goal, and vice versa. The handle's media
+            # type and the shared inspection budget still control actual execution.
+            offered.update({"read_source_text", "inspect_photo", "read_photo_text"})
 
     return tuple(spec for spec in TOOL_SPECS if spec.name in offered)

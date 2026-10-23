@@ -105,6 +105,12 @@ class StubToolbox:
         self._outcomes = dict(outcomes or {})
         self.calls: list[tuple[str, Mapping[str, object]]] = []
 
+    def is_text_scope(self, scope_id: str) -> bool:
+        return False
+
+    def is_mixed_scope(self, scope_id: str) -> bool:
+        return False
+
     def execute(
         self,
         name: str,

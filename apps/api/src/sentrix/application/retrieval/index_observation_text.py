@@ -80,6 +80,7 @@ def compose_text(observation: Observation) -> str:
         part
         for part in (
             observation.caption,
+            observation.source_text,
             observation.activity,
             observation.place,
             observation.ocr_text,
