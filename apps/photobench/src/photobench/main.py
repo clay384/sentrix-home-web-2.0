@@ -1,6 +1,6 @@
 """PhotoBench 的进程入口：FastAPI 装配 + 后台扫描 ``results/``。
 
-**端口 8772。** 设计文档 §5.1 的端口表给 2.0 的 PhotoBench 定的是 8772；1.0 跑在 8771
+**端口 9597。** 设计文档 §5.1 的端口表给 2.0 的 PhotoBench 定的是 9597；1.0 跑在 8771
 （裸进程 + ``scripts/deploy/restart_photobench.sh``，不受 systemd 管）。本切片只把
 **服务本身**起得来，进程守护方式归 S11。
 

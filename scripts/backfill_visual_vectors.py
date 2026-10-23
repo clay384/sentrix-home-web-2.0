@@ -28,7 +28,7 @@
 再重跑（或者干脆把服务停掉再跑）。
 
 用法：
-    # 先停掉 API（8191），否则镜像会静默丢掉
+    # 先停掉 API（9598），否则镜像会静默丢掉
     .venv/bin/python scripts/backfill_visual_vectors.py [scope]
 """
 

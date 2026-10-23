@@ -1978,7 +1978,7 @@ class Settings(BaseSettings):
 
     data_dir: Path = Field(default=Path("data"))
 
-    api_port: int = 8191
+    api_port: int = 9598
     api_host: str = "0.0.0.0"
 
     # 2.0 reuses 1.0's already-running model services; it never manages them.
@@ -5430,7 +5430,7 @@ ci: 全部通过
 
 自动验收只能保证链路没坏。**"输入内容词能不能搜出正确的照片"必须用眼睛看**。
 
-起服务（注意端口：8191 在 153 上已被别的进程占用，实测要换一个空闲端口）：
+起服务（注意端口：9598 在 153 上已被别的进程占用，实测要换一个空闲端口）：
 
 ```bash
 cd /home/asus/Github/sentrix-home-web2.0
@@ -5447,7 +5447,7 @@ done
 curl -s "http://127.0.0.1:8391/api/v1/search?q=%E6%A1%A5&scope_id=album1&limit=10"
 ```
 
-再起 Web（`cd apps/web && npm run dev -- --port 4274`，vite 把 `/api` 代理到 8191——**换端口时记得同步改 `vite.config.ts`**），在搜索框里输入内容词，看结果图对不对。
+再起 Web（`cd apps/web && npm run dev -- --port 4274`，vite 把 `/api` 代理到 9598——**换端口时记得同步改 `vite.config.ts`**），在搜索框里输入内容词，看结果图对不对。
 
 ### 实测记录（规划阶段在隔离副本上跑过一遍）
 
@@ -5554,4 +5554,4 @@ Qdrant 本地模式第二个进程打开同一目录：
 
 - **代码在隔离副本里，没进真实仓库。** 执行阶段要按本计划逐任务真写一遍。副本路径 `/home/asus/s2verify/repo` 可以留着对照，但不要直接 `cp` 过去——照着计划走一遍才是这份文档的价值所在。
 - **Task 27/28 的 `pyproject.toml` 依赖声明，在已提交历史里落在 T28。** 本计划修正后应落在 Task 27 的 Step 5（`qdrant-client` 是 T27 自己的依赖）。已提交的 T27 没有动 `pyproject.toml`，是 T28 才把四个包一起加上的；最终文件内容与副本逐字节一致，只是 commit 边界对不上计划。对着历史看计划时别以为漏了。
-- `8191` 端口在 153 上已被另一个进程占用（非 1.0 的 8091）。人工验收换空闲端口，`vite.config.ts` 的代理要同步改。
+- `9598` 端口在 153 上已被另一个进程占用（非 1.0 的 8091）。人工验收换空闲端口，`vite.config.ts` 的代理要同步改。

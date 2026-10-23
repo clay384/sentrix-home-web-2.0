@@ -61,7 +61,7 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
     config_root = tmp_path / "config"
     config_root.mkdir()
     for name, payload in (
-        ("runtime_connection.json", {"sentrix_url": "http://sentrix:8191"}),
+        ("runtime_connection.json", {"sentrix_url": "http://sentrix:9598"}),
         ("judge_providers.json", PROVIDERS),
         ("vllm_targets.json", TARGETS),
     ):

@@ -74,7 +74,7 @@ SENTRIX_LEGACY_CLIP_URL=http://127.0.0.1:8103 \
 SENTRIX_TEXT_EMBEDDER_URL=http://127.0.0.1:8101 \
 SENTRIX_VLM_BASE_URL=http://127.0.0.1:8100/v1 \
 .venv/bin/python -m uvicorn --factory sentrix.main:create_app \
-  --host 0.0.0.0 --port 8191 --app-dir apps/api/src
+  --host 0.0.0.0 --port 9598 --app-dir apps/api/src
 ```
 
 首次导入前必须确保向量表是空的，或者用新 `model_name` 重嵌。切回 wemm 时同理。

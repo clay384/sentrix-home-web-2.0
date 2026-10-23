@@ -71,12 +71,12 @@ def default_import_timeout() -> int:
 
 
 #: 2.0 主 API 的默认启动命令。与仓库 ``Makefile`` 的 ``dev`` 目标逐字一致——那一条就是
-#: 2.0 的进程入口（``uvicorn --factory sentrix.main:create_app --port 8191
+#: 2.0 的进程入口（``uvicorn --factory sentrix.main:create_app --port 9598
 #: --app-dir apps/api/src``）。换部署形态（容器 / systemd / 另一个端口）只需覆盖
 #: ``PHOTOBENCH_SENTRIX_START_COMMAND``，**不改这里、也不改重启模块**。
 DEFAULT_SENTRIX_START_COMMAND = (
     ".venv/bin/python -m uvicorn --factory sentrix.main:create_app "
-    "--host 0.0.0.0 --port 8191 --app-dir apps/api/src"
+    "--host 0.0.0.0 --port 9598 --app-dir apps/api/src"
 )
 
 
@@ -90,7 +90,7 @@ class Settings:
     #: 在 data_root 之后：前三个没有默认值，dataclass 不允许无默认字段跟在有默认字段后面。
     web_dist_root: Path = APP_ROOT / "web" / "dist"
     #: 2.0 主 API 的健康检查基址（不含 ``/api/v1``）。重启后拿它确认真的起来了。
-    sentrix_api_url: str = "http://127.0.0.1:8191"
+    sentrix_api_url: str = "http://127.0.0.1:9598"
     #: 2.0 的检出根：启动命令的 ``cwd``（``--app-dir apps/api/src`` 是相对的）。
     #: 默认取 ``APP_ROOT.parents[1]``——``apps/photobench`` 上两级就是仓库根。
     sentrix_repo_root: Path = APP_ROOT.parents[1]
@@ -116,7 +116,7 @@ class Settings:
             results_root=_root("PHOTOBENCH_RESULTS_ROOT", APP_ROOT / "results"),
             data_root=_root("PHOTOBENCH_DATA_ROOT", APP_ROOT / "datasets"),
             web_dist_root=_root("PHOTOBENCH_WEB_DIST_ROOT", APP_ROOT / "web" / "dist"),
-            sentrix_api_url=os.environ.get("PHOTOBENCH_SENTRIX_API_URL", "http://127.0.0.1:8191").strip(),
+            sentrix_api_url=os.environ.get("PHOTOBENCH_SENTRIX_API_URL", "http://127.0.0.1:9598").strip(),
             sentrix_repo_root=_root("PHOTOBENCH_SENTRIX_REPO_ROOT", APP_ROOT.parents[1]),
             sentrix_start_command=os.environ.get(
                 "PHOTOBENCH_SENTRIX_START_COMMAND", DEFAULT_SENTRIX_START_COMMAND

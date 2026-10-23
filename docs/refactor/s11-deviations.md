@@ -65,18 +65,18 @@
 
 ---
 
-## 4. D：PhotoBench 侧的 8091 残留 —— 收敛到 8191
+## 4. D：PhotoBench 侧的 8091 残留 —— 收敛到 9598
 
 改了 4 个文件（1 个是**新增的第 4 处**，见下）：
 
 | 文件 | 改动 | 性质 |
 |---|---|---|
-| `apps/photobench/src/photobench/application/config/service.py:102` | fallback `http://127.0.0.1:8091` → `8191` | 代码，**受版本管理** |
-| `apps/photobench/config/runtime_connection.example.json` | `8091` → `8191` | 模板，受版本管理（任务书未点名，但同属残留） |
-| `apps/photobench/config/runtime_connection.json` | `http://192.168.0.153:8091` → `8191` | **部署者配置，`.gitignore` 忽略**（`config/runtime_connection.json`） |
-| `apps/photobench/tests/test_config_service.py:131` | 断言兜底 `8091` → `8191` | 测试，跟随代码默认值 |
+| `apps/photobench/src/photobench/application/config/service.py:102` | fallback `http://127.0.0.1:8091` → `9598` | 代码，**受版本管理** |
+| `apps/photobench/config/runtime_connection.example.json` | `8091` → `9598` | 模板，受版本管理（任务书未点名，但同属残留） |
+| `apps/photobench/config/runtime_connection.json` | `http://192.168.0.153:8091` → `9598` | **部署者配置，`.gitignore` 忽略**（`config/runtime_connection.json`） |
+| `apps/photobench/tests/test_config_service.py:131` | 断言兜底 `8091` → `9598` | 测试，跟随代码默认值 |
 
-**关于 `runtime_connection.json` 的取舍（已先读其现有内容）**：它现有 6 个键（`sentrix_url` / `judge_url` / `judge_model` / `model_base_url` / `endpoint_model` / `judge_provider_id`），是 2.0 PhotoBench（8772）在本机**实际生效**的连接配置（`settings.config_root` 默认 = `apps/photobench/config`，`config.py:66`）。**决定：就地改**，因为 153 上这套部署就是 2.0 自己，它该指向 8191；但它是 **gitignore 的部署文件**，改动**不进 git**、也不会随仓库分发到别的实例。所以：
+**关于 `runtime_connection.json` 的取舍（已先读其现有内容）**：它现有 6 个键（`sentrix_url` / `judge_url` / `judge_model` / `model_base_url` / `endpoint_model` / `judge_provider_id`），是 2.0 PhotoBench（9597）在本机**实际生效**的连接配置（`settings.config_root` 默认 = `apps/photobench/config`，`config.py:66`）。**决定：就地改**，因为 153 上这套部署就是 2.0 自己，它该指向 9598；但它是 **gitignore 的部署文件**，改动**不进 git**、也不会随仓库分发到别的实例。所以：
 - **可分发的那半**是代码兜底 + `*.example.json`（已在 git 里改）；
 - **每个已部署实例必须手工改**自己的 `runtime_connection.json`，否则它继续读旧值（文件值优先于兜底）。本机已改；**其他实例（若有）需运维照做**——这条记在这里，T1105 的 runbook 应带上。
 
@@ -143,7 +143,7 @@ Chinese-CLIP / ONNX 视觉嵌入器。T1102 判「不必要」，判据是「服
 
 ### 2.6 现状缺口：`PHOTOBENCH_SENTRIX_SERVICE_UNIT` **当前没设**
 
-`deploy/` 无命中，8772 进程环境里只有 `PHOTOBENCH_RESULTS_ROOT`。
+`deploy/` 无命中，9597 进程环境里只有 `PHOTOBENCH_RESULTS_ROOT`。
 ⇒ **生产的 PhotoBench 现在走的是裸进程路径，不是 systemd 接管**（T1103 的默认值）。
 runbook §4.1 已标出并给了补法。这是**部署配置**，不是代码缺陷。
 

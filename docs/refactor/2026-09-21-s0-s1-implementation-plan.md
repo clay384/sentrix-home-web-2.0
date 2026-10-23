@@ -4,7 +4,7 @@
 
 **Goal:** 搭起 2.0 的工程骨架与真相基线（S0），并打通第一条端到端竖切——导入一张真实照片，在浏览器里看到原图（S1）。
 
-**Architecture:** FastAPI 模块化单体，严格四层（domain / application / infrastructure / api），依赖方向由 `import-linter` 约束。SQLite 是业务事实源，用带版本号的 SQL 迁移管理 schema。2.0 独立于 1.0 运行（端口 8191/4274），共用 1.0 已在跑的模型服务（8100 llama-server、8101 bge-m3 sidecar）。
+**Architecture:** FastAPI 模块化单体，严格四层（domain / application / infrastructure / api），依赖方向由 `import-linter` 约束。SQLite 是业务事实源，用带版本号的 SQL 迁移管理 schema。2.0 独立于 1.0 运行（端口 9598/4274），共用 1.0 已在跑的模型服务（8100 llama-server、8101 bge-m3 sidecar）。
 
 **Tech Stack:** Python 3.11 / FastAPI / uvicorn / pydantic-settings / 标准库 sqlite3 / Pillow + pillow-heif / pytest / ruff / mypy / import-linter · React 19 / TypeScript / Vite / Vitest
 
@@ -347,7 +347,7 @@ def test_defaults_point_at_2_0_ports_and_data_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("SENTRIX_DATA_DIR", str(tmp_path))
     settings = Settings()
 
-    assert settings.api_port == 8191
+    assert settings.api_port == 9598
     assert settings.data_dir == tmp_path
     assert settings.database_path == tmp_path / "sentrix.db"
     assert settings.media_dir == tmp_path / "media"
@@ -401,7 +401,7 @@ class Settings(BaseSettings):
 
     data_dir: Path = Field(default=Path("data"))
 
-    api_port: int = 8191
+    api_port: int = 9598
     api_host: str = "0.0.0.0"
 
     # 2.0 reuses 1.0's already-running model services; it never manages them.
@@ -1935,8 +1935,8 @@ check-docs: ## 文档防腐校验
 ci: lint format-check typecheck arch check-docs coverage web-check ## CI 门禁
 	@echo "ci: 全部通过"
 
-dev: ## 起 2.0 API（8191）
-	$(PY) -m uvicorn --factory sentrix.main:create_app --host 0.0.0.0 --port 8191 --app-dir apps/api/src
+dev: ## 起 2.0 API（9598）
+	$(PY) -m uvicorn --factory sentrix.main:create_app --host 0.0.0.0 --port 9598 --app-dir apps/api/src
 
 web-dev: ## 起 2.0 Web（4274）
 	cd apps/web && npm run dev -- --port 4274
@@ -4429,7 +4429,7 @@ export default defineConfig({
     host: true,
     port: 4274,
     proxy: {
-      "/api": { target: "http://127.0.0.1:8191", changeOrigin: true },
+      "/api": { target: "http://127.0.0.1:9598", changeOrigin: true },
     },
   },
 });
@@ -4553,7 +4553,7 @@ export function AssetGrid({ assets }: { assets: AssetSummary[] }) {
   const [selected, setSelected] = useState<AssetSummary | null>(null);
 
   if (assets.length === 0) {
-    return <p className="empty">还没有照片。用 curl 导入一张：<code>curl -F file=@photo.jpg -F scope_id=album1 http://127.0.0.1:8191/api/v1/media/import</code></p>;
+    return <p className="empty">还没有照片。用 curl 导入一张：<code>curl -F file=@photo.jpg -F scope_id=album1 http://127.0.0.1:9598/api/v1/media/import</code></p>;
   }
 
   return (
@@ -4757,13 +4757,13 @@ Expected: 2 passed（若夹具路径不可用会 skip，需确认不是 skip）
 
 ```bash
 cd /home/asus/Github/sentrix-home-web2.0
-make dev &          # API on 8191
+make dev &          # API on 9598
 make web-dev &      # Web on 4274
 
 # 导入一张真实照片
 curl -s -F "file=@/home/asus/Github/Sentrix-Home-Web/data/album3-v2-source/photos/$(ls /home/asus/Github/Sentrix-Home-Web/data/album3-v2-source/photos | head -1)" \
      -F "scope_id=album1" \
-     http://127.0.0.1:8191/api/v1/media/import
+     http://127.0.0.1:9598/api/v1/media/import
 ```
 
 浏览器打开 `http://192.168.0.153:4274/`，确认：

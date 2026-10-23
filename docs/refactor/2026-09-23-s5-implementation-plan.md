@@ -3080,7 +3080,7 @@ vite 输出——**没有裁剪**。原始文件在隔离副本的 `logs/ci-2026
 （`make: *** [Makefile:51: coverage] 已杀死`，`EXIT=2`），另有两次 e2e 抖动
 （`e2e/test_assistant_turn.py` 的两条各失败一次），而**单独重跑该文件是 `6 passed`**。
 根因是同机的资源竞争（1.0 的 8091 RSS 11.7 GB、vLLM 8500、photobench runner、
-2.0 的 8191/4274 同时在这台机器上），**不是代码缺陷**。
+2.0 的 9598/4274 同时在这台机器上），**不是代码缺陷**。
 
 **「每个 commit 跑一次完整 `make ci`」这条要求如果不配判据，就会拿假红灯去改代码**——
 而那正是 S2/S3 反复栽过的那类错误。所以判据不写在人脑里，固化成一个脚本
@@ -3103,7 +3103,7 @@ vite 输出——**没有裁剪**。原始文件在隔离副本的 `logs/ci-2026
 | GPU | 13124 MiB / 24576 MiB 已用（剩 11 GB） | **5856 MiB / 24576 MiB 已用（剩 18.7 GB）** |
 | 内存 | 39 GB 已用 / 19 GB 可用 | 40 GB 已用 / **19 GB 可用**（不变） |
 | 磁盘 | `/home/asus` 可用 1.1 T | 不变 |
-| **装依赖会不会扰动 8191** | 未查 | **不会**：`readlink -f /home/asus/s5verify/repo/.venv` 是它自己的目录（不是符号链接），而 8191 的 `/proc/<pid>/cwd` 指向 `/home/asus/Github/sentrix-home-web2.0`，用的是**那个仓库的 venv**。两个 venv 互不相干 |
+| **装依赖会不会扰动 9598** | 未查 | **不会**：`readlink -f /home/asus/s5verify/repo/.venv` 是它自己的目录（不是符号链接），而 9598 的 `/proc/<pid>/cwd` 指向 `/home/asus/Github/sentrix-home-web2.0`，用的是**那个仓库的 venv**。两个 venv 互不相干 |
 
 **所以 S5b 的依赖可以装**，但有一处**必须先验证再决定**的风险：
 `onnxruntime-gpu` 与已有的 `torch 2.14.0` 要共处同一个 venv，两者的 CUDA/cuDNN 运行库

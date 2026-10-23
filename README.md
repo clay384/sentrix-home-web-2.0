@@ -30,8 +30,8 @@
 ### 153（默认，WeMM）
 
 ```bash
-make dev            # 主 API 8191
-make pb-dev         # PhotoBench 8772
+make dev            # 主 API 9598
+make pb-dev         # PhotoBench 9597
 ```
 
 或单独启动：
@@ -92,7 +92,7 @@ PHOTOBENCH_QA_CONCURRENCY=4 ...
 
 ```
 apps/api/          主产品（sentrix.*）：api → application → domain，infrastructure 实现端口
-apps/web/          主前端（8191 挂载）
+apps/web/          主前端（9598 挂载）
 apps/photobench/   独立评测包（photobench.*），只经 /api/v1 HTTP 访问主产品
 docs/architecture/ 设计、模块图、**强制规则与端口文档**
 docs/refactor/     重构计划、裁决、能力登记、偏离记录
@@ -117,7 +117,7 @@ make ci
 
 ## 评测
 
-PhotoBench 运行结果在 `apps/photobench/results/<run_id>/`，页面在 8772。
+PhotoBench 运行结果在 `apps/photobench/results/<run_id>/`，页面在 9597。
 QA 数据集在 `apps/photobench/datasets/`。
 
 ---

@@ -1029,7 +1029,7 @@ for name, gps in [('萧山', GpsPoint(30.1839, 120.2642)), ('清迈', GpsPoint(1
 "
 
 # 2. 整册导入后的时间线（S4b 完成后）
-#    curl -s http://127.0.0.1:8191/api/v1/timeline | python -m json.tool | head -40
+#    curl -s http://127.0.0.1:9598/api/v1/timeline | python -m json.tool | head -40
 ```
 
 **通过标准**（对应设计 §8 的 S4 行）：
@@ -1738,12 +1738,12 @@ store.is_confirmed_person_name(subject, scope_id)`。`_commit_semantic_image`
                                                     assert [] == [<ChatRole.SYSTEM…>, <ChatRole.USER…>]
 ```
 
-## 真数据验收（8191，重新导入 53 张）
+## 真数据验收（9598，重新导入 53 张）
 
-`data/` 清空（保留 `data/geo/`）后重启 8191 并重跑整册导入：
+`data/` 清空（保留 `data/geo/`）后重启 9598 并重跑整册导入：
 
 ```
-POST http://127.0.0.1:8191/api/v1/imports
+POST http://127.0.0.1:9598/api/v1/imports
 {"scope_id":"album1","directory":"/home/asus/Github/Sentrix-Home-Web/data/album3-v2-source/photos"}
 ```
 

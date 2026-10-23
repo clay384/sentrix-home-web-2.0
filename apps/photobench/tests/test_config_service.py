@@ -73,8 +73,8 @@ def test_file_values_win_over_the_builtin_fallbacks(config_root: Path):
 
 
 def test_environment_wins_over_the_file(config_root: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("BENCH_SENTRIX_URL", "http://from-env:8191")
-    assert _service(config_root).sentrix_url == "http://from-env:8191"
+    monkeypatch.setenv("BENCH_SENTRIX_URL", "http://from-env:9598")
+    assert _service(config_root).sentrix_url == "http://from-env:9598"
 
 
 def test_an_explicitly_empty_environment_value_means_unset(
@@ -128,7 +128,7 @@ def test_a_broken_runtime_connection_is_swallowed(config_root: Path):
     """1.0 ``:71``：连接配置是运行参数，坏了当空（改错了要能进去改回来）。"""
     (config_root / "runtime_connection.json").write_text("{ not json", encoding="utf-8")
     config = _service(config_root)
-    assert config.sentrix_url == "http://127.0.0.1:8191"  # 兜底
+    assert config.sentrix_url == "http://127.0.0.1:9598"  # 兜底
 
 
 def test_public_judge_providers_never_returns_the_whole_key(config_root: Path):
@@ -149,17 +149,17 @@ def test_persist_writes_the_file_and_takes_effect_immediately(config_root: Path)
     config = _service(config_root)
     saved = config.persist_runtime_connection(
         {
-            "sentrix_url": "http://new-host:8191",
+            "sentrix_url": "http://new-host:9598",
             "judge_url": "http://judge-new/v1",
             "judge_model": "m",
             "model_base_url": "http://new-host:8100",
             "judge_provider_id": "cloud",
         }
     )
-    assert saved["sentrix_url"] == "http://new-host:8191"
-    assert config.sentrix_url == "http://new-host:8191"
+    assert saved["sentrix_url"] == "http://new-host:9598"
+    assert config.sentrix_url == "http://new-host:9598"
     on_disk = json.loads((config_root / "runtime_connection.json").read_text(encoding="utf-8"))
-    assert on_disk["sentrix_url"] == "http://new-host:8191"
+    assert on_disk["sentrix_url"] == "http://new-host:9598"
     assert on_disk["model_base_url"] == "http://new-host:8100/v1"  # 归一化后落盘
 
 
@@ -167,7 +167,7 @@ def test_persist_requires_a_judge_model(config_root: Path):
     with pytest.raises(InvalidRequestError) as excinfo:
         _service(config_root).persist_runtime_connection(
             {
-                "sentrix_url": "http://x:8191",
+                "sentrix_url": "http://x:9598",
                 "judge_url": "http://j/v1",
                 "judge_model": "",
                 "judge_provider_id": "cloud",
@@ -202,7 +202,7 @@ def test_persist_writes_the_api_key_into_dotenv_not_the_json(config_root: Path):
     config = _service(config_root)
     config.persist_runtime_connection(
         {
-            "sentrix_url": "http://x:8191",
+            "sentrix_url": "http://x:9598",
             "judge_url": "http://j/v1",
             "judge_model": "m",
             "judge_provider_id": "cloud",
@@ -222,7 +222,7 @@ def test_a_multiline_secret_is_refused(config_root: Path):
     with pytest.raises(ValueError):
         config.persist_runtime_connection(
             {
-                "sentrix_url": "http://x:8191",
+                "sentrix_url": "http://x:9598",
                 "judge_url": "http://j/v1",
                 "judge_model": "m",
                 "judge_provider_id": "cloud",

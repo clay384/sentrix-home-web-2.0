@@ -70,13 +70,13 @@ describe("AppShell 壳层入口", () => {
     expect(dialog.textContent).toContain("相册管理");
   });
 
-  it("QA 测评在新窗口打开同主机的 8772", async () => {
+  it("QA 测评在新窗口打开同主机的 9597", async () => {
     const open = vi.spyOn(window, "open").mockImplementation(() => null);
     renderShell();
     await screen.findByText("第一册");
 
     fireEvent.click(screen.getByText("QA 测评"));
-    expect(open).toHaveBeenCalledWith("http://localhost:8772/", "_blank", "noopener,noreferrer");
+    expect(open).toHaveBeenCalledWith("http://localhost:9597/", "_blank", "noopener,noreferrer");
   });
 
   it("相册切换失败时提示，而不是静默停在旧范围", async () => {

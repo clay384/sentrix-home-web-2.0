@@ -5,7 +5,7 @@
  * `additionalProperties: true`**（它证明「有这条路径」，不证明形状），所以这里的字段
  * 逐个来自两处实证，注释里指到具体来源：
  *
- *   - 2.0 后端：`apps/photobench/src/photobench/`，以及 8772 上跑出来的真实响应；
+ *   - 2.0 后端：`apps/photobench/src/photobench/`，以及 9597 上跑出来的真实响应；
  *   - 1.0 前端消费处：`services/photobench/frontend/src/App.vue`（只读权威）。
  *
  * **纪律**：形状不确定就不编——大对象一律留 `[key: string]: unknown` 兜住未来切片要读的

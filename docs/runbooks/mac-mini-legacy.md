@@ -33,7 +33,7 @@ cd ~/GitHub/sentrix-home-web2.0
 1. 设置 `SENTRIX_DEPLOYMENT_PROFILE=mac`（profile 默认：legacy / 墙钟 600s /
    chat 180s / 人脸 CPU）；
 2. 拉起 8103 chinese-clip 侧车；
-3. 拉起 8191 API；
+3. 拉起 9598 API；
 4. 等 `/api/v1/health` 返回。
 
 profile 不负责数据根、模型/侧车地址、llama-server 上下文和 judge 配置，仍需显式设置。
@@ -48,7 +48,7 @@ profile 不负责数据根、模型/侧车地址、llama-server 上下文和 jud
 SENTRIX_DEPLOYMENT_PROFILE=mac \
 PHOTOBENCH_DATA_ROOT=$HOME/GitHub/Sentrix-Home-Web/services/photobench/data \
 .venv/bin/python -m uvicorn --factory photobench.main:create_app \
-  --host 0.0.0.0 --port 8772 --app-dir apps/photobench/src
+  --host 0.0.0.0 --port 9597 --app-dir apps/photobench/src
 ```
 
 ### 2.2 PhotoBench 迁移（必做）
@@ -56,7 +56,7 @@ PHOTOBENCH_DATA_ROOT=$HOME/GitHub/Sentrix-Home-Web/services/photobench/data \
 从 153 复制 PhotoBench 配置后，**必须**改 `apps/photobench/config/runtime_connection.json`：
 
 ```json
-{"sentrix_url": "http://127.0.0.1:8191", "model_base_url": "http://127.0.0.1:8100/v1", ...}
+{"sentrix_url": "http://127.0.0.1:9598", "model_base_url": "http://127.0.0.1:8100/v1", ...}
 ```
 
 PhotoBench 的 `SentrixClient` 读的是这个文件，不是 `PHOTOBENCH_SENTRIX_API_URL`。
@@ -66,10 +66,10 @@ PhotoBench 的 `SentrixClient` 读的是这个文件，不是 `PHOTOBENCH_SENTRI
 ## 3. 验证
 
 ```bash
-curl -s http://127.0.0.1:8191/api/v1/health
+curl -s http://127.0.0.1:9598/api/v1/health
 # {"status":"ok",...,"embeddings":"ok"}
 
-curl -s "http://127.0.0.1:8191/api/v1/search?q=街道&scope_id=<scope>&limit=5"
+curl -s "http://127.0.0.1:9598/api/v1/search?q=街道&scope_id=<scope>&limit=5"
 # channel_trace 里 visual_ann / text_ann 应为 ok，backend=qdrant / sqlite_exact
 ```
 

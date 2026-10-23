@@ -8,7 +8,7 @@ PhotoBench / model-manager **独立启停**」。下面每一条都是**真机�
 
 ## 1. 独立性矩阵（2026-10-06 实测）
 
-| 动作 | 8191 | 8772 | 8500 | 8100 | 8101 | 8102 |
+| 动作 | 9598 | 9597 | 8500 | 8100 | 8101 | 8102 |
 |---|---|---|---|---|---|---|
 | 起点 | 200 | 200 | 200 | 200 | 200 | 200 |
 | `stop sentrix-api` | **000** | 200 | 200 | 200 | 200 | 200 |
@@ -42,13 +42,13 @@ T1102 实测：对两个服务各 `kill -9` 主进程 → **8 秒后 systemd 自
 
 | 探活 | 结果 |
 |---|---|
-| `8191 /` | 200 `text/html` |
-| `8191 /timeline`（react-router 深链） | 200 `text/html` ← **SPA 回落生效** |
-| `8191 /api/v1/health` | 200 `application/json` |
-| `8191 /api/v1/nope` | **JSON 404** ← **API 没被静态挂载遮蔽** |
-| `8772 /` | 200 `text/html` |
-| `8772 /api/config` | 200 `application/json` |
-| `8772 /api/runs` | 191 个 run（扫的是 1.0 的 results） |
+| `9598 /` | 200 `text/html` |
+| `9598 /timeline`（react-router 深链） | 200 `text/html` ← **SPA 回落生效** |
+| `9598 /api/v1/health` | 200 `application/json` |
+| `9598 /api/v1/nope` | **JSON 404** ← **API 没被静态挂载遮蔽** |
+| `9597 /` | 200 `text/html` |
+| `9597 /api/config` | 200 `application/json` |
+| `9597 /api/runs` | 191 个 run（扫的是 1.0 的 results） |
 
 > **2026-10-07 补注**：上表的路径写于当时，PhotoBench 的前缀当日是 `/api`。2026-10-07 完成 T924 后改为 **`/api/v1`**——上表里的 `/api/config`、`/api/runs` 现在是 `/api/v1/config`、`/api/v1/runs`。本表保持原样作为当时的记录。
 

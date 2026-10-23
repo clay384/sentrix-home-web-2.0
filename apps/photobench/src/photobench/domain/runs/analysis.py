@@ -990,7 +990,7 @@ def capability_summary(
 
     # **`timing_breakdown` 是 1.0 的存档字段，2.0 的 run 从来不写它。** 只读它的话，
     # `judge_llm_latency_mean_ms` / `agent_task_latency_mean_ms` 恒为 None——
-    # 8772 页面上那两行有位置、没数字。2.0 的真实来源是 item 级的 `judge_ms`
+    # 9597 页面上那两行有位置、没数字。2.0 的真实来源是 item 级的 `judge_ms`
     # 与 `wall_clock_ms`（后者减去前者就是 agent 的墙钟）。
     def _flat_ms(item: Mapping[str, Any], key: str) -> float | None:
         value = item.get(key)

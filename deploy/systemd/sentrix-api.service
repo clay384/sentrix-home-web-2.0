@@ -1,4 +1,4 @@
-# Sentrix Home Web 2.0 主 API（端口 8191，生产时同时 serve apps/web 的 dist）。
+# Sentrix Home Web 2.0 主 API（端口 9598，生产时同时 serve apps/web 的 dist）。
 #
 # 单元文件**放在仓库里**（deploy/systemd/），由 `make install-services` 拷到
 # ~/.config/systemd/user/ 后生效。这样单元与它启动的代码同源、可复现；
@@ -9,14 +9,14 @@
 #
 # T1102 之前这是前台裸进程（`make dev`），机器重启即丢；Restart= 由 systemd 兜底。
 [Unit]
-Description=Sentrix Home 2.0 API (port 8191)
+Description=Sentrix Home 2.0 API (port 9598)
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Github/sentrix-home-web2.0
+WorkingDirectory=%h/lingbot-map/004SHW/sentrix-home-web-2.0
 # 与 Makefile 的 `dev` 目标逐字一致（`.venv/bin/python -m uvicorn --factory ...`）。
-ExecStart=%h/Github/sentrix-home-web2.0/.venv/bin/python -m uvicorn --factory sentrix.main:create_app --host 0.0.0.0 --port 8191 --app-dir apps/api/src
+ExecStart=%h/lingbot-map/004SHW/sentrix-home-web-2.0/.venv/bin/python -m uvicorn --factory sentrix.main:create_app --host 0.0.0.0 --port 9598 --app-dir apps/api/src
 # 崩溃即重拉；`systemctl --user stop` 的 SIGTERM 属正常退出，不触发重启。
 Restart=on-failure
 RestartSec=5

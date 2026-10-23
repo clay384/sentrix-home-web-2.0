@@ -3,12 +3,12 @@ import { describe, expect, it } from "vitest";
 import { qaDashboardUrl } from "./qa";
 
 describe("qaDashboardUrl", () => {
-  it("从当前页面的协议与主机名推导 8772，不写死 IP", () => {
+  it("从当前页面的协议与主机名推导 9597，不写死 IP", () => {
     expect(qaDashboardUrl({ protocol: "http:", hostname: "192.168.0.42" })).toBe(
-      "http://192.168.0.42:8772/",
+      "http://192.168.0.42:9597/",
     );
     expect(qaDashboardUrl({ protocol: "https:", hostname: "sentrix.local" })).toBe(
-      "https://sentrix.local:8772/",
+      "https://sentrix.local:9597/",
     );
   });
 
@@ -23,7 +23,7 @@ describe("qaDashboardUrl", () => {
 
   it("空配置回落到端口推导", () => {
     expect(qaDashboardUrl({ protocol: "http:", hostname: "localhost" }, "   ")).toBe(
-      "http://localhost:8772/",
+      "http://localhost:9597/",
     );
   });
 });

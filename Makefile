@@ -125,18 +125,18 @@ photobench-web-check: ## PhotoBench 前端门禁：同 web-check 四步
 	cd apps/photobench/web && npx vitest run
 	cd apps/photobench/web && npx vite build
 
-dev: ## 起 2.0 API（8191）
-	$(PY) -m uvicorn --factory sentrix.main:create_app --host 0.0.0.0 --port 8191 --app-dir apps/api/src
+dev: ## 起 2.0 API（9598）
+	$(PY) -m uvicorn --factory sentrix.main:create_app --host 0.0.0.0 --port 9598 --app-dir apps/api/src
 
 # PhotoBench 的入口也是工厂（`photobench.main` 没有模块级 app：那会让任何 import 带上
-# 建目录与起后台扫描线程的副作用）。端口 8772 出自设计文档 §5.1 的端口表；1.0 跑 8771。
-photobench-dev: ## 起 2.0 PhotoBench（8772）
-	$(PY) -m uvicorn --factory photobench.main:create_app --host 0.0.0.0 --port 8772 --app-dir apps/photobench/src
+# 建目录与起后台扫描线程的副作用）。端口 9597 出自设计文档 §5.1 的端口表；1.0 跑 8771。
+photobench-dev: ## 起 2.0 PhotoBench（9597）
+	$(PY) -m uvicorn --factory photobench.main:create_app --host 0.0.0.0 --port 9597 --app-dir apps/photobench/src
 
-web-dev: ## 起 2.0 Web（4274）
-	cd apps/web && npm run dev -- --port 4274
+web-dev: ## 起 2.0 Web（9501）
+	cd apps/web && npm run dev -- --port 9501
 
-photobench-web-dev: ## 起 PhotoBench 前端（4276）
+photobench-web-dev: ## 起 PhotoBench 前端（9502）
 	cd apps/photobench/web && npm run dev
 
 # S11 · T1102：两个 `systemd --user` 单元。单元文件在仓库 `deploy/systemd/`（与它启
@@ -158,7 +158,7 @@ install-services: ## 装 systemd --user 单元到 ~/.config/systemd/user/（S11�
 	install -m 0644 deploy/systemd/sentrix-wemm-sidecar.service $(SYSTEMD_USER_DIR)/
 	systemctl --user daemon-reload
 
-start: ## 起 2.0 两个 --user 服务（8191/8772）
+start: ## 起 2.0 两个 --user 服务（9598/9597）
 	systemctl --user start $(SERVICE_UNITS)
 
 stop: ## 停 2.0 两个 --user 服务

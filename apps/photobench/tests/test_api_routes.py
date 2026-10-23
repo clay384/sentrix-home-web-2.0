@@ -28,7 +28,7 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
     config_root = tmp_path / "config"
     config_root.mkdir()
     (config_root / "runtime_connection.json").write_text(
-        json.dumps({"sentrix_url": "http://sentrix:8191", "judge_provider_id": "cloud"}), encoding="utf-8"
+        json.dumps({"sentrix_url": "http://sentrix:9598", "judge_provider_id": "cloud"}), encoding="utf-8"
     )
     (config_root / "judge_providers.json").write_text(json.dumps(PROVIDERS), encoding="utf-8")
     (config_root / "vllm_targets.json").write_text(json.dumps(TARGETS), encoding="utf-8")
@@ -136,7 +136,7 @@ def test_the_write_routes_are_mounted(client: TestClient):
 
 def test_get_config_exposes_the_effective_values(client: TestClient):
     body = client.get("/api/v1/config").json()
-    assert body["default_sentrix_url"] == "http://sentrix:8191"
+    assert body["default_sentrix_url"] == "http://sentrix:9598"
     assert body["default_vllm_target_id"] == "local"
     assert body["default_judge_provider_id"] == "cloud"
     assert body["judge_providers"][0]["id"] == "cloud"
@@ -154,7 +154,7 @@ def test_post_config_persists_and_answers_in_the_1_0_shape(client: TestClient):
     response = client.post(
         "/api/v1/config",
         json={
-            "sentrix_url": "http://new:8191",
+            "sentrix_url": "http://new:9598",
             "judge_url": "http://j2/v1",
             "judge_model": "m2",
             "judge_provider_id": "cloud",
@@ -163,8 +163,8 @@ def test_post_config_persists_and_answers_in_the_1_0_shape(client: TestClient):
     )
     assert response.status_code == 200
     assert response.json()["saved"] is True
-    assert response.json()["runtime_config"]["sentrix_url"] == "http://new:8191"
-    assert client.get("/api/v1/config").json()["default_sentrix_url"] == "http://new:8191"
+    assert response.json()["runtime_config"]["sentrix_url"] == "http://new:9598"
+    assert client.get("/api/v1/config").json()["default_sentrix_url"] == "http://new:9598"
 
 
 def test_post_config_rejects_an_unknown_provider_with_a_400(client: TestClient):

@@ -630,8 +630,8 @@ S9b-1 把 1.0 `benchmark_orchestrator.py` 的 **HTTP 层、配置域与结果读
 
 | 项 | 值 | 出处 |
 |---|---|---|
-| PhotoBench 端口 | **2.0 = 8772**（1.0 = 8771）；主 API **2.0 = 8191**（1.0 = 8091） | 设计文档 §5.1；`SYSTEM_PROCESS_PORTS` 默认值在 S9b-1 改为 `8772, 8191, 8500, 8501, 8100, 8101, 6333` |
-| Apple 侧同一组端口 | 同步改为 `8772, 8191, ...`（数字变了，「多一个 mlx、不读 env」那条差别**不变**） | `apple_telemetry.py` |
+| PhotoBench 端口 | **2.0 = 9597**（1.0 = 8771）；主 API **2.0 = 9598**（1.0 = 8091） | 设计文档 §5.1；`SYSTEM_PROCESS_PORTS` 默认值在 S9b-1 改为 `9597, 9598, 8500, 8501, 8100, 8101, 6333` |
+| Apple 侧同一组端口 | 同步改为 `9597, 9598, ...`（数字变了，「多一个 mlx、不读 env」那条差别**不变**） | `apple_telemetry.py` |
 | API 前缀 | 本切片仍是 `/api`（与 1.0 相同）；改 `/api/v1` 是 S9c · T924 | `photobench/main.py` |
 | HTTP 客户端超时 | 按调用传；1.0 的默认 120 s，老 run 的资产查询用 15 s | 1.0 `:731`, `:6870` |
 | 非 2xx 的失败形状 | `RuntimeError("HTTP {code} {reason}: {detail}")`；`detail` 依次取 `detail` / `error` / `message` / 整个对象，正文先截 2000 字符、还原后截 1000 | 1.0 `:744-760` |

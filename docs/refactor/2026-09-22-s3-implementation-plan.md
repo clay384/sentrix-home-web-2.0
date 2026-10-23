@@ -7269,7 +7269,7 @@ class Settings(BaseSettings):
 
     data_dir: Path = Field(default=Path("data"))
 
-    api_port: int = 8191
+    api_port: int = 9598
     api_host: str = "0.0.0.0"
 
     # 2.0 reuses 1.0's already-running model services; it never manages them.
@@ -9054,7 +9054,7 @@ Run: `make ci`
 
 自动验收只能保证链路没坏。**"问一句「给我看看在海边的照片」，回来的图对不对"必须用眼睛看**。
 
-起服务（端口自己挑一个空的；153 上 8091/8191/8100/8101/8500 都被占着）：
+起服务（端口自己挑一个空的；153 上 8091/9598/8100/8101/8500 都被占着）：
 
 ```bash
 cd /home/asus/Github/sentrix-home-web2.0
@@ -9080,7 +9080,7 @@ TURN=$(curl -s -X POST "http://127.0.0.1:8391/api/v1/assistant/conversations/$CO
 curl -N -s "http://127.0.0.1:8391/api/v1/assistant/turns/$TURN/events"
 ```
 
-再起 Web（`cd apps/web && npm run dev -- --port 4274`，vite 把 `/api` 代理到 8191——**换端口时记得同步改 `vite.config.ts`**），在「问一句」的输入框里打「给我看看在海边的照片」，看回答下面的图对不对、点得开。
+再起 Web（`cd apps/web && npm run dev -- --port 4274`，vite 把 `/api` 代理到 9598——**换端口时记得同步改 `vite.config.ts`**），在「问一句」的输入框里打「给我看看在海边的照片」，看回答下面的图对不对、点得开。
 
 ### 实测记录（规划阶段在隔离副本上跑过一遍）
 

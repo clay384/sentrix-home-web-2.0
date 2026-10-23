@@ -46,7 +46,7 @@ def _write(path: Path, payload: object) -> None:
 def client(tmp_path: Path) -> Iterator[TestClient]:
     config_root = tmp_path / "config"
     config_root.mkdir()
-    _write(config_root / "runtime_connection.json", {"sentrix_url": "http://sentrix:8191"})
+    _write(config_root / "runtime_connection.json", {"sentrix_url": "http://sentrix:9598"})
     _write(config_root / "judge_providers.json", PROVIDERS)
     _write(config_root / "vllm_targets.json", TARGETS)
 
@@ -165,7 +165,7 @@ def test_qa_dataset_resolves_media_against_sentrix(client: TestClient):
             "assets": {"items": [{"id": "asset-1", "file_name": "pic.jpg", "media_type": "image"}]},
         },
     )
-    response = client.get("/api/v1/qa-dataset?album_id=album-a&qa_set=qa-1&sentrix_url=http://sentrix:8191")
+    response = client.get("/api/v1/qa-dataset?album_id=album-a&qa_set=qa-1&sentrix_url=http://sentrix:9598")
     assert response.status_code == 200
     body = response.json()
     assert body["album_id"] == "album-a" and body["qa_set"] == "qa-1"
@@ -181,12 +181,12 @@ def test_qa_dataset_resolves_media_against_sentrix(client: TestClient):
     ref = body["items"][0]["retrieval_media_refs"][0]
     assert ref["mapping_status"] == "ok"
     assert ref["asset_id"] == "asset-1"
-    assert ref["media_url"] == "http://sentrix:8191/api/v1/assets/asset-1/file"
+    assert ref["media_url"] == "http://sentrix:9598/api/v1/assets/asset-1/file"
     # 1.0 这条路用的是**裸** load_jsonl，不叠 qa_set 级 expected_action——多补一个字段
     # 就是响应形状变了。``AlbumSource.qa_rows`` 会补，所以不能走它。
     assert "expected_action" not in body["items"][0]
-    assert http.calls[0][0] == "http://sentrix:8191/api/v1/memory-spaces?limit=1000"
-    assert http.calls[1][0] == "http://sentrix:8191/api/v1/assets?limit=1000&scope_id=scope-1"
+    assert http.calls[0][0] == "http://sentrix:9598/api/v1/memory-spaces?limit=1000"
+    assert http.calls[1][0] == "http://sentrix:9598/api/v1/assets?limit=1000&scope_id=scope-1"
 
 
 def test_qa_dataset_without_media_refs_does_not_touch_sentrix(client: TestClient):

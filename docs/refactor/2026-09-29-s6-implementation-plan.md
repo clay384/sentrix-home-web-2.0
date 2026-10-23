@@ -30,7 +30,7 @@ S3 计划里也留了明确的交接（`2026-09-22-s3-implementation-plan.md:614
 ### 0.2 证据来源
 
 - 1.0 的 119 条路由（`grep '@app\.\(get\|post\|put\|patch\|delete\)' backend/*.py`）按四域逐条对拍；
-- 2.0 运行中实例 8191 的 `openapi.json`（39 条端点）；
+- 2.0 运行中实例 9598 的 `openapi.json`（39 条端点）；
 - 结构实测：五条 import-linter 契约、`scripts/check_*.py` 的判定逻辑、迁移建表与
   `git grep` 的引用比对、线上库 `data/sentrix.db` 行数；
 - 路线图：设计文档 §8、S3 计划的交接段、`frozen.md`、`capability-map.jsonl`。
@@ -1290,7 +1290,7 @@ PIL 边界在 `infrastructure/media/person_vision.py`，端口是 `PersonCropRen
 | family-graph 7 条、relationships CRUD、角色假设 | **S7**（设计 §8）；`s5-deviations.md` 第 15/35 条已标「随 S7」 |
 | `hardware` / `model-profiles` / `runtime-providers` 9 条 | **S11**；设计 §2.1「2.0 不管理模型进程生命周期」 |
 | PhotoBench 后端 / 前端 | **S9 / S10** |
-| **鉴权** | 裁决：**不着急**。核实过的事实记在此：`api/routes/` 零鉴权依赖，8191/8091 绑 `0.0.0.0`，局域网内任何人可读全部家庭照片、改身份数据。**它不是「缺功能」而是「缺一个设计决定」**，等排期时单独定 |
+| **鉴权** | 裁决：**不着急**。核实过的事实记在此：`api/routes/` 零鉴权依赖，9598/8091 绑 `0.0.0.0`，局域网内任何人可读全部家庭照片、改身份数据。**它不是「缺功能」而是「缺一个设计决定」**，等排期时单独定 |
 | 语义实体 / entity-groups / knowledge | **未归属**：`repositories/entities.py:8-13` 注释推给 S7，但 S7 的定义（设计 §8）里没有它。**列进 §6 待裁决** |
 | observations 原始列表、OCR settings / telemetry / query-gaps、`/api/dashboard` | 未归属，价值判断见 §6 |
 

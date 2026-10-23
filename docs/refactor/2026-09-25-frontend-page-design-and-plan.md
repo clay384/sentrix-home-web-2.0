@@ -49,7 +49,7 @@ S0–S5 的切片计划都是后端能力切片，前端每次都只是"顺手�
 | 2.0 是否已有 router | **没有**（`node_modules` 无 router/history） | `ls node_modules \| grep -iE "router\|history"` |
 | API 前缀 | `/api/v1` | `main.py:26` `APIRouter(prefix="/api/v1")`；`curl /openapi.json` 复核 |
 | 2.0 端点数 | **28 条路径 / 31 个操作** | `curl /openapi.json` 的 `paths` 去重计数 = 28；`grep "@router\." routes/*.py` = 31 条装饰器（`/assistant/conversations` 有 GET+POST 等）。**本文档一律按 28 条路径说** |
-| vite dev | 端口 4274，`/api` → `127.0.0.1:8191` | `vite.config.ts` |
+| vite dev | 端口 4274，`/api` → `127.0.0.1:9598` | `vite.config.ts` |
 | vitest | jsdom，`include: src/**/*.test.ts(x)` | `vite.config.ts` |
 | 现有前端测试 | **1 个文件**（`PeopleView.test.tsx`） | `find src -name "*.test.*"` |
 | `module-map.md` 是否含 `apps/web` | **0 次** | `grep -c "apps/web" docs/architecture/module-map.md` |
@@ -545,7 +545,7 @@ docs/architecture/module-map.md                  【改】+1 行（新文件）
 - [ ] **反向验证**：`curl /api/v1/memory-spaces` 实测，确认不在 28 端点清单里的这个真的出现了
 - [ ] `docs/architecture/module-map.md` 补行，`check_module_map.py` 绿
 
-**Run:** `make ci` · `curl -s http://127.0.0.1:8191/api/v1/memory-spaces`
+**Run:** `make ci` · `curl -s http://127.0.0.1:9598/api/v1/memory-spaces`
 
 ---
 

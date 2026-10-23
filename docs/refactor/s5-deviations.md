@@ -311,7 +311,7 @@ Task 69 已在隔离副本落地（commit `2824a5f`，`make ci` 全绿）。它�
 ### 2c.4 顾虑①的处置：`make ci` 真假红灯判据
 
 限制条件（实测）：153 同机在跑 1.0 的 8091（RSS 11.7 GB）、vLLM 8500、photobench runner、
-2.0 的 8191/4274，`make ci` 的 `coverage` 那一步被 SIGKILL 过，e2e 抖动过两次，
+2.0 的 9598/4274，`make ci` 的 `coverage` 那一步被 SIGKILL 过，e2e 抖动过两次，
 而**单独重跑失败文件是绿的**。如果不把判据固化，就会拿假红灯去改代码。
 
 **判据固化成一个脚本** `/home/asus/s5verify/ci.sh`（不写在人脑里），顺序执行：
@@ -693,7 +693,7 @@ provider 链实测是 `['CUDAExecutionProvider', 'CPUExecutionProvider']`——�
    到目前为止对 **Task 69 与 Task 70** 执行完毕，其余按计划继续进行；每个落地任务的
    红灯 / 绿灯 / `make ci` 原始输出都在计划文档的验证记录里。**没有实施的任务不写推测的
    2.0 代码块**——S2 的教训是「13–14% 的错误率全部发生在计划生成这一步」。
-4. **没有碰 1.0 仓库的任何文件**，没有重启 8091 / 8100 / 8101 / 8500 / 11434 / 8191 / 4274。
+4. **没有碰 1.0 仓库的任何文件**，没有重启 8091 / 8100 / 8101 / 8500 / 11434 / 9598 / 4274。
 5. **没有决定任何一条「待裁决」**——7 条都原样列在计划文档里。
 
 ---
@@ -742,7 +742,7 @@ provider 链实测是 `['CUDAExecutionProvider', 'CPUExecutionProvider']`——�
 | 2.0 venv 人脸依赖 | **全缺**（无 onnxruntime / insightface / opencv） |
 | 1.0 venv 人脸依赖 | `insightface 1.0.1` / `onnxruntime-gpu 1.23.2` / `opencv-contrib-python 4.10.0.84` |
 | AdaFace 权重 | 700,286,703 B（`/home/asus/models/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt`） |
-| 不稳定的根因 | 同机在跑 1.0 的 8091（RSS 11.7 GB）、vLLM 8500、photobench runner、2.0 的 8191/4274 |
+| 不稳定的根因 | 同机在跑 1.0 的 8091（RSS 11.7 GB）、vLLM 8500、photobench runner、2.0 的 9598/4274 |
 
 ---
 
@@ -1781,7 +1781,7 @@ make: *** [Makefile:56：coverage] 错误 1
 |---|---|---:|
 | 2022870 `VLLM::EngineCore`（父 2022624 = 监听 8100 的 `vllm`） | 8100 / 8500 | 19092 MiB |
 | 1507974 | 1.0 的 8091 | 2458 MiB |
-| 3623789 | 2.0 的 8191 | 1134 MiB |
+| 3623789 | 2.0 的 9598 | 1134 MiB |
 
 **基线那一次（第 111 条后记的 20:08 / `1066 passed` / 0 skipped）跑在 vLLM 起来之前**：
 `VLLM::EngineCore` 的 `etime` 起算于 2026-09-24 14:47，而基线是 11:33。所以 7 分 32 秒 / 14 red
@@ -1977,15 +1977,15 @@ llama.cpp 是**原生**支持 tools 的（1.0 ``chat_client`` 的模块注释：
 后端真正可用，8100 必须以 `--enable-auto-tool-choice --tool-call-parser <parser>` 重启**
 （parser 按模型选，gemma 系通常 `pythonic`/`hermes` 之一，需实测确认）。在那之前，2.0 的助手
 **能规划、不能跑工具循环**——见下面那次实测。
-### 实测：8191（旧进程）vs 8193（本次改动的代码）问同一句话
+### 实测：9598（旧进程）vs 8193（本次改动的代码）问同一句话
 
-8191 是 09-23 起就挂着的进程，跑的是改动前的代码，**不能重启**（用户明令）。所以另起一个
+9598 是 09-23 起就挂着的进程，跑的是改动前的代码，**不能重启**（用户明令）。所以另起一个
 实例（8193）用**本次改动的工作树**、`SENTRIX_DATA_DIR` 指向 `data/` 的副本（不动真 `data/`，
 用完即删），两边问同一句「给我看看海边的照片」：
 
 ```
-=== 改动前的进程 8191（09-23 起，跑的是旧代码） ===
-### BEFORE (http://127.0.0.1:8191) conversation=conv_9645ccf2f8ed turn=turn_20260925020240609107
+=== 改动前的进程 9598（09-23 起，跑的是旧代码） ===
+### BEFORE (http://127.0.0.1:9598) conversation=conv_9645ccf2f8ed turn=turn_20260925020240609107
 status            : partial
 termination_reason: planner_blocked
 answer            : 当前问题的证据需求无法可靠规划，因此暂时无法确认。
@@ -1999,7 +1999,7 @@ answer            : 这一轮没有检索到照片。还差这些没能确认：
 attachments       : 0
 ```
 
-**8191 的日志（真因一直是留全的）**：
+**9598 的日志（真因一直是留全的）**：
 
 ```
 sentrix.infrastructure.assistant.chat_client.ChatModelError: 模型返回 404：
@@ -2022,7 +2022,7 @@ sentrix.infrastructure.assistant.chat_client.ChatModelError: 模型返回 404：
   展示给用户」正是**规划器的输出**——规划成功地跑完了，这一点由它自己证明。
 - 失败点从**规划**移到了**工具循环**，原因是 8100 缺 tool-call 启动参数（见上一节），
   不是本次改动的缺陷，也不是 2.0 能在客户端修的。
-- 8191 那句「当前问题的证据需求无法可靠规划」正是裁决二要改掉的**基础设施故障被说成理解
+- 9598 那句「当前问题的证据需求无法可靠规划」正是裁决二要改掉的**基础设施故障被说成理解
   能力不足**；改动的树上这条路径由 `test_a_planner_that_cannot_be_reached_says_the_model_
   service_is_down` 与契约测试 `test_a_dead_endpoint_is_reported_as_the_model_service` 钉住
   （都带端点地址）。
@@ -2047,7 +2047,7 @@ sentrix.infrastructure.assistant.chat_client.ChatModelError: 模型返回 404：
 8100  vLLM gemma4-12b-it，pid 2022624（重启前）→ 2596792（重启后）
 8091  1.0 后端（Sentrix-Home-Web/.venv，env：SENTRIX_OPENAI_API_MODE=vllm、
       SENTRIX_VLLM_API_URL=http://127.0.0.1:8500、SENTRIX_VLLM_REGISTRY=/home/asus/sentrix-vllm/registry.json）
-8191  2.0 后端（SENTRIX_DATA_DIR=<2.0 仓库>/data）
+9598  2.0 后端（SENTRIX_DATA_DIR=<2.0 仓库>/data）
 8192  s5verify 的 2.0 实例（SENTRIX_DATA_DIR=/home/asus/s5verify/data-web-verify）
 ```
 
@@ -2055,7 +2055,7 @@ sentrix.infrastructure.assistant.chat_client.ChatModelError: 模型返回 404：
 `POST /v1/chat/completions` 的 peer 都是 `127.0.0.1`，没有一条来自别的机器；`ss -tn` 也没有
 到 8100 的连接。所以影响面就是上面三个本机后端 + 本机上临时跑的脚本。
 
-**1.0 的 8091 与 2.0 的 8191、8192 在重启窗口内拿不到模型**（不是它们的代码问题：它们都只是
+**1.0 的 8091 与 2.0 的 9598、8192 在重启窗口内拿不到模型**（不是它们的代码问题：它们都只是
 HTTP 客户端，端点回来即恢复）。用户已裁决重启，故执行；`8091` 事后仍在（见文末）。
 
 重启走 **manager**（`8500` 的 `POST /switch`），不自己 `kill` + 手起 vLLM：2.0 不管理模型
@@ -2180,7 +2180,7 @@ progress (tool steps):
 
 这是 §2n 那次 `failed` / `model_error` 的**直接对照**：同一条链路（规划 → 工具循环 →
 证据账本 → 答案门禁 → 回答）这次跑完了，两条需求都 `satisfied`，6 张照片真的交付了。
-`8191` 与 `8192` 都没重启（用户明令），8193 用的是本次工作树的代码、`SENTRIX_DATA_DIR`
+`9598` 与 `8192` 都没重启（用户明令），8193 用的是本次工作树的代码、`SENTRIX_DATA_DIR`
 指向 `/tmp/sentrix-8193-data`（`data/` 的 `cp -a` 副本，真 `data/` 全程没动）。
 
 **这条实测把 §2n 的判断正面证伪了一半**：§2n 写「在那之前，2.0 的助手能规划、不能跑工具
@@ -2256,20 +2256,20 @@ AFTER  这一轮没有检索到照片。还差这些没能确认：包含海边�
 
 ### 动过共享资源之后的必查项：1.0 的 8091 仍然活着
 
-8100 是 1.0 的 8091 与 2.0 的 8191 共用的。重启窗口结束后复测：
+8100 是 1.0 的 8091 与 2.0 的 9598 共用的。重启窗口结束后复测：
 
 ```
 $ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8091/api/health
 200
 $ curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8091/api/family-graph?scope_id=home-default'
 200
-$ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8191/api/v1/health
+$ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9598/api/v1/health
 200
 $ curl -s http://127.0.0.1:8100/v1/models | grep -o gemma4-12b-it
 gemma4-12b-it
 ```
 
-`8091` / `8101` / `11434` 全程没有重启，8191 也没有（用户明令）。8100 的进程号从
+`8091` / `8101` / `11434` 全程没有重启，9598 也没有（用户明令）。8100 的进程号从
 2022624 换成 2596792，启动命令末尾多了那两个 flag（上面 `cmd` 的输出）。
 
 ### 本次交付的 `make ci`（`bf022d4` 的树上，2026-09-25T10:41:47+08:00 起跑，load1=1.0）
@@ -2444,7 +2444,7 @@ IDENTICAL: 1.0 答案一字未变
 2.0 工作树的三个文件里，8091/8100 的进程、1.0 仓库、8100 的启动参数全部没碰
 （见下面「动过什么」）。**这个写死的名字本身就是 §2n 那条「模型名问端点要」的活证据。**
 
-### 8191 换新代码重启（裁决二）
+### 9598 换新代码重启（裁决二）
 
 旧进程是 **2026-09-23 10:40** 起的，跑的是旧代码（模型名还写死）。停掉，用**本次工作树**
 重起，`SENTRIX_DATA_DIR` 沿用旧进程那一份：
@@ -2452,7 +2452,7 @@ IDENTICAL: 1.0 答案一字未变
 ```
 === 旧进程 ===  3623789  Wed Sep 23 10:40:41 2026
 === 新进程 ===  2922328  Fri Sep 25 13:31:09 2026
-LISTEN 0.0.0.0:8191
+LISTEN 0.0.0.0:9598
 ```
 
 `/api/v1/health` → **200**。4274 的 Web 没重启（它只是前端，HMR 自己跟）。
@@ -2489,7 +2489,7 @@ result_set_id=rs_00a2c3684999
 越界 handle       http=404
 ```
 
-重启前那句固定文案 vs 重启后的真答案，说明「模型名写死」在 8191 上是**实际发生**过的坏法。
+重启前那句固定文案 vs 重启后的真答案，说明「模型名写死」在 9598 上是**实际发生**过的坏法。
 
 ### 顾虑（如实）
 
@@ -2558,7 +2558,7 @@ dist/assets/index-CX99wMss.js   240.85 kB │ gzip: 75.79 kB
 | 8101 / 11434 | 未碰 |
 | 4274（Web 3529372） | 未重启 |
 | `data/` | 未清；本次实测产生的会话与结果集是正常写入 |
-| 8191 | **停旧进程、用本次工作树重起**（用户裁决二要求） |
+| 9598 | **停旧进程、用本次工作树重起**（用户裁决二要求） |
 
 ---
 

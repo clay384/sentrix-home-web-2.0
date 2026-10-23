@@ -1,4 +1,4 @@
-"""静态产物挂载（S11 · T1101）：8772 顺带 serve ``apps/photobench/web/dist``。
+"""静态产物挂载（S11 · T1101）：9597 顺带 serve ``apps/photobench/web/dist``。
 
 PhotoBench 前端**没有 router**（两个视图用 ``useState`` 切，见 ``web/src/App.tsx``），
 所以这里**没有 SPA 回落**：未知路径就是 404。夹具让两种口径给出不同答案——同一个 dist
@@ -40,7 +40,7 @@ def dist(tmp_path: Path) -> Path:
 
 def settings_for(tmp_path: Path, dist_root: Path) -> Settings:
     config_root = tmp_path / "config"
-    _write(config_root / "runtime_connection.json", {"sentrix_url": "http://sentrix:8191"})
+    _write(config_root / "runtime_connection.json", {"sentrix_url": "http://sentrix:9598"})
     _write(config_root / "judge_providers.json", PROVIDERS)
     _write(config_root / "vllm_targets.json", TARGETS)
     (tmp_path / "results").mkdir(exist_ok=True)

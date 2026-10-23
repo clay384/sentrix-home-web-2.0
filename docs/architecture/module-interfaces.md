@@ -816,7 +816,7 @@ def test_chat_model_maps_prompt_too_long():
 | `SENTRIX_DATA_DIR` | 数据根，派生 db/media/previews/qdrant/geo | `data` | 全部持久化/索引 | 生产必设 |
 | `SENTRIX_WEB_DIST_DIR` | 前端构建产物 | `apps/web/dist` | Web 挂载 | 否 |
 | `SENTRIX_API_HOST` | 监听地址 | `0.0.0.0` | API | 否 |
-| `SENTRIX_API_PORT` | 端口 | `8191` | API | 否 |
+| `SENTRIX_API_PORT` | 端口 | `9598` | API | 否 |
 | `SENTRIX_VLM_BASE_URL` | OpenAI 兼容端点 | `http://127.0.0.1:8100/v1` | Chat/VLM/PersonVision/PhotoInspector | 否（缺失则助手不可用） |
 | `SENTRIX_WEMM_URL` | WeMM 侧车 | `http://127.0.0.1:8102` | wemm 方案 | 否（缺失降级） |
 | `SENTRIX_EMBEDDING_SCHEME` | **嵌入方案**：`wemm`（默认）/ `legacy` | `wemm` | 视觉+文本两条向量通道 | 否 |

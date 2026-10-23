@@ -3,7 +3,7 @@
 **两条断言必须都能分辨「实现正确」与「实现错误」**：
 
 - 「新端点进了子进程的环境变量」——这是整条路径的目的。一个只是把进程重起、
-  却没把 ``SENTRIX_VLM_BASE_URL`` 传下去的实现，看起来「重启成功了」（8191 健康），
+  却没把 ``SENTRIX_VLM_BASE_URL`` 传下去的实现，看起来「重启成功了」（9598 健康），
   但模型还是旧的：**这正是最该被抓住的那种假成功**。
 - 「先停后起」——顺序颠倒的两个进程会抢同一个端口，第二个起不来，而健康探测
   却可能在前一个的时间窗里回 ok。
@@ -77,7 +77,7 @@ class _Harness:
 
 def _process(harness: _Harness, http: FakeHttpClient, pid_file: Path) -> SubprocessSentrixProcess:
     return SubprocessSentrixProcess(
-        api_url="http://127.0.0.1:8191",
+        api_url="http://127.0.0.1:9598",
         start_command=[".venv/bin/python", "-m", "uvicorn"],
         cwd=Path("/repo"),
         pid_file=pid_file,
@@ -98,7 +98,7 @@ def _process(harness: _Harness, http: FakeHttpClient, pid_file: Path) -> Subproc
 def test_the_new_endpoint_is_exported_to_the_child_environment(tmp_path: Path):
     """**这条路径的目的**：新端点在子进程的环境变量里。
 
-    区分力：一个只重启进程、不传 ``SENTRIX_VLM_BASE_URL`` 的实现让 8191 照样健康
+    区分力：一个只重启进程、不传 ``SENTRIX_VLM_BASE_URL`` 的实现让 9598 照样健康
     （它退回 Settings 的默认 8100），而模型其实没换——用例只断言「起来了」的话
     对它是没有区分力的。
     """
@@ -133,7 +133,7 @@ def test_the_old_process_is_stopped_before_the_new_one_starts(tmp_path: Path):
     """先停后起，**两个都要停**：pid 记录里那个 + 按端口反查到的那个。
 
     区分力：只停自己起过的那一个的实现，第一次「换模型」会留下 ``make dev``
-    起的旧 8191，新进程在端口上撞车——而它在日志里表现成「起不来」，看不出是漏停。
+    起的旧 9598，新进程在端口上撞车——而它在日志里表现成「起不来」，看不出是漏停。
     """
     pid_file = tmp_path / "sentrix.json"
     pid_file.write_text('{"pid": 111, "endpoint": "http://old:8100/v1"}', encoding="utf-8")
@@ -234,8 +234,8 @@ def test_the_outcome_keeps_the_1_0_gamma_sync_shape():
 def test_the_port_discovery_only_looks_at_listeners(monkeypatch: pytest.MonkeyPatch):
     """按端口反查时**只认监听进程**，不能把客户端一起捞进来。
 
-    **来历不是推演**：S9c 真机验收驱动脚本在 Part A 用自己的 httpx 客户端探过 8191
-    的健康，连接留在池里；run 的 ``model_deploy`` 重启 2.0 时，``lsof -ti tcp:8191``
+    **来历不是推演**：S9c 真机验收驱动脚本在 Part A 用自己的 httpx 客户端探过 9598
+    的健康，连接留在池里；run 的 ``model_deploy`` 重启 2.0 时，``lsof -ti tcp:9598``
     把那个脚本也列了出来，于是它被自己的重启 SIGTERM 掉（静默，没有堆栈）。
     Web 前端、任何正在调 2.0 的进程都会这样被误杀。
 
@@ -254,7 +254,7 @@ def test_the_port_discovery_only_looks_at_listeners(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(module.shutil, "which", lambda _name: "/usr/bin/lsof")
     monkeypatch.setattr(module.subprocess, "run", fake_run)
-    assert module._discover_by_port(8191) == [12345]
+    assert module._discover_by_port(9598) == [12345]
     assert "-sTCP:LISTEN" in captured["argv"]
 
 

@@ -3,7 +3,7 @@
 > 路线图出处：设计文档 `docs/architecture/2026-09-21-sentrix-home-web-2-implementation-design.md:514`
 > ——「**S9 | PhotoBench 后端重构 | 7,751 行 stdlib 单文件 → FastAPI 拆分；断 `sys.path` 硬耦合；
 > 修死端点循环；改指 `/api/v1` | 能对 2.0 跑完一轮评测**」。它是 **M3（S8–S11）** 的第二段。
-> §5.1 的端口表（`:365`）给 2.0 的 PhotoBench 定的是 **8772**。
+> §5.1 的端口表（`:365`）给 2.0 的 PhotoBench 定的是 **9597**。
 >
 > 前置：S0–S8 全部完成（S8 于 2026-10-04 收口）。W1（检索换 wemm）完成。
 
@@ -72,7 +72,7 @@ from backend.apple_telemetry import LocalAppleUnifiedTelemetryProvider, is_apple
 - 1.0 的 PhotoBench 跑 **8771**，**不受 systemd 管**——裸进程 + `scripts/deploy/restart_photobench.sh`。
 - 启动时要扫 `results/` 下 **270 个 run 目录**，**约 55 秒**才绑端口（脚本注释明说）。
 - 结果体量大：单个 `run.json` 最大 **447 MB**、`results.jsonl` 337 MB。
-- 2.0 的目标端口是 **8772**（设计文档 §5.1）。
+- 2.0 的目标端口是 **9597**（设计文档 §5.1）。
 
 ---
 
@@ -132,7 +132,7 @@ PhotoBench / model-manager 独立启停」，这里的重启逻辑到 S11 可能
 | # | 内容 |
 |---|---|
 | T911 | 拆 `benchmark_orchestrator.py`。建议按域拆：**runs**（建/查/取消/重跑/评审）/ **config**（profiles / targets / judge providers）/ **judge**（打分与重判）/ **telemetry**（GPU 采样、功耗）/ **run-execution**（那条主链：建空间 → 种身份 → 导入 → 处理 → 问答 → 打分 → 聚合）/ **http-client**（`request_json` / `request_bytes` 的替代，2.0 用 `httpx`） |
-| T912 | HTTP 栈从 `http.server` 换成 FastAPI + uvicorn（端口 8772）。**40 多条路由**逐条对照搬 |
+| T912 | HTTP 栈从 `http.server` 换成 FastAPI + uvicorn（端口 9597）。**40 多条路由**逐条对照搬 |
 | T913 | **断 `sys.path` 硬耦合**（裁决①的连带）：不再反向 import 1.0 的 `backend/`，改为用 T901/T902 在 2.0 里的实现 |
 | T914 | 它自己的 `results/` 读写（270 个 run、单个 JSON 最大 447 MB）：**开服务时要扫目录**，1.0 因此要 55 秒才就绪。**这是一个真实的启动性能问题**，值得在迁移时一并想（懒加载？索引文件？）——但**先量再改**，不要凭感觉 |
 
@@ -287,7 +287,7 @@ lint 与 format 加 photobench 路径、新 `photobench-check` 段并挂上 ci �
 |---|---|---|
 | 1 | `OrinLlamaCppTelemetryProvider`（端点/ssh 用户/PID 路径全写死成「模型在 118、PhotoBench 在 153」） | **保留**（用户裁决①「照搬全量」）。2.0 若两者同机它确实是死重量，但那是**部署决定**，不是迁移时该替用户做的决定 |
 | 2 | `LocalAppleUnifiedTelemetryProvider`（只对 Mac M4 成立） | **保留**，同上。2.0 的目标机是 153，但 provider 可被替换——这正是把它做成端口的意义 |
-| 3 | **`SYSTEM_PROCESS_PORTS` 默认值是 1.0 的部署**（8771 / 8091 / 8500） | **S9b 必须改**（2.0 是 8772 / 8191，model-manager 归 S11）。不改的话 PhotoBench 自己的端口判据是过期的——进程名关键词还能兜住，端口那条已经失效。可由 env 覆盖，所以是「改默认值」不是「能不能改」 |
+| 3 | **`SYSTEM_PROCESS_PORTS` 默认值是 1.0 的部署**（8771 / 8091 / 8500） | **S9b 必须改**（2.0 是 9597 / 9598，model-manager 归 S11）。不改的话 PhotoBench 自己的端口判据是过期的——进程名关键词还能兜住，端口那条已经失效。可由 env 覆盖，所以是「改默认值」不是「能不能改」 |
 | 4 | Apple 那份的 `SYSTEM_PROCESS_KEYWORDS` 是**独立一份**（多 `mlx`、不读 env） | **不合并**。1.0 如此；合并会悄悄改变 Apple 主机上的归属结果 |
 | 5 | `backend/jetson_telemetry.py`（660 行）：1.0 的 `runtime_providers.py` **import 了它两个名字却从未使用**（F401），真正构造 Jetson provider 的是编排侧的 `select_runtime_providers` | **归 S9b**，与 `select_runtime_providers` 一起搬。它属于「provider 选择逻辑」那一块，不是 provider 本体 |
 
@@ -308,7 +308,7 @@ lint 与 format 加 photobench 路径、新 `photobench-check` 段并挂上 ci �
 
 ### S9b-1 服务骨架与 HTTP 层（2026-10-04）
 
-**交付点达成**：8772 起得来、能列出 run。建起 `application / api / bootstrap` 三层与
+**交付点达成**：9597 起得来、能列出 run。建起 `application / api / bootstrap` 三层与
 入口 `photobench.main`；契约从 8 条增至 **11 条**。
 
 #### 一条反直觉的实测，推翻了「懒加载」的设计直觉（T914）
@@ -418,7 +418,7 @@ coverage 94.35%；`web-check` 单独补跑绿；photobench 自己的 160 条用�
 - `InferenceProvider.health` / `token_count`、`TelemetryProvider.kv_cache` **仍无调用者**
   （主链的探活走 `chat`），登记保留、改注明「S9b-2 余项」。
 
-#### 真机验收（153，对跑着的 8191）
+#### 真机验收（153，对跑着的 9598）
 
 夹具：`/tmp/pb-smoke/album-smoke/` —— 2 张真照片（从 `album3-14` 拷来）+ 1 张参考脸 +
 2 道题（从 `compact-10q` 精简），**不进仓库**。
@@ -631,7 +631,7 @@ sqlite3.IntegrityError: FOREIGN KEY constraint failed
 根 `pyproject.toml`（judge.py 的 E501 单文件豁免）、`scripts/check_reachability.py` /
 `check_method_reachability.py`（各删一条被反向规则追上的登记）。
 
-#### 真机验收（153，对跑着的 8191 与 8100）
+#### 真机验收（153，对跑着的 9598 与 8100）
 
 夹具：`/tmp/pb-smoke/album-judge/` —— 2 张真照片 + 1 张参考脸 + 2 道题（**不进仓库**）。
 判分真打 **8100 的 llama-server**（qwen35-q4km），不烧云端额度。
@@ -795,7 +795,7 @@ systemd 管理下——`sentrix-vllm.service` 显示 active (exited) 是文档�
 新增 `scripts/export_photobench_openapi.py` → `packages/contracts/openapi/photobench.yaml`，
 挂上 `make check-docs`。文件名没有 `-v1`（前缀仍是 `/api`，T924 未做，见下）。
 
-#### 真机验收（153，对跑着的 8191 与 8100）
+#### 真机验收（153，对跑着的 9598 与 8100）
 
 夹具：`/tmp/pb-smoke/album-noident/` —— 2 张真照片 + 2 道题（**不进仓库**）。
 **没有 `faces`**：身份环为空是**刻意**的，为的是绕过 `POST /api/v1/imports` 在
@@ -820,11 +820,11 @@ aggregate            done   0.0s
 
 | 段 | 真跑 / 假件 |
 |---|---|
-| A. 重启路径（用真的 `SubprocessSentrixProcess`） | **真跑**：8191 从 8100 重启到标记端点 8199；旧 pid 消失、新 pid 在听、`/api/v1/health` 200、**`/proc/<新pid>/environ` 的 `SENTRIX_VLM_BASE_URL = 8199`** |
-| B. 一轮评测 | **真跑**：起 PhotoBench 8772 → `POST /api/runs`（model_base_url=8100）→ `model_deploy` 发现 2.0 正指着 8199，**在 run 内把它重启回 8100**（`gamma_sync = {ok:true, restarted:true, endpoint:8100, previous_endpoint:8199, pid:86759}`）→ 导入 / 处理 / 两道题走真模型（8100 的 llama-server）→ 判分也真打 8100 |
+| A. 重启路径（用真的 `SubprocessSentrixProcess`） | **真跑**：9598 从 8100 重启到标记端点 8199；旧 pid 消失、新 pid 在听、`/api/v1/health` 200、**`/proc/<新pid>/environ` 的 `SENTRIX_VLM_BASE_URL = 8199`** |
+| B. 一轮评测 | **真跑**：起 PhotoBench 9597 → `POST /api/runs`（model_base_url=8100）→ `model_deploy` 发现 2.0 正指着 8199，**在 run 内把它重启回 8100**（`gamma_sync = {ok:true, restarted:true, endpoint:8100, previous_endpoint:8199, pid:86759}`）→ 导入 / 处理 / 两道题走真模型（8100 的 llama-server）→ 判分也真打 8100 |
 > **2026-10-07 补注**：本文里的 `POST /api/runs` 等路径写于当时，PhotoBench 的前缀当日是 `/api`。T924 之后是 **`/api/v1`**。本行保持原样作为当时的记录。
 
-| C. 收尾核对 | **真跑**：8191 最终指着 8100，健康 200 |
+| C. 收尾核对 | **真跑**：9598 最终指着 8100，健康 200 |
 | 单元用例 | **全假件**（352 条），不碰网络、不起真进程 |
 | judge 打分 | **真跑**（8100 的 llama-server）：`judge_valid_count=2`、`answer_quality_mean=2.0`、`exact_accuracy=1.0` |
 | 身份环 / 关系 | **空**（夹具刻意无 faces，见上）——这是这一轮的**假件侧** |
@@ -836,7 +836,7 @@ aggregate            done   0.0s
 #### 真机验收抓到两个「假件看不见」的接缝缺陷（已修）
 
 1. **重启时的进程发现会误杀客户端**：`lsof -ti tcp:PORT` 把客户端也列出来，而验收
-   驱动脚本的 httpx 连接池里留着到 8191 的连接，于是它被自己触发的重启 SIGTERM 掉
+   驱动脚本的 httpx 连接池里留着到 9598 的连接，于是它被自己触发的重启 SIGTERM 掉
    （静默，没有堆栈）。修法是只停监听进程（`-sTCP:LISTEN`）。
 2. **读侧状态缓存不失效**：`ReadRuns._state` 的 LRU 2 从不失效，run 已 `completed`
    而 `GET /api/runs/{id}` 一直回 `running`（验收脚本按 API 轮询，白等十分钟）。
@@ -888,7 +888,7 @@ oxlint / vitest **62 passed** / vite build 82 ms）。
 | 段 | 交付点 | 状态 |
 |---|---|---|
 | S9a 运行时提供者与遥测（T901–T904） | 能在 2.0 里查到本机 GPU/模型进程遥测，provider 可换假件 | **完成** |
-| S9b-1 服务骨架与 HTTP 层（T911–T914） | 8772 起得来、能列出 run | **完成** |
+| S9b-1 服务骨架与 HTTP 层（T911–T914） | 9597 起得来、能列出 run | **完成** |
 | S9b-2 run-execution 主链 | 能对跑着的 2.0 跑完「建空间 → 种身份 → 导入 → 处理 → 问答」 | **完成**（真机达成） |
 | S9b-3 judge / 遥测聚合 / 写侧 | 一轮评测带着 judge 分数与遥测样本落盘 + 写侧路由 | **完成**（真机达成） |
 | S9c 适配与收口（T922 / T923 / T925） | 两个死端点 / 换模型重启 / openapi / 收口 | **完成**（真机达成） |

@@ -72,7 +72,7 @@ S9 把 1.0 那个 7,997 行的 stdlib 单文件重写成 2.0 的 FastAPI 分层�
 细节见计划书 §5 · S9a「偏离与待裁决」13 条 + 「带出来的待定项」5+3 条。摘要：
 
 - **1.0 那两个模块其实有测试**（计划书 §2 说「它们没有测试」不准确）；2.0 的用例是**重写**（改用假件对象）。
-- **`SYSTEM_PROCESS_PORTS` 的默认值改指 2.0 的 8772 / 8191**（1.0 是 8771 / 8091 / 8500）。
+- **`SYSTEM_PROCESS_PORTS` 的默认值改指 2.0 的 9597 / 9598**（1.0 是 8771 / 8091 / 8500）。
 - **Apple 那份 `SYSTEM_PROCESS_KEYWORDS` 不与 providers 合并**（多 `mlx`、不读 env；合并会悄悄改变归属结果）。
 - **`_process_smaps_field_mib` 结尾不可达的 `return None` 没搬**（行为等价）。
 - **`test_architecture_rules.py` 的 `CONTRACT_COUNT` 5→8**：它写死的是**全仓契约条数**，而 `lint-imports` 一次跑两个包。
@@ -160,7 +160,7 @@ PhotoBench 是**第二个发行包**，另起 `scripts/export_photobench_openapi
 
 | # | 缺陷 | 怎么暴露的 | 修法 |
 |---|---|---|---|
-| 1 | **`_discover_by_port` 会把客户端一起捞出来**：``lsof -ti tcp:PORT`` 列出**所有**用这个端口的进程——包括连着它的客户端。httpx 的连接池默认 keep-alive，于是 PhotoBench 自己、Web 前端、任何正在调 2.0 的进程都会被列进「要停的进程」，被 ``_terminate`` 一起 SIGTERM 掉 | **验收驱动脚本被自己触发的重启杀掉了**（静默 SIGTERM，没有堆栈）：它在 Part A 用自己的 httpx 客户端探过 8191 健康，连接留在池里；run 的 ``model_deploy`` 重启 2.0 时把它也列进了发现表 | 加 ``-sTCP:LISTEN``，只停**监听**进程。用例 `test_the_port_discovery_only_looks_at_listeners` 钉住这个参数 |
+| 1 | **`_discover_by_port` 会把客户端一起捞出来**：``lsof -ti tcp:PORT`` 列出**所有**用这个端口的进程——包括连着它的客户端。httpx 的连接池默认 keep-alive，于是 PhotoBench 自己、Web 前端、任何正在调 2.0 的进程都会被列进「要停的进程」，被 ``_terminate`` 一起 SIGTERM 掉 | **验收驱动脚本被自己触发的重启杀掉了**（静默 SIGTERM，没有堆栈）：它在 Part A 用自己的 httpx 客户端探过 9598 健康，连接留在池里；run 的 ``model_deploy`` 重启 2.0 时把它也列进了发现表 | 加 ``-sTCP:LISTEN``，只停**监听**进程。用例 `test_the_port_discovery_only_looks_at_listeners` 钉住这个参数 |
 | 2 | **读侧状态缓存不失效**：``ReadRuns._state`` 把按需解析的 run 状态缓进 LRU 2，从不失效。一个 run 在「还在跑」时被读过一次，之后**哪怕它已经完成**，``GET /api/runs/{id}`` 也一直回那份旧快照 | **验收脚本按 API 轮询，run.json 已经 completed、八个相位全 done，API 一直回 running**，脚本白等了十分钟（同一次验收里磁盘与 API 给出两个矛盾的答案） | 缓存**只对终态生效**：非终态（pending/running/cancelling）每次重新解析并摘掉旧缓存。用例 `test_a_running_run_is_not_served_from_a_stale_cache` 钉住 |
 
 **两条都是 S9b-1/S9c 自己写的代码**（不是 `apps/api` 那个不在范围的缺陷）。第 1 条尤其

@@ -39,7 +39,7 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
     config_root = tmp_path / "config"
     config_root.mkdir()
     (config_root / "runtime_connection.json").write_text(
-        '{"sentrix_url": "http://sentrix:8191"}', encoding="utf-8"
+        '{"sentrix_url": "http://sentrix:9598"}', encoding="utf-8"
     )
     (config_root / "judge_providers.json").write_text(
         '{"default_provider_id": "p", "providers": {"p": {"url": "http://j/v1", "model": "m"}}}',

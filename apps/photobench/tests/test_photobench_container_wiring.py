@@ -85,7 +85,7 @@ def test_a_run_execution_can_be_built_without_a_manager_or_an_endpoint(tmp_path)
             album_id="a",
             qa_set="q",
             model_profile="m",
-            sentrix_url="http://sentrix:8191",
+            sentrix_url="http://sentrix:9598",
             model_base_url="http://example.invalid:9999/v1",
         )
     )
@@ -100,7 +100,7 @@ def test_a_run_execution_can_be_built_without_a_manager_or_an_endpoint(tmp_path)
             album_id="a",
             qa_set="q",
             model_profile="m",
-            sentrix_url="http://sentrix:8191",
+            sentrix_url="http://sentrix:9598",
             manager_url="http://manager:8500",
             model_base_url="http://127.0.0.1:8100/v1",
         )

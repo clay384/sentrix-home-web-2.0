@@ -134,7 +134,7 @@ def _suites(
     config_root = tmp_path / "config"
     config_root.mkdir(exist_ok=True)
     (config_root / "runtime_connection.json").write_text(
-        json.dumps({"sentrix_url": "http://sentrix:8191", "judge_provider_id": "cloud"}), encoding="utf-8"
+        json.dumps({"sentrix_url": "http://sentrix:9598", "judge_provider_id": "cloud"}), encoding="utf-8"
     )
     (config_root / "judge_providers.json").write_text(json.dumps(PROVIDERS), encoding="utf-8")
     (config_root / "vllm_targets.json").write_text(json.dumps(TARGETS), encoding="utf-8")
@@ -427,7 +427,7 @@ def _judged_state() -> dict[str, Any]:
         "run_id": "run-1",
         "status": "completed",
         "scope_id": "PhotoBench-x",
-        "sentrix_url": "http://sentrix:8191",
+        "sentrix_url": "http://sentrix:9598",
         "items": [
             {
                 "qa_id": "q1",
@@ -547,7 +547,7 @@ def _cancelled_state(**over: Any) -> dict[str, Any]:
         "album_id": "album-x",
         "qa_set": "qa-1",
         "model_profile": "qwen",
-        "sentrix_url": "http://sentrix:8191",
+        "sentrix_url": "http://sentrix:9598",
         "items": [
             {"qa_id": "q1", "execution_status": "completed"},
             {"qa_id": "q2", "execution_status": "scheduled"},

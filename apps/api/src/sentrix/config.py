@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     # 「有产物 / 没产物」两种情形都能被摆到门禁里（见 ``main.py`` 的挂载逻辑）。
     web_dist_dir: Path = Field(default=REPO_ROOT / "apps" / "web" / "dist")
 
-    api_port: int = 8191
+    api_port: int = 9598
     api_host: str = "0.0.0.0"
 
     # 2.0 reuses 1.0's already-running model services; it never manages them.

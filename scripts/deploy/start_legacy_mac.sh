@@ -21,7 +21,7 @@ export SENTRIX_DEPLOYMENT_PROFILE="${SENTRIX_DEPLOYMENT_PROFILE:-mac}"
 
 DATA_DIR="${SENTRIX_DATA_DIR:-$PROJ/data}"
 CLIP_PORT="${SENTRIX_LEGACY_CLIP_PORT:-8103}"
-API_PORT="${SENTRIX_API_PORT:-8191}"
+API_PORT="${SENTRIX_API_PORT:-9598}"
 
 if ! pgrep -f "legacy_clip_sidecar.py" >/dev/null; then
   echo "启动 chinese-clip 侧车 :$CLIP_PORT"

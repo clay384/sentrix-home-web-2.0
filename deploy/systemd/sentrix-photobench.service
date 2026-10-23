@@ -1,26 +1,26 @@
-# Sentrix Home Web 2.0 PhotoBench 后端（端口 8772，生产时同时 serve 它的前端 dist）。
+# Sentrix Home Web 2.0 PhotoBench 后端（端口 9597，生产时同时 serve 它的前端 dist）。
 #
 # 同 sentrix-api.service：单元在仓库 deploy/systemd/，由 `make install-services` 安装。
 #
 # %h = 当前用户的 home。仓库按约定检出在 ~/Github/sentrix-home-web2.0。
 [Unit]
-Description=Sentrix Home 2.0 PhotoBench (port 8772)
+Description=Sentrix Home 2.0 PhotoBench (port 9597)
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Github/sentrix-home-web2.0
+WorkingDirectory=%h/lingbot-map/004SHW/sentrix-home-web-2.0
 # 2026-10-06 起不再指向 1.0 的 results/：评测历史（281 个 run、20 GB）属「旧数据」，
 # 用户裁决不迁。这里**故意不设** PHOTOBENCH_RESULTS_ROOT——`photobench/config.py:86`
 # 的缺省值 APP_ROOT/results 就是 2.0 自己的 apps/photobench/results，写死它反而多一处
 # 会漂的配置。空目录是安全的：FileRunStore.iter_entries 在 root 不存在时直接返回空
 # （`infrastructure/results/store.py`），不会抛。
-# 让 PhotoBench 通过 systemd 管 8191，而不是走裸进程路径（S11 §4.1 的补法）。
-# 不设的后果：它会 lsof 反查 pid、SIGTERM、再 Popen 一个 make dev——而 8191 归
-# systemd 管时那个新进程绑不上端口，8191 直接不可用（2026-10-07 实测）。
+# 让 PhotoBench 通过 systemd 管 9598，而不是走裸进程路径（S11 §4.1 的补法）。
+# 不设的后果：它会 lsof 反查 pid、SIGTERM、再 Popen 一个 make dev——而 9598 归
+# systemd 管时那个新进程绑不上端口，9598 直接不可用（2026-10-07 实测）。
 Environment=PHOTOBENCH_SENTRIX_SERVICE_UNIT=sentrix-api.service
 # 与 Makefile 的 `photobench-dev` 目标逐字一致。
-ExecStart=%h/Github/sentrix-home-web2.0/.venv/bin/python -m uvicorn --factory photobench.main:create_app --host 0.0.0.0 --port 8772 --app-dir apps/photobench/src
+ExecStart=%h/lingbot-map/004SHW/sentrix-home-web-2.0/.venv/bin/python -m uvicorn --factory photobench.main:create_app --host 0.0.0.0 --port 9597 --app-dir apps/photobench/src
 Restart=on-failure
 RestartSec=5
 

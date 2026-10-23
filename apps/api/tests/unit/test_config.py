@@ -5,7 +5,7 @@ def test_defaults_point_at_2_0_ports_and_data_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("SENTRIX_DATA_DIR", str(tmp_path))
     settings = Settings()
 
-    assert settings.api_port == 8191
+    assert settings.api_port == 9598
     assert settings.data_dir == tmp_path
     assert settings.database_path == tmp_path / "sentrix.db"
     assert settings.media_dir == tmp_path / "media"

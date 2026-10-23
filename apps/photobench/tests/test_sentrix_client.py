@@ -21,7 +21,7 @@ from fakes_read import FakeJsonHttpClient
 
 from photobench.infrastructure.sentrix.client import HttpxSentrixClient
 
-BASE = "http://sentrix:8191"
+BASE = "http://sentrix:9598"
 
 
 def _client(responses: dict) -> tuple[HttpxSentrixClient, FakeJsonHttpClient]:

@@ -48,7 +48,7 @@ def _write(path: Path, payload: object) -> None:
 def client(tmp_path: Path) -> Iterator[TestClient]:
     config_root = tmp_path / "config"
     config_root.mkdir()
-    _write(config_root / "runtime_connection.json", {"sentrix_url": "http://configured:8191"})
+    _write(config_root / "runtime_connection.json", {"sentrix_url": "http://configured:9598"})
     _write(config_root / "judge_providers.json", PROVIDERS)
     _write(config_root / "vllm_targets.json", TARGETS)
 
@@ -102,7 +102,7 @@ def test_memory_spaces_forwards_to_the_configured_url_and_builds_reuse_bases(cli
     http = _with_http(client, {"memory-spaces": {"spaces": [SPACE]}})
     body = client.get("/api/v1/memory-spaces").json()
     assert body["spaces"] == [SPACE]
-    assert http.calls[0][0] == "http://configured:8191/api/v1/memory-spaces"
+    assert http.calls[0][0] == "http://configured:9598/api/v1/memory-spaces"
     assert body["reuse_bases"] == [
         {
             "base_id": "album3::big_model",

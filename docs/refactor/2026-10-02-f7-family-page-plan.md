@@ -146,7 +146,7 @@ function relationChoices() {
 
 ## 3.6 `shared/api/client.ts` 要新增的接口（**这是并行施工的契约，签名不要改**）
 
-权威形状在 `GET http://127.0.0.1:8191/openapi.json` 的 `components.schemas`，
+权威形状在 `GET http://127.0.0.1:9598/openapi.json` 的 `components.schemas`，
 `Family*` 那十个。下面是前端要落的 TS：
 
 ```ts

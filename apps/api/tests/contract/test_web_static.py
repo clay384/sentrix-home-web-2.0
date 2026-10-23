@@ -1,4 +1,4 @@
-"""静态产物挂载（S11 · T1101）：8191 顺带 serve ``apps/web/dist``。
+"""静态产物挂载（S11 · T1101）：9598 顺带 serve ``apps/web/dist``。
 
 夹具**必须让两种口径给出不同答案**——同一份 dist 里放三种路径：``/`` 与
 ``timeline`` 这类 react-router 路由回 ``index.html``，``assets/app.js`` 发文件，

@@ -96,8 +96,8 @@ def test_system_process_judgement_can_be_replaced_by_the_deployment(
     assert providers._configured_set("PHOTOBENCH_SYSTEM_PROCESS_PORTS", ("1",)) == {"1"}
     monkeypatch.delenv("PHOTOBENCH_SYSTEM_PROCESS_PORTS", raising=False)
     assert providers._configured_set("PHOTOBENCH_SYSTEM_PROCESS_PORTS", ("1",)) == {"1"}
-    # 默认值在 S9b-1 换成 2.0 的端口表（8772/8191），见 providers.py 的常量注释。
-    assert "8772" in providers.SYSTEM_PROCESS_PORTS
+    # 默认值在 S9b-1 换成 2.0 的端口表（9597/9598），见 providers.py 的常量注释。
+    assert "9597" in providers.SYSTEM_PROCESS_PORTS
     assert "llama-server" in providers.SYSTEM_PROCESS_KEYWORDS
 
 

@@ -208,7 +208,7 @@ def _request(**overrides: Any) -> RunRequest:
         "album_id": ALBUM,
         "qa_set": QA_SET,
         "model_profile": "qwen",
-        "sentrix_url": "http://sentrix:8191",
+        "sentrix_url": "http://sentrix:9598",
         "run_id": "run_test",
     }
     base.update(overrides)
@@ -636,7 +636,7 @@ def test_the_trace_is_persisted_verbatim_and_digested():
 def test_the_turn_facts_are_projected_into_the_three_panels():
     """助手报的**一份事实**，摆成三块面板各自的形状。
 
-    这三处此前在 8772 上分别是：``AgentLoopTree`` 整棵树只有一个空文案、
+    这三处此前在 9597 上分别是：``AgentLoopTree`` 整棵树只有一个空文案、
     ``Agent2SummaryPanel`` 整块不出现、``DebugTracePanel`` 整块不出现——
     而读侧的代码早就写好了，缺的一直是写侧。
     """
@@ -867,7 +867,7 @@ def test_a_restart_that_fails_fails_the_model_deploy_phase():
     「标着 A 模型、其实是 B 模型」的结果。**区分力**：忽略 ``outcome.ok`` 的实现
     在这里会让 run 收成 ``completed``。
     """
-    process = FakeSentrixProcess(current="", restart_ok=False, restart_error="port 8191 busy")
+    process = FakeSentrixProcess(current="", restart_ok=False, restart_error="port 9598 busy")
     execution, _client, _writer, _lifecycle, _albums = _execution(sentrix_switch=SentrixModelSwitch(process))
     state = execution.execute(_request(model_base_url="http://127.0.0.1:8100/v1"))
     assert process.restarts == ["http://127.0.0.1:8100/v1"]

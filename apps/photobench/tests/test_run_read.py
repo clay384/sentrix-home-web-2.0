@@ -97,7 +97,7 @@ def _read_runs(
         index=index,
         qa_metadata=_NoQaMetadata(),
         http=http or FakeJsonHttpClient(),
-        sentrix_url=lambda: "http://sentrix:8191",
+        sentrix_url=lambda: "http://sentrix:9598",
         live_states=(lambda: live) if live is not None else None,
     )
 

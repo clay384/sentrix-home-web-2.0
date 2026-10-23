@@ -39,11 +39,11 @@ from urllib.parse import urlparse
 # 与 providers.py 的同名常量**刻意不同源**：1.0 这里是一份写死的 set/tuple，
 # 不读 PHOTOBENCH_SYSTEM_PROCESS_* 环境变量，而且关键词多一个 "mlx"。照搬这个差别，
 # 不合并——合并会悄悄改变 Apple 主机上的进程归属结果。
-# **端口跟着 S9b-1 改过（8771 → 8772、8091 → 8191）**，理由与 ``providers.py`` 的同名
-# 常量一样：2.0 的 PhotoBench 是 8772、主 API 是 8191（设计文档 §5.1）。「不与
+# **端口跟着 S9b-1 改过（8771 → 9597、8091 → 9598）**，理由与 ``providers.py`` 的同名
+# 常量一样：2.0 的 PhotoBench 是 9597、主 API 是 9598（设计文档 §5.1）。「不与
 # providers 共用」这条差别说的是**关键词**（多一个 "mlx"、不读环境变量），端口不是
 # 差别的一部分——留 1.0 的端口号只会让 Apple 主机上的归属判据在 2.0 上过期。
-SYSTEM_PROCESS_PORTS = {"8772", "8191", "8500", "8501", "8100", "8101", "6333"}
+SYSTEM_PROCESS_PORTS = {"9597", "9598", "8500", "8501", "8100", "8101", "6333"}
 SYSTEM_PROCESS_KEYWORDS = (
     "photobench",
     "benchmark_orchestrator.py",

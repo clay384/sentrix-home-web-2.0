@@ -368,7 +368,7 @@ Place(
 | 端口 | 归属 | 2.0 处理 |
 |---|---|---|
 | 8091 / 4174 / 8771 | 1.0 API / Web / PhotoBench | **保持运行**，M3 之前是权威 |
-| **8191 / 4274 / 8772** | 2.0 API / Web / PhotoBench | 新增 |
+| **9598 / 4274 / 9597** | 2.0 API / Web / PhotoBench | 新增 |
 | 8100 | llama-server（OpenAI 兼容 `/v1`） | 直接复用 |
 | 8101 | bge-m3 sidecar（文本嵌入，`.venv-text`，CPU） | 直接复用 |
 | 8500 | model-manager API | 通过 HTTP 使用 |

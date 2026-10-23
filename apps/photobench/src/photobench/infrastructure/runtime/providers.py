@@ -75,15 +75,15 @@ def _configured_set(env_name: str, defaults: tuple[str, ...]) -> set[str]:
 
 # 判定「这个进程属于 Sentrix 这套系统」的两个信号：监听端口，或命令行里的关键词。
 # 两个都可以由部署用环境变量整体替换（见 _configured_set）。
-# **默认值在 S9b-1 改过：8771 → 8772、8091 → 8191。** S9a 照搬的是 1.0 的部署
+# **默认值在 S9b-1 改过：8771 → 9597、8091 → 9598。** S9a 照搬的是 1.0 的部署
 # （PhotoBench 跑 8771、主 API 跑 8091）；2.0 的端口表（设计文档 §5.1）给 PhotoBench
-# 定的是 8772，主 API 是 8191。不改的话这条判据在 2.0 上是**过期**的——进程名关键词
+# 定的是 9597，主 API 是 9598。不改的话这条判据在 2.0 上是**过期**的——进程名关键词
 # 还能兜住一部分，但「按监听端口认进程」那一路会认不出自己派生的进程。
 # 8500/8501 与 8100/8101/6333 是模型服务与 Qdrant 的端口，由 S11 随部署形态再定，
 # 本切片不动（2.0 的 config 里模型服务仍在 8100，照旧命中）。
 SYSTEM_PROCESS_PORTS = _configured_set(
     "PHOTOBENCH_SYSTEM_PROCESS_PORTS",
-    ("8772", "8191", "8500", "8501", "8100", "8101", "6333"),
+    ("9597", "9598", "8500", "8501", "8100", "8101", "6333"),
 )
 SYSTEM_PROCESS_KEYWORDS = _configured_set(
     "PHOTOBENCH_SYSTEM_PROCESS_KEYWORDS",

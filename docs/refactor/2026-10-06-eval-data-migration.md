@@ -19,7 +19,7 @@
 | 5 个 `manifest.json` | 相同 |
 | `photos/` `faces/` `videos/`（1.3 GB） | 文件数与字节数全等 |
 
-**而且 8772 读的一直是这份**：`photobench/config.py:87` 的 `data_root` 缺省值是
+**而且 9597 读的一直是这份**：`photobench/config.py:87` 的 `data_root` 缺省值是
 `APP_ROOT / "datasets"`，`sentrix-photobench.service` 从来没设过 `PHOTOBENCH_DATA_ROOT`。
 （单元里那条 `PHOTOBENCH_RESULTS_ROOT` 是另一个配置项，不干扰。）
 
@@ -134,7 +134,7 @@ diff -rq ~/Github/Sentrix-Home-Web/services/photobench/data/album3-max/qa \
 # 夹具是否仍逐字节一致
 rsync -ain --checksum ~/Github/Sentrix-Home-Web/data/album3-v2-source/ data/album3-v2-source/
 
-# 8772 现在读的是哪
+# 9597 现在读的是哪
 systemctl --user show sentrix-photobench -p Environment
-curl -s http://127.0.0.1:8772/api/v1/manifests | head -c 200
+curl -s http://127.0.0.1:9597/api/v1/manifests | head -c 200
 ```

@@ -1,5 +1,5 @@
 {
-  "sentrix_url": "http://127.0.0.1:8191",
+  "sentrix_url": "http://127.0.0.1:9598",
   "judge_url": "",
   "judge_model": "",
   "vllm_manager_url": "",

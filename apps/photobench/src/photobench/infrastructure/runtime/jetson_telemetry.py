@@ -43,7 +43,7 @@ def _configured_set(env_name: str, defaults: tuple[str, ...]) -> set[str]:
 
 #: 这份是与 providers.py **独立的一份**（S9a 对 Apple 那份的裁决，同一条理由）：
 #: Jetson 上模型进程绑的是 8100/8101，而 providers.py 的默认集里那两条用的是 2.0 的
-#: 8772/8191。合并会让一台 Jetson 上的归属结果跟着另一台主机的端口表变。
+#: 9597/9598。合并会让一台 Jetson 上的归属结果跟着另一台主机的端口表变。
 SYSTEM_PROCESS_PORTS = _configured_set(
     "PHOTOBENCH_SYSTEM_PROCESS_PORTS",
     ("8771", "8091", "8500", "8501", "8100", "8101", "6333"),

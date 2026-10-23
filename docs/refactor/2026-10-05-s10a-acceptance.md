@@ -6,10 +6,10 @@
 
 | 服务 | 端口 | 说明 |
 |---|---|---|
-| 2.0 主 API | 8191 | 已在跑 |
+| 2.0 主 API | 9598 | 已在跑 |
 | 8100 / 8102 | 模型与 WeMM 侧车 | 已在跑 |
 | 1.0 PhotoBench | 8771 | **差分对照，验收时才起** |
-| 2.0 PhotoBench | 8772 | 被验对象 |
+| 2.0 PhotoBench | 9597 | 被验对象 |
 
 1.0 的 `results/` 有 270 个 run（19 GB），2.0 用 `PHOTOBENCH_RESULTS_ROOT` 指过去即可
 ——目录形状两边一致，`FileRunStore` 的设计就是为了这个。
@@ -18,12 +18,12 @@
 
 ```sh
 cd /home/asus/Github/sentrix-home-web2.0
-PID=$(ss -ltnp 2>/dev/null | sed -n 's/.*:8772 .*pid=\([0-9]*\).*/\1/p' | head -1)
+PID=$(ss -ltnp 2>/dev/null | sed -n 's/.*:9597 .*pid=\([0-9]*\).*/\1/p' | head -1)
 [ -n "$PID" ] && kill "$PID" && sleep 2
 
 PHOTOBENCH_RESULTS_ROOT=/home/asus/Github/Sentrix-Home-Web/services/photobench/results \
 nohup .venv/bin/python -m uvicorn --factory photobench.main:create_app \
-  --host 0.0.0.0 --port 8772 --app-dir apps/photobench/src \
+  --host 0.0.0.0 --port 9597 --app-dir apps/photobench/src \
   >> apps/photobench/logs/uvicorn.log 2>&1 &
 ```
 
@@ -69,7 +69,7 @@ cd /home/asus/Github/sentrix-home-web2.0
 | `GET /api/manifests` | 应列出 `apps/photobench/datasets/` 下 5 个相册及其计数 |
 | `GET /api/manifests/{id}` | 与 `datasets/<id>/manifest.json` 原文逐字节相同 |
 | `GET /api/albums/{album}/photos/{file}` | 200 + 正确 MIME；带 `Range: bytes=0-9` → 206 + `Content-Range: bytes 0-9/<size>` |
-| `GET /api/assets/{id}/file` | 代理到 8191；上游 404 时状态码与错误体同上游 |
+| `GET /api/assets/{id}/file` | 代理到 9598；上游 404 时状态码与错误体同上游 |
 | `GET /api/memory-spaces` | `{"spaces": [...]}`，每条带 `created_at`；`reuse_bases` 非空（有历史 run 时） |
 | `POST /api/test-model` | 指向在跑的端点 → `{"ok": true, …}`；不选模型 → 400 那句原文 |
 | `GET /api/runs/{id}/export-trace` | `Content-Disposition` 正确；**中文不被转义成 `\uXXXX`**（`ensure_ascii=False`） |

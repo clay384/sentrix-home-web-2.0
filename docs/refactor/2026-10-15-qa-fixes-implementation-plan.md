@@ -83,7 +83,7 @@
 
 - 8100 当前跑的是 **vLLM gemma4-12b-it**（`--max-model-len 8192 --max-num-seqs 12`），而基准是 **qwen35-q4km**。`restart_q4km_ctx8192.sh` 可切回（llama.cpp，`--ctx-size 32768 --parallel 4 --metrics`）→ 每槽 8192、4 个并发槽。
 - **8102 WeMM 侧车没在跑**。venv 在 `/home/asus/Github/Sentrix-Home-Web/.venv-text/.venv-wemm`，模型在 `/home/asus/models/WeMM-Embedding-2B`（5.1G）。无常驻管理（`deploy/systemd/` 只有 api 与 photobench 两个单元）。启动路径靠 `wemm.py` docstring 里一句话。
-- `8191 /health` 只查数据库（`api/routes/health.py:8-11`），侧车全废时仍报 `ok`。
+- `9598 /health` 只查数据库（`api/routes/health.py:8-11`），侧车全废时仍报 `ok`。
 - 内存充裕（60G 总/44G available），dmesg **无 OOM 记录** —— 侧车是被外部杀掉的。
 - 2.0 库里已有可复用 scope：`PhotoBench-20261010-161414-…`（362 assets），`GET /api/v1/memory-spaces` 的 `reuse_bases` 已能列出它（`ready: true`）。
 
@@ -569,7 +569,7 @@ bash /home/asus/restart_q4km_ctx8192.sh                        # 切回 qwen35-q
 systemctl --user daemon-reload
 systemctl --user enable --now sentrix-wemm-sidecar.service
 curl -s http://127.0.0.1:8102/health          # 侧车自己的健康
-curl -s http://127.0.0.1:8191/api/v1/health   # 必须是 ok（不是 impaired）
+curl -s http://127.0.0.1:9598/api/v1/health   # 必须是 ok（不是 impaired）
 curl -s http://127.0.0.1:8100/props | python3 -m json.tool | head   # 确认 total_slots=4、n_ctx
 ```
 
@@ -582,7 +582,7 @@ sudo systemctl --user restart sentrix-api.service sentrix-photobench.service
 - [ ] **Step 4: 发起复用相册的 487q 评测**
 
 ```bash
-curl -s -X POST http://127.0.0.1:8772/api/v1/runs \
+curl -s -X POST http://127.0.0.1:9597/api/v1/runs \
   -H 'Content-Type: application/json' \
   -d '{
     "album_id": "album3-max-video10",
@@ -590,7 +590,7 @@ curl -s -X POST http://127.0.0.1:8772/api/v1/runs \
     "mode": "reuse",
     "existing_scope_id": "PhotoBench-20261010-161414-album3-max-video10-qwen35-q4km",
     "models": ["qwen35-q4km"],
-    "sentrix_url": "http://192.168.0.153:8191",
+    "sentrix_url": "http://192.168.0.153:9598",
     "model_base_url": "http://127.0.0.1:8100/v1",
     "judge_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
     "judge_model": "doubao-seed-2.0-lite",
@@ -605,7 +605,7 @@ curl -s -X POST http://127.0.0.1:8772/api/v1/runs \
 ```bash
 bash /home/asus/memwatch_487q.sh <run_id>       # 内存看门狗（既有脚本）
 # 相位进展 / 并发数
-curl -s "http://127.0.0.1:8772/api/v1/runs/<run_id>" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['status'], d['phases']['qa_eval']['progress'])"
+curl -s "http://127.0.0.1:9597/api/v1/runs/<run_id>" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['status'], d['phases']['qa_eval']['progress'])"
 ```
 
 预期：`qa_concurrency: 4`、`judge_concurrency: 4`、`progress.completed` **不含 failed**。

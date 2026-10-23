@@ -94,7 +94,7 @@ def _process(
     unit: str = "sentrix-api.service",
 ) -> SystemdSentrixProcess:
     return SystemdSentrixProcess(
-        api_url="http://127.0.0.1:8191",
+        api_url="http://127.0.0.1:9598",
         unit=unit,
         http=http,
         systemctl=systemctl,

@@ -101,7 +101,7 @@ def _discover_by_port(port: int) -> list[int]:
     **连着这个端口的客户端**也列出来——httpx 的连接池默认 keep-alive，于是
     PhotoBench 自己、Web 前端、任何正在调 2.0 的进程都会出现在这张表里，被
     ``_terminate`` 一起 SIGTERM 掉。**这是 S9c 真机验收撞出来的**：验收驱动脚本
-    在 Part A 用它自己的 httpx 客户端探过 8191 健康，连接留在池里；run 的
+    在 Part A 用它自己的 httpx 客户端探过 9598 健康，连接留在池里；run 的
     ``model_deploy`` 重启 2.0 时，那份发现表里就有这个脚本，于是它被自己的重启
     静默杀掉（SIGTERM，没有堆栈）。用例
     ``test_the_port_discovery_only_looks_at_listeners`` 钉住这个参数。
@@ -147,7 +147,7 @@ class SubprocessSentrixProcess:
     ) -> None:
         #: 四个进程原语与两个时间源都可注入。**不是为了「可测试」这个名头**：单元用例
         #: 里真起进程、真发信号、真等 60 秒健康探测，会把一份秒级的用例拖成分钟级，
-        #: 而且依赖跑用例那台机器上有没有 8191。注入之后，用例钉的是**调用顺序**与
+        #: 而且依赖跑用例那台机器上有没有 9598。注入之后，用例钉的是**调用顺序**与
         #: **传下去的环境变量**——那才是这条路径的正确性所在。
         self._api_url = api_url.rstrip("/")
         self._command = list(start_command)

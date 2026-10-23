@@ -52,7 +52,7 @@ def _request(**overrides: Any) -> RunRequest:
         "album_id": ALBUM,
         "qa_set": QA_SET,
         "model_profile": "qwen",
-        "sentrix_url": "http://sentrix:8191",
+        "sentrix_url": "http://sentrix:9598",
         "run_id": "run_test",
     }
     base.update(overrides)

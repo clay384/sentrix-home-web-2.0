@@ -596,7 +596,7 @@ WeMM 实例**，所以那一轮里：
 - 文本 ANN 通道也没跑；
 - 只剩 lexical / metadata / entity 三路。
 
-实测证据（2026-10-09 在同样的降级状态下直连 8191）：
+实测证据（2026-10-09 在同样的降级状态下直连 9598）：
 
 ```
 GET /api/v1/search?q=海边  →  degraded=true, degraded_reason="embedder_unavailable"

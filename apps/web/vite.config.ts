@@ -7,9 +7,9 @@ export default defineConfig({
   plugins: [react()],
   server: {
     host: true,
-    port: 4274,
+    port: 9501,
     proxy: {
-      "/api": { target: "http://127.0.0.1:8191", changeOrigin: true },
+      "/api": { target: "http://127.0.0.1:9598", changeOrigin: true },
     },
   },
   test: {
