@@ -62,6 +62,7 @@ from sentrix.infrastructure.models.onnx_runtime import (
     provider_chain,
     require_requested_providers,
 )
+from sentrix.infrastructure.thread_limits import ort_session_options
 
 log = logging.getLogger(__name__)
 
@@ -447,7 +448,10 @@ class FaceAdapter:
             if not Path(self.recognition_path).is_file():
                 return None
             providers = face_onnx_providers(FACE_PROVIDERS_ENV)
-            session = onnxruntime.InferenceSession(self.recognition_path, providers=providers)
+            # sess_options 带线程上限：onnxruntime 的线程数只能在这里设，环境变量无效。
+            session = onnxruntime.InferenceSession(
+                self.recognition_path, providers=providers, sess_options=ort_session_options()
+            )
             require_requested_providers(session, FACE_PROVIDERS_ENV, label="buffalo_l w600k_r50")
             return session
         except CudaProviderMissingError:

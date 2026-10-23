@@ -35,3 +35,17 @@ def health(request: Request) -> dict[str, str]:
         # 而这条路径的整个教训就是「降级必须自己走到人眼前」。
         payload["embeddings_error"] = container.embedding_health.load_error or "sidecar_unreachable"
     return payload
+
+
+@router.get("/healthz")
+def healthz() -> dict[str, str]:
+    """轻量存活探针：进程活着就答，**不碰任何依赖**。
+
+    **为什么拆(1.0 的教训，xy 2026-10-20 #6)。** 上面的合一体要查数据库 + 嵌入侧车
+    (带 TTL，仍可能有 IO)；1.0 在 153 上被高频轮询时完整诊断超时 → 看门狗误判进程
+    死了 → 重启 → **正在跑的评测被 SIGTERM 杀掉**(354/370 次静默降级之后才拆成
+    轻量 0.15-0.21ms + 完整 7-11ms 两档)。分层不是删功能：合一体保留在
+    ``/health``(它能发现「进程活着但嵌入器挂了」，这个价值是真的)；
+    **看门狗/负载均衡的高频轮询一律打 ``/healthz``**。
+    """
+    return {"status": "ok", "version": __version__}

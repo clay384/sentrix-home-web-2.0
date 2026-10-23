@@ -30,6 +30,7 @@ from sentrix.infrastructure.models.onnx_runtime import (
     face_onnx_providers,
     require_requested_providers,
 )
+from sentrix.infrastructure.thread_limits import ort_session_options
 
 STEPS = (8, 16, 32)
 MIN_SIZES = ((16, 32), (64, 128), (256, 512))
@@ -244,7 +245,10 @@ class RetinaFaceTiledDetector:
                     import onnxruntime
 
                     providers = face_onnx_providers(RETINAFACE_PROVIDERS_ENV)
-                    session = onnxruntime.InferenceSession(self.model_path, providers=providers)
+                    # sess_options 带线程上限：onnxruntime 的线程数只能在这里设，环境变量无效。
+                    session = onnxruntime.InferenceSession(
+                        self.model_path, providers=providers, sess_options=ort_session_options()
+                    )
                     # 请求了 CUDA 而落在 CPU 上时在这里抛。**异常原样穿出 ``_load``**：上面那个
                     # ``except`` 改写 ``error`` 之后重抛，所以调用方拿到的是同一个异常，不是
                     # 一句日志（第 111 条那道防线，见 onnx_runtime）。

@@ -15,6 +15,10 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=%h/lingbot-map/004SHW/sentrix-home-web-2.0
+# 算子线程上限的环境变量层(#5,仓库内文件、与代码同源):OMP/BLAS 系库必须在进程
+# 启动前拿到限额;opencv/onnxruntime 读不进环境变量,由代码层(create_app 里的
+# apply_process_thread_limits + session 工厂)显式设——两层缺一不可(xy 2026-10-20)。
+EnvironmentFile=%h/lingbot-map/004SHW/sentrix-home-web-2.0/deploy/thread-limits.env
 # 与 Makefile 的 `dev` 目标逐字一致（`.venv/bin/python -m uvicorn --factory ...`）。
 ExecStart=%h/lingbot-map/004SHW/sentrix-home-web-2.0/.venv/bin/python -m uvicorn --factory sentrix.main:create_app --host 0.0.0.0 --port 9598 --app-dir apps/api/src
 # 崩溃即重拉；`systemctl --user stop` 的 SIGTERM 属正常退出，不触发重启。

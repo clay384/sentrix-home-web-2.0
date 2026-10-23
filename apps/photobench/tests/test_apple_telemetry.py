@@ -224,6 +224,8 @@ def apple_host(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(apple, "_MACMON", _FakeMacmon(MACMON_SAMPLE))
     monkeypatch.setattr(apple, "_phys_footprint_bytes", lambda pid: {100: 128 * MIB, 200: 512 * MIB}[pid])
+    # 权重映射按进程注入：只有模型进程(pid 200)有 mmap 的 .gguf 页，orchestrator 没有。
+    monkeypatch.setattr(apple, "_weight_map_bytes", lambda pid: {200: 2600 * MIB}.get(pid, 0))
 
 
 def test_gpu_stats_sums_related_footprints_and_reports_the_model(apple_host: None) -> None:
@@ -231,7 +233,7 @@ def test_gpu_stats_sums_related_footprints_and_reports_the_model(apple_host: Non
     assert data["gpus"] == [
         {
             "index": 0,
-            "memory_unit": "apple_phys_footprint_mib",
+            "memory_unit": "apple_phys_footprint_plus_weight_map_mib",
             "gpu_utilization_pct": 12.5,
             "gpu_allocated_unified_memory_mib": 1.0,
             "gpu_in_use_unified_memory_mib": 0.5,
@@ -246,15 +248,19 @@ def test_process_memory_attributes_model_and_sentrix_separately(apple_host: None
     provider = apple.LocalAppleUnifiedTelemetryProvider("http://127.0.0.1:8100")
     data = provider.process_memory()["data"]
     assert data["root_pid"] == 200
-    assert data["model_process_system_memory_used_mib"] == 512.0
-    assert data["model_process_system_memory_scope"] == "apple_phys_footprint"
-    assert data["process_memory_used_mib"] == 512.0
+    # 模型进程 = footprint 512 + 权重映射 2600；llama.cpp mmap 的 .gguf 页不进
+    # footprint，两者相加才是真实占用(1.0 实测：只报 footprint 是真实值的 39%)。
+    assert data["model_process_system_memory_used_mib"] == 3112.0
+    assert data["model_process_phys_footprint_mib"] == 512.0
+    assert data["model_process_weight_map_mib"] == 2600.0
+    assert data["model_process_system_memory_scope"] == "apple_phys_footprint_plus_weight_map"
+    assert data["process_memory_used_mib"] == 3112.0
     assert data["sentrix_stack_pss_mib"] == 128.0
-    assert data["sentrix_stack_pss_scope"] == "apple_phys_footprint_excluding_model"
-    assert data["product_stack_memory_mib"] == 640.0
-    assert data["benchmark_process_memory_used_mib"] == 640.0
-    assert data["memory_unit"] == "apple_phys_footprint_mib"
-    assert data["memory_profile"] == {"method": "apple_phys_footprint_v1"}
+    assert data["sentrix_stack_pss_scope"] == "apple_phys_footprint_plus_weight_map_excluding_model"
+    assert data["product_stack_memory_mib"] == 3240.0
+    assert data["benchmark_process_memory_used_mib"] == 3240.0
+    assert data["memory_unit"] == "apple_phys_footprint_plus_weight_map_mib"
+    assert data["memory_profile"] == {"method": "apple_phys_footprint_plus_weight_map_v1"}
     assert data["system_memory_scope"] == "apple_app_wired_compressed"
     # 基线就是第一次采到的已用量，所以这次 delta 为 0。
     assert data["system_memory_delta_mib"] == 0.0
@@ -273,6 +279,7 @@ def test_process_memory_without_a_model_process_writes_no_product_total(
     )
     monkeypatch.setattr(apple, "_MACMON", _FakeMacmon({}))
     monkeypatch.setattr(apple, "_phys_footprint_bytes", lambda pid: 128 * MIB)
+    monkeypatch.setattr(apple, "_weight_map_bytes", lambda pid: 0)
     data = apple.LocalAppleUnifiedTelemetryProvider("http://127.0.0.1:8100").process_memory()["data"]
     assert "root_pid" not in data
     assert "model_process_system_memory_used_mib" not in data
@@ -297,6 +304,7 @@ def test_two_model_candidates_are_not_guessed_into_one(monkeypatch: pytest.Monke
     monkeypatch.setattr(
         apple, "_phys_footprint_bytes", lambda pid: {100: 128 * MIB, 200: 512 * MIB, 201: 256 * MIB}[pid]
     )
+    monkeypatch.setattr(apple, "_weight_map_bytes", lambda pid: 0)
     data = apple.LocalAppleUnifiedTelemetryProvider("http://127.0.0.1:8100").process_memory()["data"]
     assert "root_pid" not in data
     assert "benchmark_process_memory_used_mib" not in data
@@ -315,10 +323,22 @@ def test_a_missing_footprint_suppresses_the_sum(monkeypatch: pytest.MonkeyPatch)
     )
     monkeypatch.setattr(apple, "_MACMON", _FakeMacmon({}))
     monkeypatch.setattr(apple, "_phys_footprint_bytes", lambda pid: 512 * MIB if pid == 200 else None)
+    monkeypatch.setattr(apple, "_weight_map_bytes", lambda pid: 0)
     data = apple.LocalAppleUnifiedTelemetryProvider("http://127.0.0.1:8100").process_memory()["data"]
     assert "sentrix_stack_pss_mib" not in data
-    assert "product_stack_memory_mib" not in data
-    assert data["model_process_system_memory_used_mib"] == 512.0
+
+
+def test_weight_map_only_changes_the_model_process_total(apple_host: None) -> None:
+    """权重映射只加在**有 .gguf 映射的进程**上；orchestrator footprint 128 就是 128。
+
+    计费口径的区分力：把 weight_map 误加给所有相关进程的实现在这里会报
+    128+2600 而不是 128；product 相应 = 128 + 3112。
+    """
+    data = apple.LocalAppleUnifiedTelemetryProvider("http://127.0.0.1:8100").process_memory()["data"]
+    assert data["sentrix_stack_pss_mib"] == 128.0
+    assert data["model_process_weight_map_mib"] == 2600.0
+    assert data["model_process_system_memory_used_mib"] == 3112.0
+    assert data["product_stack_memory_mib"] == 3240.0
 
 
 def test_system_memory_reports_unavailable_without_vm_stat(

@@ -33,6 +33,7 @@ from sentrix.api.routes import (
 from sentrix.bootstrap.container import Container
 from sentrix.config import Settings, load_settings
 from sentrix.domain.errors import DomainError
+from sentrix.infrastructure.thread_limits import apply_process_thread_limits
 
 log = logging.getLogger("sentrix.main")
 
@@ -126,6 +127,10 @@ def _mount_web(app: FastAPI, settings: Settings) -> None:
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     settings.ensure_directories()
+
+    # 进程级线程上限(cv2/torch 显式设；onnxruntime 在 session 工厂里设)。
+    # 1.0 教训：241 线程抢 32 核 → 健康检查超时 → 评测被 SIGTERM(xy 2026-10-20 取证)。
+    apply_process_thread_limits()
 
     container = Container.build(settings)
     container.database.migrate()

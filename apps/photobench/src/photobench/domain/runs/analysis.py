@@ -1648,6 +1648,10 @@ GPU_SAMPLE_FIELDS = (
     "system_memory_delta_mib",
     "sentrix_stack_pss_mib",
     "product_stack_memory_mib",
+    # Jetson CPU/GPU 拆分三字段(xy 2026-10-20 #2):gpu_sampler 已接住,
+    # 这份曲线清单不同步它们就在曲线/汇总里被静默丢掉——46 上少 79% 的那种丢法。
+    "model_process_host_memory_mib",
+    "model_process_gpu_memory_mib",
 )
 
 
@@ -1771,6 +1775,7 @@ def attach_gpu_sample_history(live: dict[str, Any], lines: Sequence[str]) -> Non
 
 #: 1.0 ``GpuSampler.aggregate``（``:1790``）逐项求 peak/mean/p50/p95 的那些键。
 #: 顺序与 1.0 一致（JSON 里键的顺序不影响读，但差分对照要能逐字段比）。
+#: Jetson 拆分两字段同样进聚合(#2):账本(nvmap)侧的 GPU 占用是 46 上唯一准的量法。
 GPU_AGGREGATE_KEYS = (
     "temperature_c",
     "cpu_temperature_c",
@@ -1791,6 +1796,8 @@ GPU_AGGREGATE_KEYS = (
     "system_memory_delta_mib",
     "sentrix_stack_pss_mib",
     "product_stack_memory_mib",
+    "model_process_host_memory_mib",
+    "model_process_gpu_memory_mib",
 )
 
 
@@ -1858,17 +1865,24 @@ def aggregate_gpu_samples(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
             },
             **metrics,
         }
-    if latest.get("memory_unit") == "apple_phys_footprint_mib":
+    # 两种 memory_unit 都认：jsonl 只追加不改写，历史样本里存的永远是
+    # ``apple_phys_footprint_mib``(phys_footprint 盲区修复前的口径)，聚合不能崩。
+    apple_memory_units = {
+        "apple_phys_footprint_mib": "apple_phys_footprint_v1",
+        "apple_phys_footprint_plus_weight_map_mib": "apple_phys_footprint_plus_weight_map_v1",
+    }
+    if latest.get("memory_unit") in apple_memory_units:
         return {
             "samples_count": len(samples),
             "source": "apple_unified",
             "memory_profile": {
-                "method": "apple_phys_footprint_v1",
-                "memory_unit": "apple_phys_footprint_mib",
+                "method": apple_memory_units[latest.get("memory_unit")],
+                "memory_unit": latest.get("memory_unit"),
                 "comparable_workload_memory_gib": None,
                 "note": (
-                    "Process physical footprint is not dedicated GPU VRAM; "
-                    "per-process GPU-only memory and KV bytes are unavailable."
+                    "Process physical footprint (plus model weight mappings where "
+                    "reported) is not dedicated GPU VRAM; per-process GPU-only "
+                    "memory and KV bytes are unavailable."
                 ),
             },
             **metrics,

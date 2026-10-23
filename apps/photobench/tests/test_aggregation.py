@@ -81,6 +81,14 @@ def test_the_apple_profile_is_selected_by_its_memory_unit():
     assert aggregated["memory_profile"]["method"] == "apple_phys_footprint_v1"
 
 
+def test_the_apple_profile_accepts_both_memory_units():
+    """新旧两种 apple 口径都走 apple 分支：jsonl 只追加，历史样本永远是旧 unit。"""
+    old = aggregate_gpu_samples([{"memory_unit": "apple_phys_footprint_mib"}])
+    new = aggregate_gpu_samples([{"memory_unit": "apple_phys_footprint_plus_weight_map_mib"}])
+    assert old["memory_profile"]["method"] == "apple_phys_footprint_v1"
+    assert new["memory_profile"]["method"] == "apple_phys_footprint_plus_weight_map_v1"
+
+
 def test_the_default_profile_estimates_comparable_workload_memory():
     """默认分支的公式：``fixed_base = idle - kv_capacity``，``comparable = fixed_base + capacity * peak%``。
 

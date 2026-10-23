@@ -152,6 +152,12 @@ class GpuSampler:
             sample["model_process_memory_limit_mib"] = process_memory.get("process_memory_limit_mib")
             sample["model_process_memory_over_limit"] = process_memory.get("process_memory_over_limit")
             sample["model_process_pid"] = process_memory.get("root_pid")
+            # Jetson 的 CPU/GPU 拆分三字段(xy 2026-10-20 #2):jetson_telemetry 已产出,
+            # 但这里不接住就在存盘时被丢弃——46 上模型总占用会凭空少 79%(2617 MiB)。
+            # 三处清单的另一处在 analysis 的曲线清单,少一处=静默丢字段。
+            sample["model_process_host_memory_mib"] = process_memory.get("model_process_host_memory_mib")
+            sample["model_process_gpu_memory_mib"] = process_memory.get("model_process_gpu_memory_mib")
+            sample["model_process_gpu_memory_source"] = process_memory.get("model_process_gpu_memory_source")
             sample["memory_unit"] = process_memory.get("memory_unit") or sample.get("memory_unit")
             sample["source"] = gpu_result.get("source") or self.provider.__class__.__name__
             sample["pss_sampled_at_monotonic"] = process_memory.get("pss_sampled_at_monotonic")
