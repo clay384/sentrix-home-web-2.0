@@ -78,7 +78,12 @@ const DETAIL = {
           kind: "model_action",
           status: "running",
           text: "正在执行 search_memories",
-          payload: { step_id: "tool_1", parent_step_id: "step_1", tool: "search_memories" },
+          payload: {
+            step_id: "tool_1",
+            parent_step_id: "step_1",
+            tool: "search_memories",
+            arguments: { query: "车", marker: "仅进度事件里的入参" },
+          },
         },
         {
           kind: "tool_result",
@@ -113,6 +118,8 @@ describe("DebugTracePanel · 每道题的全流程完整轨迹", () => {
     expect(screen.getAllByText("先检索一下").length).toBeGreaterThan(0);
     expect(screen.getAllByText(/search_memories/).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/total/).length).toBeGreaterThan(0);
+    // 原始进度事件里的入参也要显示（它在 payload 里，不在顶层）。
+    expect(screen.getAllByText(/仅进度事件里的入参/).length).toBeGreaterThan(0);
     expect(screen.getByText("停在小区地下车库")).not.toBeNull();
     expect(screen.getByText("运行时事件（2.0 进度流 · 5 条）")).not.toBeNull();
   });

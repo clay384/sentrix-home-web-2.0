@@ -91,33 +91,41 @@ const STEP_LABELS: Record<string, string> = {
 };
 
 function ProgressStepView({ turn, step, index }: { turn: Dict; step: Dict; index: number }) {
+  // 两个来源：PhotoBench 投影过的 `debug_trace`（字段在顶层）与主 API 的原始
+  // `trace` 事件（字段在 payload 里）。同一块 UI 要同时认。
+  const payload =
+    typeof step.payload === "object" && step.payload !== null ? (step.payload as Dict) : {};
   const type = String(step.type || step.kind || "");
   const linked = debugCallForStep(turn, step);
   const label = STEP_LABELS[type] || type || `步骤 ${index + 1}`;
-  const hasToolData = step.arguments != null || step.observation != null || step.tool;
+  const tool = step.tool ?? payload.tool;
+  const argumentsValue = step.arguments ?? payload.arguments;
+  const observationValue = step.observation ?? payload.result ?? payload.observation;
+  const parentStepId = step.parent_step_id ?? payload.parent_step_id;
+  const hasToolData = argumentsValue != null || observationValue != null || tool;
   return (
     <details className={`debug-step debug-step-${type || "step"}`}>
       <summary>
         <span className="debug-step-index">{index + 1}</span>
         <strong>{label}</strong>
         <span className="debug-step-status">{String(step.status || "已记录")}</span>
-        {step.tool ? <span>工具 · {String(step.tool)}</span> : null}
-        {step.parent_step_id ? <span>父步骤 · {String(step.parent_step_id)}</span> : null}
+        {tool ? <span>工具 · {String(tool)}</span> : null}
+        {parentStepId ? <span>父步骤 · {String(parentStepId)}</span> : null}
         {linked ? <span className="debug-step-linked">含模型完整输入 / 输出</span> : null}
       </summary>
       {step.text ? <p className="muted small">{String(step.text)}</p> : null}
       {hasToolData ? (
         <div className="debug-step-tool">
-          {step.arguments != null ? (
+          {argumentsValue != null ? (
             <>
               <p className="muted small">工具输入</p>
-              <pre>{pretty(step.arguments)}</pre>
+              <pre>{pretty(argumentsValue)}</pre>
             </>
           ) : null}
-          {step.observation != null ? (
+          {observationValue != null ? (
             <>
               <p className="muted small">工具输出</p>
-              <pre>{pretty(step.observation)}</pre>
+              <pre>{pretty(observationValue)}</pre>
             </>
           ) : null}
         </div>
