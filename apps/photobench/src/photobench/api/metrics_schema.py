@@ -58,12 +58,29 @@ class ImportObservationProjection(BaseModel):
     error: str | None = None
 
 
+class JudgeRequestMetrics(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    version: int | None = None
+    requests_started: int | None = None
+    responses_received: int | None = None
+    request_errors: int | None = None
+    http_429: int | None = None
+    in_flight: int | None = None
+    rate_waiting: int | None = None
+    rate_wait_ms: float | None = None
+
+
 class PhaseProgressProjection(BaseModel):
     model_config = ConfigDict(extra="allow")
     total: int | None = None
     completed: int | None = None
     agent_completed: int | None = None
     agent_total: int | None = None
+    agent_waiting: int | None = None
+    agent_running: int | None = None
+    judge_waiting: int | None = None
+    judge_running: int | None = None
+    outcome_unknown: int | None = None
     judge_completed: int | None = None
     judge_total: int | None = None
     judge_skipped: int | None = None
@@ -82,6 +99,7 @@ class PhaseProgressProjection(BaseModel):
 
 class PhaseMetricsProjection(BaseModel):
     model_config = ConfigDict(extra="allow")
+    judge_requests: JudgeRequestMetrics | None = None
     agent_completed: int | None = None
     agent_total: int | None = None
     judge_completed: int | None = None
@@ -122,6 +140,9 @@ class JudgeObservation(BaseModel):
 
 class RunItemObservation(BaseModel):
     model_config = ConfigDict(extra="allow")
+    execution_status: str | None = None
+    judge_status: str | None = None
+    judge_dispatch_status: str | None = None
     judge: JudgeObservation | None = None
 
 

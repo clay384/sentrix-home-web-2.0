@@ -50,6 +50,7 @@ _RETRYABLE = (
     httpx.WriteError,
     httpx.RemoteProtocolError,
     httpx.ReadTimeout,
+    httpx.WriteTimeout,
 )
 _RETRIES = 3
 _RETRY_BACKOFF_S = 0.2

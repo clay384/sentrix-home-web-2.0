@@ -1916,6 +1916,28 @@ class RunExecution:
                 pass
         return min(8, max(1, int(qa_concurrency or 1)))
 
+    @staticmethod
+    def resume_item(item: Mapping[str, Any]) -> dict[str, Any]:
+        """Preserve completed work; an interrupted dispatch cannot safely be replayed.
+
+        Historical pending Judge checkpoints predate dispatch journaling and may
+        already have reached the cloud. Only an explicit not_started marker is safe.
+        """
+        restored = copy.deepcopy(dict(item))
+        if restored.get("execution_status") in {"running", "started", "pending"}:
+            restored.update(
+                execution_status="outcome_unknown",
+                judge_status="skipped",
+                error="request_outcome_unknown: interrupted Agent dispatch; not replayed",
+            )
+        if restored.get("judge_status") == "running" or (
+            restored.get("judge_status") == "pending"
+            and restored.get("judge_dispatch_status") != "not_started"
+        ):
+            restored["judge_status"] = "outcome_unknown"
+            restored["judge_dispatch_status"] = "outcome_unknown"
+        return restored
+
     def _phase_qa_eval(self, state: RunState, request: RunRequest) -> None:
         """1.0 ``:3103``：Agent 池 + 独立的 Judge 池。**Agent 一完成就立刻排进 Judge**。
 
@@ -1924,13 +1946,6 @@ class RunExecution:
         并发预算会让「评测吞吐」与「打分吞吐」互相拖住。
         """
         started = time.perf_counter()
-        # 1.0 ``:3394-3397``：**入 QA 前先探一次端点**。不健康就抛——487 道题跑在一个
-        # 不回话的端点上，产出的是一份**看起来正常**的废数据，那比直接失败更糟
-        # （2026-10-10 那轮 18:13 起端点连续 13 题 503/Connection refused，
-        #  而整轮照常往下跑、只在每题上留一句「模型服务当前不可用」）。
-        health_error = self._probe_endpoint_health()
-        if health_error:
-            raise RuntimeError(f"model service is unhealthy before QA evaluation: {health_error}")
         scope_id = str(state.get("scope_id"))
         album_id = str(state.get("album_id"))
         assets = self.client.list_assets(scope_id=scope_id, limit=1000)
@@ -1947,6 +1962,7 @@ class RunExecution:
         state.set("qa_concurrency_runtime_limit", resolved.runtime_limit)
         state.set("qa_assets", len(assets))
         state.set("judge_concurrency", judge_concurrency if judge is not None else 0)
+        state.record_phase("qa_eval", "judge_concurrency", judge_concurrency if judge is not None else 0)
         state.record_phase("qa_eval", "agent_total", len(rows))
         state.record_phase("qa_eval", "agent_phase_started_at", now_iso())
         agent_phase_started = time.perf_counter()
@@ -1962,19 +1978,28 @@ class RunExecution:
         # 2.0 只带 items 那一格：**已完成的题不进池、直接当成结果**，于是续跑出来的
         # run.json 仍然是一份完整的 487 题结果，而不是「只剩没跑的那些」——后者会让
         # 汇总里所有的均值都只覆盖续跑的那一段，与上一轮不可比。
-        prior_by_qa = {str(item.get("qa_id")): item for item in request.prior_items}
+        prior_by_qa = {str(item.get("qa_id")): self.resume_item(item) for item in request.prior_items}
         items: dict[int, dict[str, Any]] = {
             index: dict(prior)
             for index, row in enumerate(rows)
             if (prior := prior_by_qa.get(str(row.get("qa_id")))) is not None
+            and prior.get("execution_status") != "scheduled"
         }
         pending_rows = [(index, row) for index, row in enumerate(rows) if index not in items]
+        if pending_rows:
+            health_error = self._probe_endpoint_health()
+            if health_error:
+                raise RuntimeError(f"model service is unhealthy before QA evaluation: {health_error}")
+        pending_judges = [
+            index
+            for index, item in items.items()
+            if item.get("execution_status") == "completed" and item.get("judge_status") == "pending"
+        ]
+        futures: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
         judge_futures: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
         judge_done = sum(item.get("judge_status") in {"completed", "failed"} for item in items.values())
 
         def record_progress() -> None:
-            # One locked checkpoint for items and both counter locations. Legacy readers
-            # still use the phase-level fields; the UI consumes progress.
             terminal_agents = sum(
                 item.get("execution_status") not in {"scheduled", "running", "pending", None}
                 for item in items.values()
@@ -2000,8 +2025,20 @@ class RunExecution:
                         ),
                         "qa_concurrency": concurrency,
                         "judge_concurrency": judge_concurrency if judge is not None else 0,
+                        "agent_waiting": len(pending_rows)
+                        + sum(item.get("execution_status") == "scheduled" for item in items.values()),
+                        "agent_running": len(futures),
+                        "judge_waiting": len(pending_judges) if judge is not None else None,
+                        "judge_running": len(judge_futures) if judge is not None else None,
+                        "outcome_unknown": sum(
+                            item.get("execution_status") == "outcome_unknown"
+                            or item.get("judge_status") == "outcome_unknown"
+                            for item in items.values()
+                        ),
                     },
                 )
+                if isinstance(judge, JudgeRunner):
+                    state.record_phase("qa_eval", "judge_requests", judge.request_metrics())
                 state.data["items"] = [items[i] for i in sorted(items)]
 
         record_progress()
@@ -2012,10 +2049,17 @@ class RunExecution:
             begin, begin_iso = time.perf_counter(), now_iso()
             try:
                 assert judge is not None
+                if state.cancelled:
+                    return {**item, "judge_status": "pending", "judge_dispatch_status": "not_started"}
                 return judge.judge_item(copy.deepcopy(item), row, assets_by_name)
             finally:
                 with judge_bounds_lock:
                     judge_bounds.append((begin, time.perf_counter(), begin_iso, now_iso()))
+
+        def run_agent(row: dict[str, Any]) -> dict[str, Any]:
+            if state.cancelled:
+                raise RunCancelledError("cancelled before Agent dispatch")
+            return self._evaluate_one(row, scope_id, assets_by_name, request)
 
         judge_pool = (
             concurrent.futures.ThreadPoolExecutor(
@@ -2028,73 +2072,109 @@ class RunExecution:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=concurrency, thread_name_prefix="qa-agent"
             ) as executor:
-                futures = {
-                    executor.submit(self._evaluate_one, row, scope_id, assets_by_name, request): index
-                    for index, row in pending_rows
-                }
-                # Drain both pools as work completes. Waiting only on Agent futures
-                # withholds scores for the whole album when one Agent is slow.
-                if not futures:
-                    state.record_phase("qa_eval", "agent_phase_finished_at", now_iso())
-                    state.record_phase("qa_eval", "agent_phase_wall_ms", 0.0)
-                while futures or judge_futures:
+                while pending_rows or futures or judge_futures or (pending_judges and judge_pool is not None):
+                    # Persist intent before any external work. A crash after this checkpoint
+                    # is conservatively unknown, never permission to replay the request.
+                    qa_batch: list[tuple[int, dict[str, Any]]] = []
+                    judge_batch: list[int] = []
+                    if not state.cancelled:
+                        while pending_rows and len(futures) + len(qa_batch) < concurrency:
+                            index, row = pending_rows.pop(0)
+                            items[index] = {
+                                "qa_id": row.get("qa_id"),
+                                "execution_status": "running",
+                                "judge_status": "pending",
+                                "judge_dispatch_status": "not_started",
+                            }
+                            qa_batch.append((index, row))
+                        while (
+                            pending_judges
+                            and judge_pool is not None
+                            and len(judge_futures) + len(judge_batch) < judge_concurrency
+                        ):
+                            index = pending_judges.pop(0)
+                            items[index] = {
+                                **items[index],
+                                "judge_status": "running",
+                                "judge_dispatch_status": "in_flight",
+                            }
+                            judge_batch.append(index)
+                    if qa_batch or judge_batch:
+                        record_progress()
+                        state.persist(wait=True)
+                    for index, row in qa_batch:
+                        futures[executor.submit(run_agent, row)] = index
+                    for index in judge_batch:
+                        assert judge_pool is not None
+                        if judge_phase_started is None:
+                            judge_phase_started = time.perf_counter()
+                            state.record_phase("qa_eval", "judge_phase_started_at", now_iso())
+                        judge_futures[judge_pool.submit(run_judge, items[index], rows[index])] = index
+                    record_progress()
+                    if (
+                        not futures
+                        and not pending_rows
+                        and not (state.get("phases") or {}).get("qa_eval", {}).get("agent_phase_finished_at")
+                    ):
+                        state.record_phase("qa_eval", "agent_phase_finished_at", now_iso())
+                        state.record_phase(
+                            "qa_eval",
+                            "agent_phase_wall_ms",
+                            round((time.perf_counter() - agent_phase_started) * 1000, 1),
+                        )
+                    if not futures and not judge_futures:
+                        break  # cancelled, judge disabled, or all work complete
                     done, _ = concurrent.futures.wait(
-                        (*futures, *judge_futures), return_when=concurrent.futures.FIRST_COMPLETED
+                        (*futures, *judge_futures),
+                        timeout=0.5,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
                     )
                     for completed_future in done:
                         if completed_future in judge_futures:
                             index = judge_futures.pop(completed_future)
                             try:
-                                judged = completed_future.result()
-                                with state.lock:
-                                    items[index] = judged
+                                items[index] = completed_future.result()
                             except Exception as exc:  # noqa: BLE001
-                                with state.lock:
-                                    items[index]["judge_status"] = "failed"
-                                    items[index]["judge"] = {"score": None, "reason": f"judge_error: {exc}"}
-                            judge_done += 1
+                                items[index] = {
+                                    **items[index],
+                                    "judge_status": "failed",
+                                    "judge": {"score": None, "reason": f"judge_error: {exc}"},
+                                }
+                            if items[index].get("judge_status") in {"completed", "failed"}:
+                                items[index] = {**items[index], "judge_dispatch_status": "finished"}
+                                judge_done += 1
+                            elif items[index].get("judge_status") == "outcome_unknown":
+                                items[index] = {**items[index], "judge_dispatch_status": "outcome_unknown"}
+                            elif items[index].get("judge_status") == "pending":
+                                pending_judges.append(index)
                             record_progress()
                             state.persist()
                             continue
-                        future = completed_future
-                        index = futures.pop(future)
+                        index = futures.pop(completed_future)
                         try:
-                            item = future.result()
+                            item = completed_future.result()
                         except RunCancelledError as exc:
-                            # **被取消的题不是失败的题。** 1.0 的 resume 靠
-                            # ``execution_status not in {"scheduled", "running"}`` 挑出「从没
-                            # 开始过」的题（``:3414-3417``），而取消时还在排队里的题正好是从没
-                            # 开始过的。标成 failed 会让 resume 把它们当成已完成跳过——
-                            # 那正是「取消一次，155 题只能整轮重跑」的成因。
                             item = {
                                 "error": f"cancelled while waiting: {exc}",
                                 "execution_status": "scheduled",
                             }
-                        except Exception as exc:  # noqa: BLE001 —— 1.0 ``:3218``
+                        except Exception as exc:  # noqa: BLE001
                             item = {"error": repr(exc), "failed": True, "execution_status": "failed"}
+                        item.setdefault("qa_id", rows[index].get("qa_id"))
                         item["_index"] = index
-                        # 「没有答案可打分的题」与「还没打分的题」是两件事（1.0 ``:3220``）：
-                        # 前者标 skipped，后者标 pending。跳过判分的 item **绝不**再排进
-                        # Judge 池——它没有答案可评，送进去只会产出一个假的 0 分。
+                        item["judge_dispatch_status"] = "not_started"
                         if item.get("failed") or item.get("error"):
                             item["judge_status"] = "skipped"
                         else:
                             item.setdefault("judge_status", "pending")
-                            if judge is not None and judge_pool is not None:
-                                if judge_phase_started is None:
-                                    judge_phase_started = time.perf_counter()
-                                    state.record_phase("qa_eval", "judge_phase_started_at", now_iso())
-                                judge_futures[judge_pool.submit(run_judge, item, rows[index])] = index
+                            if judge is not None:
+                                pending_judges.append(index)
                         items[index] = item
-                        if not futures:
-                            state.record_phase("qa_eval", "agent_phase_finished_at", now_iso())
-                            state.record_phase(
-                                "qa_eval",
-                                "agent_phase_wall_ms",
-                                round((time.perf_counter() - agent_phase_started) * 1000, 1),
-                            )
                         record_progress()
                         state.persist()
+                    # Also publish cloud request counters while all Agents/Judges are busy.
+                    record_progress()
+                    state.persist()
         finally:
             if judge_pool is not None:
                 judge_pool.shutdown(wait=True)
@@ -2104,6 +2184,15 @@ class RunExecution:
                 state.record_phase("qa_eval", "judge_phase_started_at", first[2])
                 state.record_phase("qa_eval", "judge_phase_finished_at", last[3])
                 state.record_phase("qa_eval", "judge_phase_wall_ms", round((last[1] - first[0]) * 1000, 1))
+        if not pending_rows and not futures:
+            phase = (state.get("phases") or {}).get("qa_eval") or {}
+            if not phase.get("agent_phase_finished_at"):
+                state.record_phase("qa_eval", "agent_phase_finished_at", now_iso())
+                state.record_phase(
+                    "qa_eval",
+                    "agent_phase_wall_ms",
+                    round((time.perf_counter() - agent_phase_started) * 1000, 1),
+                )
         with state.lock:
             ordered = [items[i] for i in sorted(items)]
             for item in ordered:
@@ -2113,19 +2202,26 @@ class RunExecution:
             state.data["run_valid"] = bool(len(ordered) == len(rows) and executed == len(rows))
             record_progress()
         failed = [
-            item for item in state.get("items") or [] if item.get("execution_status") in {"failed", "timeout"}
+            item
+            for item in state.get("items") or []
+            if item.get("execution_status") in {"failed", "timeout", "outcome_unknown"}
+            or item.get("judge_status") == "outcome_unknown"
         ]
         phase_result = {
             "total_seconds": round(time.perf_counter() - started, 1),
             "qa_concurrency": concurrency,
             "failed_count": len(failed),
-            "error": f"{len(failed)} 道题执行失败或超时" if failed else None,
+            "error": f"{len(failed)} 道题执行失败、超时或结果待确认" if failed else None,
             "error_details": [
                 {
                     "sample_id": item.get("qa_id") or "QA",
-                    "status": item.get("execution_status") or "failed",
-                    "error_type": "agent_error",
-                    "reason": str(item.get("error") or "QA execution failed"),
+                    "status": "outcome_unknown"
+                    if item.get("judge_status") == "outcome_unknown"
+                    else item.get("execution_status") or "failed",
+                    "error_type": "judge_outcome_unknown"
+                    if item.get("judge_status") == "outcome_unknown"
+                    else "agent_error",
+                    "reason": str(item.get("error") or "request outcome unknown; not replayed"),
                 }
                 for item in failed
             ],
@@ -2368,6 +2464,9 @@ class RunExecution:
             # 记成 ``failed``。这是照搬会连带搬过来的缺陷，不是风格差异。
             timed_out = isinstance(exc, TimeoutError) or "timed out" in message or "timeout" in message
             item["execution_status"] = "timeout" if timed_out else "failed"
+            if isinstance(exc, RequestOutcomeUnknownError):
+                item["execution_status"] = "outcome_unknown"
+                item["request_failure"] = exc.facts
             item.update(
                 {
                     "error": str(exc),

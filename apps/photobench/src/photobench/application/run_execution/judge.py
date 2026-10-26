@@ -31,6 +31,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from photobench.domain.errors import RequestOutcomeUnknownError
 from photobench.domain.http.ports import JsonHttpClient
 from photobench.domain.runs.analysis import (
     JUDGE_CONSISTENCY_VERSION,
@@ -107,8 +108,28 @@ class JudgeRunner:
         self.sleep = sleep
         self.rand = rand
         #: 限流锁与下一次可发时刻。惰性创建（1.0 也是第一次用到才建）。
-        self._rate_lock: threading.Lock | None = None
+        self._rate_lock = threading.Lock()
         self._next_request_at = 0.0
+        self._metrics_lock = threading.Lock()
+        self._request_metrics: dict[str, int | float] = {
+            "version": 1,
+            "requests_started": 0,
+            "responses_received": 0,
+            "request_errors": 0,
+            "http_429": 0,
+            "in_flight": 0,
+            "rate_waiting": 0,
+            "rate_wait_ms": 0.0,
+        }
+
+    def request_metrics(self) -> dict[str, int | float]:
+        """Actual HTTP attempts for this run, not question/sub-judge counts."""
+        with self._metrics_lock:
+            return dict(self._request_metrics)
+
+    def _request_metric(self, key: str, amount: int | float = 1) -> None:
+        with self._metrics_lock:
+            self._request_metrics[key] += amount
 
     # ---- HTTP ---------------------------------------------------------------
 
@@ -123,11 +144,7 @@ class JudgeRunner:
         """把 judge 请求在多个 worker 之间摊开，避免同步突发（1.0 ``:4467``）。"""
         if JUDGE_REQUEST_INTERVAL_SECONDS <= 0:
             return
-        lock = self._rate_lock
-        if lock is None:
-            lock = threading.Lock()
-            self._rate_lock = lock
-        with lock:
+        with self._rate_lock:
             current = time.monotonic()
             wait_seconds = max(0.0, self._next_request_at - current)
             self._next_request_at = max(current, self._next_request_at) + JUDGE_REQUEST_INTERVAL_SECONDS
@@ -190,13 +207,45 @@ class JudgeRunner:
         last_error: Exception | None = None
         for attempt in range(1, JUDGE_RETRY_ATTEMPTS + 1):
             try:
-                self._wait_for_request_slot()
-                response = self.http.request_json(
-                    judge_chat_url(self.judge_url), payload, "POST", timeout, self._headers()
-                )
+                if self.cancel is not None and self.cancel.is_set():
+                    raise RunCancelledError("cancelled before Judge request dispatch")
+                wait_started = time.perf_counter()
+                self._request_metric("rate_waiting")
+                try:
+                    self._wait_for_request_slot()
+                finally:
+                    self._request_metric("rate_waiting", -1)
+                    self._request_metric("rate_wait_ms", (time.perf_counter() - wait_started) * 1000)
+                if self.cancel is not None and self.cancel.is_set():
+                    raise RunCancelledError("cancelled before Judge request dispatch")
+                self._request_metric("requests_started")
+                self._request_metric("in_flight")
+                try:
+                    response = self.http.request_json(
+                        judge_chat_url(self.judge_url), payload, "POST", timeout, self._headers()
+                    )
+                    self._request_metric("responses_received")
+                except Exception as exc:
+                    self._request_metric("request_errors")
+                    current: BaseException | None = exc
+                    seen: set[int] = set()
+                    while current is not None and id(current) not in seen:
+                        seen.add(id(current))
+                        code = getattr(current, "code", None)
+                        if code is None:
+                            code = getattr(getattr(current, "response", None), "status_code", None)
+                        if code == 429:
+                            self._request_metric("http_429")
+                            break
+                        current = current.__cause__ or current.__context__
+                    raise
+                finally:
+                    self._request_metric("in_flight", -1)
                 if not isinstance(response, dict):
                     raise ValueError("judge response is not an object")
                 return response, attempt
+            except (RunCancelledError, RequestOutcomeUnknownError):
+                raise
             except Exception as exc:  # noqa: BLE001 —— 1.0 在这里把一切收成「重试或放弃」
                 last_error = exc
                 client_code = self._client_error_code(exc)
@@ -336,7 +385,10 @@ class JudgeRunner:
                 "reason": "judge_inconsistent_score_reason" if len(attempts) > 1 else f"judge_error: {exc}",
                 "input": payload,
                 "raw_text": text,
-                "judge_status": "failed",
+                "judge_status": "outcome_unknown"
+                if isinstance(exc, RequestOutcomeUnknownError)
+                else "failed",
+                **({"request_failure": exc.facts} if isinstance(exc, RequestOutcomeUnknownError) else {}),
             }
 
     def judge_task_action(
@@ -411,7 +463,10 @@ class JudgeRunner:
                 "correct": None,
                 "reason": f"judge_error: {exc}",
                 "input": payload,
-                "judge_status": "failed",
+                "judge_status": "outcome_unknown"
+                if isinstance(exc, RequestOutcomeUnknownError)
+                else "failed",
+                **({"request_failure": exc.facts} if isinstance(exc, RequestOutcomeUnknownError) else {}),
             }
 
     def _inline_images(
@@ -505,7 +560,10 @@ class JudgeRunner:
                 "score": None,
                 "reason": f"judge_error: {exc}",
                 "input": payload,
-                "judge_status": "failed",
+                "judge_status": "outcome_unknown"
+                if isinstance(exc, RequestOutcomeUnknownError)
+                else "failed",
+                **({"request_failure": exc.facts} if isinstance(exc, RequestOutcomeUnknownError) else {}),
             }
 
     # ---- 一个 item 的编排 ---------------------------------------------------
@@ -555,6 +613,8 @@ class JudgeRunner:
                 reference=turn_reference,
                 conversation=conv_ctx,
             )
+            if record["task_judge"].get("judge_status") == "outcome_unknown":
+                break  # No new sub-requests after an uncertain dispatch for this item.
             # 同一轮的回答质量与图片证据两个调用**并行**（1.0 的注释）。
             should_judge_evidence = (
                 self.evidence_enabled
@@ -597,6 +657,12 @@ class JudgeRunner:
                 evidence_future.result() if evidence_future else {"score": None, "reason": "not_applicable"}
             )
 
+            if any(
+                (record.get(key) or {}).get("judge_status") == "outcome_unknown"
+                for key in ("judge", "evidence_judge")
+            ):
+                break
+
         task_judges = [record.get("task_judge") or {} for record in turn_records]
         task_judge = task_judges[-1] if task_judges else {"actual_action": None, "correct": None}
         judge = turn_records[-1].get("judge") if turn_records else {"score": None, "reason": "not_applicable"}
@@ -606,7 +672,9 @@ class JudgeRunner:
             else {"score": None, "reason": "not_applicable"}
         )
         judge_ms = round((time.perf_counter() - started) * 1000, 1)
-        all_judge_outputs = [judge, evidence_judge, *task_judges]
+        all_judge_outputs = [
+            record.get(key) for record in turn_records for key in ("judge", "task_judge", "evidence_judge")
+        ]
         # 任何一个子判分 failed，item 的 judge_status 就是 failed——读侧靠它区分
         # 「真的打了 0 分」与「根本没打成」。
         judge_terminal_status = (
@@ -617,6 +685,11 @@ class JudgeRunner:
             )
             else "completed"
         )
+        if any(
+            isinstance(value, dict) and value.get("judge_status") == "outcome_unknown"
+            for value in all_judge_outputs
+        ):
+            judge_terminal_status = "outcome_unknown"
         item.update(
             {
                 "judge": judge or {"score": None, "reason": "not_applicable"},

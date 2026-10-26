@@ -85,6 +85,11 @@ export interface PhaseProgress {
   agent_completed?: number | null;
   agent_total?: number | null;
   agent_in_flight?: number;
+  agent_waiting?: number | null;
+  agent_running?: number | null;
+  judge_waiting?: number | null;
+  judge_running?: number | null;
+  outcome_unknown?: number | null;
   /** Judge 已结束的题数（含评分失败）；有效评分数另见 summary.judge_valid_count。 */
   judge_completed?: number | null;
   judge_total?: number | null;
@@ -102,6 +107,16 @@ export interface PhaseProgress {
  * 另有 `gpu_metrics` 这种非执行阶段。
  */
 export interface Phase {
+  judge_requests?: {
+    version?: number | null;
+    requests_started?: number | null;
+    responses_received?: number | null;
+    request_errors?: number | null;
+    http_429?: number | null;
+    in_flight?: number | null;
+    rate_waiting?: number | null;
+    rate_wait_ms?: number | null;
+  } | null;
   scanned_count?: number | null;
   sampling_integrity?: {
     callback_failures?: number;
@@ -380,6 +395,9 @@ export interface TaskJudge {
 /** 一行逐题摘要（`/api/v1/runs/{id}/items` 的 `items[]`）。 */
 export interface RunItemSummary {
   index: number;
+  execution_status?: string | null;
+  judge_status?: string | null;
+  judge_dispatch_status?: string | null;
   qa_id?: string;
   question?: string;
   task_type?: string;

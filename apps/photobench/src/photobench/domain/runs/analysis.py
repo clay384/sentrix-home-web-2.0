@@ -1688,6 +1688,11 @@ def item_summary(item: dict[str, Any], index: int, review: dict[str, Any] | None
     return {
         "index": index,
         "qa_id": item.get("qa_id"),
+        **{
+            key: item[key]
+            for key in ("execution_status", "judge_status", "judge_dispatch_status")
+            if key in item
+        },
         "question": item.get("question"),
         "task_type": item.get("task_type"),
         "question_type": item.get("question_type"),

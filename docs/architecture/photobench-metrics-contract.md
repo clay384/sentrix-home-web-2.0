@@ -161,3 +161,15 @@ QA阶段的规范进度存于`phases.qa_eval.progress`：`agent_completed`为已
 Agent和Judge仍使用独立线程池，协调器等待任一池完成即提交结果，不再等全部Agent结束才回收Judge。恢复运行从已有明确Judge终态初始化计数，跳过事实单列，不重新请求既有评分。Agent阶段墙钟在最后Agent结果返回时结束，不包含等待Judge尾部。前端阶段卡和列表共用同一读取函数，优先内层、缺失时兼容外层；没有记录显示?，不以0替代未知。历史原文不改写，旧运行自身未更新的计数仍属于旧检查点事实，不能据有效评分数补造完整Judge终态。
 
 复现测试覆盖一题Agent阻塞时另一题Judge的合法0分、返回失败和抛异常及时可见；resume既有评分、失败/跳过、取消未开始题不假报完成、可空投影及历史外层字段UI。仅本地验证，未触碰四机或启动真实测评；后续发布按公共执行路径影响验证。
+
+
+### 2026-10-26 有界派发、评分补齐与请求计数
+
+- QA 与 Judge 使用独立有界池；`qa_concurrency` 与 `PHOTOBENCH_JUDGE_CONCURRENCY` 保持原含义。每次派发前同步保存检查点，成功落盘才允许外部调用。取消后不再派发新 QA 或 Judge；在途调用仍按原超时结束。
+- 新 item 的 `judge_dispatch_status` 为 `not_started` / `in_flight` / `finished` / `outcome_unknown`。恢复保留已完成 QA、已完成评分（包括合法 0 分）及评分失败；仅对 QA 已完成且 `judge_status=pending, judge_dispatch_status=not_started` 的题补评分。`running` / `started` QA 或 Judge 被恢复为 `outcome_unknown`，不得自动重发。旧版 pending 无派发日志，同样视为未知；显式全量 rejudge 的目标、归档及覆盖语义不变。
+- `phases.qa_eval.progress` 增加可选 `agent_waiting` / `agent_running` / `judge_waiting` / `judge_running` / `outcome_unknown`。running 表示已交执行池、结果尚未回收；waiting 为尚未派发。未知子评分保持空值，不作0分；已确认的独立子评分保留，item标未知并使相位 partial。
+- `phases.qa_eval.judge_requests` 版本 1：`requests_started` 为该次运行真正交给 HTTP 端口的请求尝试数，包含重试、各回合子评分及一致性复问；`responses_received` 为收到并返回 JSON 的调用数；`request_errors` 为 HTTP 调用异常数；`http_429` 为异常链上明确收到的 429 数。`in_flight` / `rate_waiting` 为当前数量，`rate_wait_ms` 是各请求累计限流等待墙钟毫秒。不是云账号配额、不是一题一次请求，也不追溯补造历史值。恢复新 run 仅统计本次补齐请求，旧 run 证据保留。
+- 新状态与指标均为可选字段，API 投影和前端类型同步；缺失表示旧记录未采集，不当作 0。Judge 明确收到 429/5xx 的既有有界重试保留；`RequestOutcomeUnknownError`（已发出但响应未知，包括读/写超时）不重试，三个子评分及 item 均保留 outcome_unknown 与失败事实，并停止该题尚未派发的后续子评分。恢复也不会重放旧 run 的未知请求。
+
+
+结果读取：`read_revision` 对新格式为 `snapshot:<generation>`，同一次不可变提交保持稳定；没有提交清单的legacy可变文件不具可靠revision，返回空值且不做跨请求终态/投影或stat-only磁盘索引缓存。读性能取舍见 `2026-10-26-concurrency-recovery-deviations.md`；新格式无需hash或重解析大payload，公开字段及分数语义不变。

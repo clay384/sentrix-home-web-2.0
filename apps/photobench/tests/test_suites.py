@@ -571,13 +571,8 @@ def test_resume_rejects_a_run_without_a_scope_checkpoint(tmp_path: Path):
     assert "no memory-space checkpoint" in str(excinfo.value)
 
 
-def test_resume_carries_only_the_finished_items_and_reuses_the_scope(tmp_path: Path):
-    """续跑只带**跑完的**题；``scheduled`` / ``running`` 的留给这一轮重跑。
-
-    判据逐条照 1.0 ``:3414-3417`` 的 ``execution_status not in {"scheduled", "running"}``。
-    这也正是取消掉的题必须标 ``scheduled`` 而不能标 ``failed`` 的原因——标 failed
-    会被当成「已跑完」，续跑时永远跳过。
-    """
+def test_resume_preserves_finished_and_unknown_items_and_reuses_the_scope(tmp_path: Path):
+    """Only never-dispatched scheduled items are rerun; running outcomes remain unknown."""
     store = FakeRunStore({"run-1": _cancelled_state()})
 
     result = _suites(tmp_path, store=store, gate=threading.Event()).resume_run("run-1")
@@ -585,8 +580,8 @@ def test_resume_carries_only_the_finished_items_and_reuses_the_scope(tmp_path: P
     assert result["mode"] == "reuse"
     assert result["scope_id"] == "PhotoBench-20260101-000000-album-x-qwen"
     assert result["resumed_from"] == "run-1"
-    # 三题里只有 q1 是 completed；另外两题留给这一轮。
-    assert result["resumed_items"] == 1
+    # Completed q1 and unknown in-flight q3 are kept; only scheduled q2 is eligible.
+    assert result["resumed_items"] == 2
 
 
 def test_queued_requests_freeze_topology_before_configuration_changes(tmp_path):

@@ -1,5 +1,6 @@
 import dataclasses
 
+import pytest
 from fastapi.testclient import TestClient
 
 
@@ -15,14 +16,18 @@ class _UnavailableEmbeddings:
         return ""
 
 
-def test_health_returns_ok(client: TestClient):
+@pytest.mark.parametrize("revision", ["development", "release-0123456789abcdef"])
+def test_health_returns_ok(client: TestClient, revision: str):
+    # Source releases contain build-info.json; the HTTP contract must not depend
+    # on whether this checkout has a deployment manifest or on its revision.
+    client.app.state.container = dataclasses.replace(client.app.state.container, build_revision=revision)
     response = client.get("/api/v1/health")
 
     assert response.status_code == 200
     assert response.json() == {
         "status": "ok",
         "version": "0.1.0",
-        "build_revision": "development",
+        "build_revision": revision,
         "database": "ok",
         "embeddings": "ok",
     }

@@ -42,7 +42,7 @@ def _load() -> None:
         if threads > 0:
             torch.set_num_threads(threads)
         path = _model_path()
-        _tokenizer = AutoTokenizer.from_pretrained(  # type: ignore[no-untyped-call]
+        _tokenizer = AutoTokenizer.from_pretrained(  # type: ignore[no-untyped-call, unused-ignore]
             str(path), local_files_only=True
         )
         _model = AutoModel.from_pretrained(

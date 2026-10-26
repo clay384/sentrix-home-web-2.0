@@ -1136,6 +1136,51 @@ components:
       additionalProperties: true
       type: object
       title: JudgeObservation
+    JudgeRequestMetrics:
+      properties:
+        version:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Version
+        requests_started:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Requests Started
+        responses_received:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Responses Received
+        request_errors:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Request Errors
+        http_429:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Http 429
+        in_flight:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: In Flight
+        rate_waiting:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Rate Waiting
+        rate_wait_ms:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Rate Wait Ms
+      additionalProperties: true
+      type: object
+      title: JudgeRequestMetrics
     MemoryObservation:
       properties:
         memory_accounting:
@@ -1260,6 +1305,10 @@ components:
       title: MemoryObservation
     PhaseMetricsProjection:
       properties:
+        judge_requests:
+          anyOf:
+          - $ref: '#/components/schemas/JudgeRequestMetrics'
+          - type: 'null'
         agent_completed:
           anyOf:
           - type: integer
@@ -1320,6 +1369,31 @@ components:
           - type: integer
           - type: 'null'
           title: Agent Total
+        agent_waiting:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Agent Waiting
+        agent_running:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Agent Running
+        judge_waiting:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Judge Waiting
+        judge_running:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Judge Running
+        outcome_unknown:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Outcome Unknown
         judge_completed:
           anyOf:
           - type: integer
@@ -1394,6 +1468,21 @@ components:
       title: PhaseProgressProjection
     RunItemObservation:
       properties:
+        execution_status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Execution Status
+        judge_status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Judge Status
+        judge_dispatch_status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Judge Dispatch Status
         judge:
           anyOf:
           - $ref: '#/components/schemas/JudgeObservation'

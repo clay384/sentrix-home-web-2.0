@@ -133,7 +133,9 @@ class RunRevisions(Protocol):
     New read capability; the legacy RunStore methods remain supported.
     """
 
-    def revision(self, run_id: str) -> str: ...
+    def revision(self, run_id: str) -> str:
+        """Cacheable immutable revision, or empty when no reliable revision exists."""
+        ...
 
 
 @runtime_checkable

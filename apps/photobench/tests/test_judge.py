@@ -218,7 +218,8 @@ def test_a_cancelled_runner_stops_the_retry_wait():
     runner = _runner(http, cancel=cancel)
     with pytest.raises(RunCancelledError):
         runner._request({"model": "m"})
-    assert len(http.calls) == 1
+    assert len(http.calls) == 0
+    assert runner.request_metrics()["requests_started"] == 0
 
 
 # ---- 任务行为与证据判分 ---------------------------------------------------
@@ -445,3 +446,87 @@ def test_reference_answer_praise_does_not_describe_the_tested_models_answer():
     result = _runner(http).judge("q", "r", "a")
     assert result["score"] == 0
     assert len(http.calls) == 1
+
+
+def test_request_metrics_count_actual_attempts_and_rate_limits():
+    cause = Exception("rate limit")
+    cause.response = SimpleNamespace(status_code=429)
+    error = RuntimeError("HTTP 429")
+    error.__cause__ = cause
+    http = FakeHttpClient([error, judge_reply('{"score":2,"reason":"ok"}')])
+    runner = _runner(http)
+    runner._request({"model": "m"})
+    metrics = runner.request_metrics()
+    assert metrics["requests_started"] == 2
+    assert metrics["http_429"] == metrics["request_errors"] == metrics["responses_received"] == 1
+    assert metrics["in_flight"] == metrics["rate_waiting"] == 0
+    metrics["requests_started"] = 99
+    assert runner.request_metrics()["requests_started"] == 2
+
+
+@pytest.mark.parametrize("failed_stage", ["task", "quality", "evidence"])
+@pytest.mark.parametrize("error_kind", ["ReadTimeout", "WriteTimeout"])
+def test_uncertain_cloud_post_is_not_retried_or_hidden(failed_stage, error_kind):
+    import httpx
+
+    from photobench.infrastructure.http.client import HttpxJsonClient
+
+    calls = []
+    task_response = judge_reply('{"actual_action":"answer","reason":"ok"}')
+    quality_response = judge_reply('{"score":2,"reason":"ok"}')
+
+    def handler(request):
+        import json
+
+        payload = json.loads(request.content)
+        system = payload["messages"][0]["content"]
+        calls.append(system)
+        if system == failed_stage:
+            raise getattr(httpx, error_kind)("request outcome is unknown", request=request)
+        return httpx.Response(200, json=task_response if system == "task" else quality_response)
+
+    client = HttpxJsonClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    runner = JudgeRunner(
+        http=client,
+        judge_url="http://judge/v1",
+        judge_model="m",
+        task_judge_prompt="task",
+        answer_quality_prompt="quality",
+        evidence_judge_prompt="evidence",
+        evidence_enabled=failed_stage == "evidence",
+        inline_images=lambda *_: [{"type": "image_url", "image_url": {"url": "data:test"}}],
+    )
+    item = {
+        "runtime_turns": [
+            {
+                "message": "q",
+                "answer": "a",
+                "expected_action": "answer",
+                "termination_reason": "answered",
+                "agent_status": "complete",
+                "predicted_images": [{"file_name": "a.jpg"}],
+            }
+        ]
+    }
+    result = runner.judge_item(item, {}, {})
+    assert result["judge_status"] == "outcome_unknown"
+    key = {"task": "task_judge", "quality": "judge", "evidence": "evidence_judge"}[failed_stage]
+    verdict = result["runtime_turns"][0][key]
+    assert verdict["judge_status"] == "outcome_unknown"
+    assert verdict["request_failure"]["automatic_replay"] is False
+    assert calls.count(failed_stage) == 1
+    if failed_stage == "task":
+        assert calls == ["task"]  # Later sub-judgements were never dispatched.
+    assert runner.request_metrics()["requests_started"] == len(calls)
+    assert runner.request_metrics()["request_errors"] == 1
+
+
+def test_received_server_error_remains_retryable():
+    cause = Exception("unavailable")
+    cause.response = SimpleNamespace(status_code=503)
+    error = RuntimeError("HTTP 503")
+    error.__cause__ = cause
+    http = FakeHttpClient([error, judge_reply('{"score":2,"reason":"ok"}')])
+    runner = _runner(http)
+    runner._request({"model": "m"})
+    assert len(http.calls) == 2
