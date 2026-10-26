@@ -312,3 +312,79 @@ def test_a_real_writer_gets_a_serializable_state(tmp_path):
     on_disk = json.loads(path.read_text(encoding="utf-8"))
     assert on_disk["run_id"] == "run_test"
     assert on_disk["status"] == state["status"]
+
+
+@pytest.mark.parametrize(
+    "cancel_at",
+    ["before_conversation", "after_conversation", "between_turns", "first_in_flight", "second_in_flight"],
+)
+def test_item_cancellation_preserves_dispatched_turns_without_new_requests(cancel_at):
+    execution, _ = _execution()
+    state = RunState({"status": "running"})
+    execution._state = state
+
+    class Client(FakeSentrixClient):
+        conversations_started = 0
+        turns_started = 0
+
+        def start_conversation(self, **kwargs):
+            self.conversations_started += 1
+            if cancel_at == "after_conversation":
+                state.request_cancel("test")
+            return {"id": "conversation"}
+
+        def start_turn(self, **kwargs):
+            self.turns_started += 1
+            return {"turn_id": f"turn-{self.turns_started}"}
+
+        def get_turn(self, **kwargs):
+            in_flight = cancel_at == "first_in_flight" or (
+                cancel_at == "second_in_flight" and self.turns_started == 2
+            )
+            if in_flight or cancel_at == "between_turns":
+                state.request_cancel("test")
+            return (
+                {"status": "running"}
+                if in_flight
+                else {
+                    "status": "completed",
+                    "result": {"answer": "fixture", "termination_reason": "completed"},
+                }
+            )
+
+    client = Client()
+    execution.client = client
+    if cancel_at == "before_conversation":
+        state.request_cancel("test")
+    result = execution._evaluate_one(
+        {"qa_id": "qa", "question": "fixture", "conversation": [{"message": "one"}, {"message": "two"}]},
+        "scope",
+        {},
+        _request(turn_timeout=4200),
+    )
+    expected_calls = {
+        "before_conversation": 0,
+        "after_conversation": 0,
+        "between_turns": 1,
+        "first_in_flight": 1,
+        "second_in_flight": 2,
+    }[cancel_at]
+    unknown = cancel_at.endswith("in_flight")
+    assert client.turns_started == expected_calls
+    assert client.conversations_started == int(cancel_at != "before_conversation")
+    assert result["execution_status"] == ("outcome_unknown" if unknown else "cancelled")
+    assert result["request_failure"]["request_outcome_unknown"] is unknown
+    assert result["request_failure"]["automatic_replay"] is False
+    completed_count = int(cancel_at in {"between_turns", "second_in_flight"})
+    assert result["request_failure"]["completed_turn_count"] == completed_count
+    assert len(result["runtime_turns"]) == completed_count
+    if completed_count:
+        assert result["runtime_turns"][0]["turn_id"] == "turn-1"
+        assert result["runtime_turns"][0]["answer"] == "fixture"
+    if unknown:
+        assert result["request_failure"]["turn_id"] == f"turn-{expected_calls}"
+    assert result["retrieval_recall"] is None
+    assert result["media_retrieval_recall"] is None
+    assert result["judge"]["score"] is None
+    assert result["judge_status"] == "skipped"
+    assert RunExecution.resume_item(result)["execution_status"] == result["execution_status"]

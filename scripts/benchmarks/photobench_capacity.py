@@ -390,6 +390,68 @@ def process_sample(pid: int | None, expected_start: str | None = None) -> Json:
     return result
 
 
+def observe_cancel_drain(
+    bench: str,
+    run_id: str,
+    state: Json,
+    samples: Journal,
+    *,
+    deadline_seconds: float,
+    poll_seconds: float,
+) -> tuple[Json, Json]:
+    """Read only after the one cancellation POST; never infer remote request completion."""
+    started = time.monotonic()
+    last_error: str | None = None
+    while state.get("status") not in TERMINAL:
+        remaining = deadline_seconds - (time.monotonic() - started)
+        if remaining <= 0:
+            break
+        try:
+            latest = json.loads(
+                get_text(
+                    bench + "/api/v1/runs/" + urllib.parse.quote(run_id, safe="") + "?include_history=false",
+                    min(30, remaining),
+                )
+            )
+            if latest.get("run_id") != run_id:
+                raise ValueError("drain run identity differs")
+            state = {**latest, "items": state.get("items", [])}
+            samples.append(
+                {
+                    "observed_at": time.time(),
+                    "run_id": run_id,
+                    "cancellation_drain": True,
+                    **progress_view(state),
+                }
+            )
+        except Exception as exc:
+            last_error = type(exc).__name__
+            samples.append(
+                {"observed_at": time.time(), "cancellation_drain": True, "read_error_type": last_error}
+            )
+        if state.get("status") in TERMINAL:
+            break
+        remaining = deadline_seconds - (time.monotonic() - started)
+        if remaining > 0:
+            time.sleep(min(poll_seconds, remaining))
+    progress = ((state.get("phases") or {}).get("qa_eval") or {}).get("progress") or {}
+    terminal = state.get("status") in TERMINAL
+    return state, {
+        "benchmark_terminal": terminal,
+        "deadline_exceeded": not terminal and time.monotonic() - started >= deadline_seconds,
+        "elapsed_seconds": time.monotonic() - started,
+        "deadline_seconds": deadline_seconds,
+        "agent_running": progress.get("agent_running"),
+        "judge_running": progress.get("judge_running"),
+        "outcome_unknown": progress.get("outcome_unknown"),
+        "remote_outcomes": "unresolved",
+        "last_read_error_type": last_error,
+        # A terminal PhotoBench record can retain abandoned remote Agent work.
+        "remote_requests_proven_idle": False,
+        "automatic_replay": False,
+    }
+
+
 def poll_run(
     *,
     bench: str,
@@ -407,10 +469,12 @@ def poll_run(
     client_pid: int | None,
     client_start: str | None,
     source_rows: Sequence[Json] | None = None,
+    cancel_drain_seconds: float = 300,
 ) -> Json:
     started = time.monotonic()
     stop_reason = None
     cancel_event: Json | None = None
+    cancellation_drain: Json | None = None
     samples = Journal(output / "photobench-progress.jsonl")
     state: Json = {}
     observed_items: dict[int, Json] = {}
@@ -438,7 +502,7 @@ def poll_run(
                     )
                     if i not in observed_items
                     or observed_items[i].get("execution_status")
-                    not in {"completed", "failed", "timeout", "outcome_unknown"}
+                    not in {"completed", "failed", "timeout", "outcome_unknown", "cancelled"}
                     or (
                         judge_changed
                         and observed_items[i].get("judge_status")
@@ -477,7 +541,17 @@ def poll_run(
                 cancel_event = previous or post_once(
                     bench + "/api/v1/runs/" + urllib.parse.quote(run_id, safe="") + "/cancel", {}, key, ledger
                 )
-            # Cancellation is a single dispatch; a lost acknowledgement is not retried.
+            # A lost acknowledgement is not retried. Observe existing work only.
+            state, cancellation_drain = observe_cancel_drain(
+                bench,
+                run_id,
+                state,
+                samples,
+                deadline_seconds=cancel_drain_seconds,
+                poll_seconds=poll_seconds,
+            )
+            save_json(output / "cancellation-drain.json", cancellation_drain)
+            save_json(output / "latest-run.json", state)
             break
         stop.wait(poll_seconds)
     problem = run_problem(state, count, concurrency, judge_concurrency) if state else "missing_run_state"
@@ -507,6 +581,7 @@ def poll_run(
         "judge_failure_cause": "unknown" if judge_failure_count(state) else None,
         "stage_timings": state.get("phases"),
         "cancel_dispatch": cancel_event,
+        "cancellation_drain": cancellation_drain,
         "model_metric_peaks": sampler.peaks,
         "capacity_only_not_model_score": True,
         "conclusion": "one observed round; no maximum or recommendation inferred",
@@ -592,6 +667,33 @@ def final_evidence(bench: str, run_id: str, output: Path, source_rows: Sequence[
     return report
 
 
+def collect_final_evidence(
+    result: Json, bench: str, run_id: str, output: Path, source_rows: Sequence[Json]
+) -> None:
+    drain = result.get("cancellation_drain")
+    if drain is not None:
+        # Full item hydration can require hundreds of GETs. It must not extend the drain
+        # deadline, even when PhotoBench is terminal but remote Agent work is unresolved.
+        result.update(
+            passed=False,
+            final_evidence_failure=(
+                "cancelled_round_full_evidence_deferred"
+                if drain.get("benchmark_terminal")
+                else "cancel_drain_incomplete"
+            ),
+        )
+        return
+    try:
+        apply_final_evidence(result, final_evidence(bench, run_id, output, source_rows))
+    except Exception as exc:
+        result.update(
+            passed=False,
+            failure=result.get("failure") or "final_run_evidence_unavailable",
+            final_evidence_failure="final_run_evidence_unavailable",
+            evidence_error_type=type(exc).__name__,
+        )
+
+
 def apply_final_evidence(result: Json, report: Json) -> None:
     """Full terminal details decide qualification; cloud counts remain run-level facts."""
     result["attribution"] = report
@@ -641,6 +743,7 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--turn-timeout-s", type=int, default=900)
     p.add_argument("--round-timeout-s", type=float, default=14400)
+    p.add_argument("--cancel-drain-s", type=float, default=300)
     p.add_argument("--poll-seconds", type=float, default=5)
     p.add_argument("--model-ssh")
     p.add_argument("--min-model-available-gib", type=float, default=8)
@@ -667,6 +770,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         min(args.qa_concurrency, args.judge_concurrency, args.window, args.turn_timeout_s) < 1
         or args.poll_seconds < 0.1
         or args.round_timeout_s <= 0
+        or args.cancel_drain_s < 0
     ):
         raise ValueError("concurrency, windows and budgets must be positive")
     bench = service_url(args.bench_url, args.allow_bench_host)
@@ -903,6 +1007,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sampler=sampler,
                 poll_seconds=args.poll_seconds,
                 deadline_seconds=args.round_timeout_s,
+                cancel_drain_seconds=args.cancel_drain_s,
                 client_pid=pid,
                 client_start=proc.get("start_time_ticks"),
                 source_rows=source_rows,
@@ -915,14 +1020,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sampler.sample_once()
                 if sampler.failure:
                     result.update(passed=False, failure=sampler.failure)
-            try:
-                apply_final_evidence(result, final_evidence(bench, run_id, args.output, source_rows))
-            except Exception as exc:
-                result.update(
-                    passed=False,
-                    failure="final_run_evidence_unavailable",
-                    evidence_error_type=type(exc).__name__,
-                )
+            collect_final_evidence(result, bench, run_id, args.output, source_rows)
             save_json(args.output / "summary.json", result)
             print(
                 json.dumps(

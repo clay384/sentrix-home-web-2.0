@@ -175,6 +175,7 @@ def poll_kwargs(tmp_path):
         sampler=SimpleNamespace(failure=None, peaks={}),
         poll_seconds=0.1,
         deadline_seconds=30,
+        cancel_drain_seconds=0,
         client_pid=None,
         client_start=None,
     )
@@ -921,3 +922,108 @@ def test_invalid_cloud_content_cannot_qualify_as_completed_capacity(monkeypatch)
     assert result["passed"] is False
     assert report["operational"]["judge_by_kind"]["model_output_invalid"] == 1
     assert report["operational"]["not_evaluable_count"] == 0
+
+
+def _cancel_drain_poll(tmp_path, monkeypatch, statuses, drain_s, *, cancel_unknown=False):
+    reads, posts = [], []
+
+    def get(url, *_):
+        reads.append(url)
+        status = statuses[min(len(reads) - 1, len(statuses) - 1)]
+        observed = state(status)
+        observed["run_id"] = "known"
+        observed["phases"]["qa_eval"]["progress"].update(
+            agent_running=int(status != "cancelled"),
+            judge_running=0,
+            outcome_unknown=int(status == "cancelled"),
+        )
+        return json.dumps(observed)
+
+    def post(url, payload, key, journal):
+        posts.append(url)
+        event = {
+            "request_id": key,
+            "state": "request_outcome_unknown" if cancel_unknown else "completed",
+        }
+        journal.append(event)
+        return event
+
+    monkeypatch.setattr(capacity, "get_text", get)
+    monkeypatch.setattr(capacity, "post_once", post)
+    kwargs = poll_kwargs(tmp_path)
+    kwargs.update(cancel_drain_seconds=drain_s, poll_seconds=0.001)
+    kwargs["stop"].set()
+    return capacity.poll_run(**kwargs), reads, posts
+
+
+@pytest.mark.parametrize("cancel_unknown", [False, True])
+def test_cancel_is_dispatched_once_then_drains_read_only(tmp_path, monkeypatch, cancel_unknown):
+    result, reads, posts = _cancel_drain_poll(
+        tmp_path,
+        monkeypatch,
+        ["running", "cancelling", "cancelled"],
+        1,
+        cancel_unknown=cancel_unknown,
+    )
+    assert len(posts) == 1
+    assert len(reads) == 3
+    assert result["state"] == "cancelled"
+    assert result["failure"] == "operator_stop"
+    drain = result["cancellation_drain"]
+    assert drain["benchmark_terminal"] is True
+    assert drain["outcome_unknown"] == 1
+    assert drain["remote_requests_proven_idle"] is False
+    assert drain["automatic_replay"] is False
+    assert (tmp_path / "cancellation-drain.json").is_file()
+
+
+def test_drain_deadline_keeps_residual_unknown_and_skips_full_item_fetch(tmp_path, monkeypatch):
+    result, reads, posts = _cancel_drain_poll(tmp_path, monkeypatch, ["running"], 0.01)
+    assert len(posts) == 1
+    assert result["state"] == "running"
+    assert result["cancellation_drain"]["deadline_exceeded"] is True
+    assert result["cancellation_drain"]["remote_outcomes"] == "unresolved"
+    assert result["cancellation_drain"]["remote_requests_proven_idle"] is False
+    monkeypatch.setattr(capacity, "final_evidence", lambda *_: pytest.fail("must not exceed drain budget"))
+    capacity.collect_final_evidence(result, "http://safe", "known", tmp_path, [])
+    assert result["failure"] == "operator_stop"
+    assert result["final_evidence_failure"] == "cancel_drain_incomplete"
+
+
+def test_drain_read_errors_are_bounded_without_new_posts(tmp_path, monkeypatch):
+    def get(*_):
+        raise TimeoutError("read failed")
+
+    monkeypatch.setattr(capacity, "get_text", get)
+    monkeypatch.setattr(capacity, "post_once", lambda *_: pytest.fail("drain is GET only"))
+    observed, drain = capacity.observe_cancel_drain(
+        "http://safe",
+        "known",
+        state(),
+        capacity.Journal(tmp_path / "progress.jsonl"),
+        deadline_seconds=0.01,
+        poll_seconds=0.001,
+    )
+    assert observed["status"] == "running"
+    assert drain["deadline_exceeded"] is True
+    assert drain["last_read_error_type"] == "TimeoutError"
+    assert drain["remote_requests_proven_idle"] is False
+
+
+def test_final_evidence_failure_preserves_original_cancellation_reason(tmp_path, monkeypatch):
+    def evidence(*_):
+        raise ValueError("changing result")
+
+    monkeypatch.setattr(capacity, "final_evidence", evidence)
+    result = {"passed": False, "failure": "operator_stop", "cancellation_drain": None}
+    capacity.collect_final_evidence(result, "http://safe", "known", tmp_path, [])
+    assert result["failure"] == "operator_stop"
+    assert result["final_evidence_failure"] == "final_run_evidence_unavailable"
+
+
+def test_terminal_cancel_does_not_extend_drain_with_full_item_hydration(tmp_path, monkeypatch):
+    monkeypatch.setattr(capacity, "final_evidence", lambda *_: pytest.fail("no GET after bounded drain"))
+    result = {"passed": False, "failure": "operator_stop", "cancellation_drain": {"benchmark_terminal": True}}
+    capacity.collect_final_evidence(result, "http://safe", "known", tmp_path, [])
+    assert result["final_evidence_failure"] == "cancelled_round_full_evidence_deferred"
+    assert result["failure"] == "operator_stop"

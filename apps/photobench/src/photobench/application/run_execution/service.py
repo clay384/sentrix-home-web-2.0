@@ -2324,7 +2324,9 @@ class RunExecution:
             if row.get(name) is not None:
                 item[name] = row[name]
         active_turn_id: str | None = None
+        turn_records: list[dict[str, Any]] = []
         try:
+            self._cancel_wait(0)
             item["execution_status"] = "started"
             conversation_id = str(
                 self.client.start_conversation(scope_id=scope_id, title=f"{row.get('qa_id') or 'qa'}").get(
@@ -2334,7 +2336,7 @@ class RunExecution:
             )
             if not conversation_id:
                 raise RuntimeError("2.0 建会话没有返回 id")
-            turn_records: list[dict[str, Any]] = []
+            item["conversation_id"] = conversation_id
             last_result: dict[str, Any] = {}
             last_progress: list[Any] = []
             for turn_index, message in enumerate(messages or [query]):
@@ -2343,6 +2345,8 @@ class RunExecution:
                     if turn_index < len(conversation) and isinstance(conversation[turn_index], dict)
                     else {}
                 )
+                # A completed earlier turn is not permission to dispatch after cancellation.
+                self._cancel_wait(0)
                 started_turn = self.client.start_turn(
                     conversation_id=conversation_id, message=message, timeout=300
                 )
@@ -2532,6 +2536,19 @@ class RunExecution:
             if isinstance(exc, RequestOutcomeUnknownError):
                 item["execution_status"] = "outcome_unknown"
                 item["request_failure"] = exc.facts
+            if isinstance(exc, RunCancelledError):
+                item["execution_status"] = "outcome_unknown" if active_turn_id else "cancelled"
+                item["request_failure"] = {
+                    "phase": "turn_polling" if active_turn_id else "before_turn_dispatch",
+                    "cause_type": "RunCancelledError",
+                    "request_outcome_unknown": active_turn_id is not None,
+                    "automatic_replay": False,
+                    "completed_turn_count": len(turn_records),
+                    **({"turn_id": active_turn_id} if active_turn_id else {}),
+                }
+                item["runtime_turns"] = turn_records
+                item["evaluation_status"] = "not_evaluable"
+                item["judge_status"] = "skipped"
             item.update(
                 {
                     "error": str(exc),
@@ -2546,6 +2563,10 @@ class RunExecution:
                     "wall_clock_ms": round((time.perf_counter() - started) * 1000, 1),
                 }
             )
+            if isinstance(exc, RunCancelledError):
+                # Operator/safety cancellation is not an answer-quality zero.
+                item["retrieval_recall"] = None
+                item["media_retrieval_recall"] = None
         return exclude_operational_quality(item)
 
     def _await_turn(self, turn_id: str, request: RunRequest) -> dict[str, Any]:
