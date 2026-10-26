@@ -23,6 +23,9 @@
 「这条候选怎么写」，它变不出候选；少了这一路，``MaintainFacts`` 的 ``candidates``
 在生产装配下恒为空元组，门禁全开也写不出一条事实。
 
+所有 JSON 调用固定 temperature=0，并请求标准 response_format=json_object；
+不支持该模式的端点不会被静默重试或降为非约束生成。输出截断/解析失败记录不含原文的 warning。
+
 模型不可用、HTTP 失败、返回的不是 JSON——一律返回 ``None``：观察是**增强**，
 不是导入的前置条件。1.0 在 ``pipeline`` 里也是这么收尾的（异常吞掉、留下无向量的资产）。
 **探测不到模型名（``ModelServiceError``）也走这一条**，但那条 ``log.warning`` 里带着端点
@@ -202,19 +205,65 @@ def chat_json(
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     for url in [image] if isinstance(image, str) else list(image or ()):
         content.append({"type": "image_url", "image_url": {"url": url}})
+    name = "unresolved"
     try:
+        name = model.current()
         body = {
-            "model": model.current(),
+            "model": name,
             "messages": [{"role": "user", "content": content}],
             "max_tokens": MAX_ANSWER_TOKENS,
+            "temperature": 0,
+            # llama.cpp and vLLM both support this standard constrained-JSON mode.
+            # Unsupported endpoints fail visibly once; never retry unconstrained.
+            "response_format": {"type": "json_object"},
         }
         response = httpx.post(endpoint, json=body, timeout=timeout_s)
         response.raise_for_status()
         payload = response.json()
-    except (httpx.HTTPError, ModelServiceError, ValueError) as error:
-        log.warning("视觉调用失败，本次结果跳过: %s", error)
+    except httpx.HTTPStatusError as error:
+        log.warning(
+            "视觉调用失败，本次结果跳过 endpoint=%s model=%s response_format=json_object http_status=%s",
+            endpoint,
+            name,
+            error.response.status_code,
+        )
         return None
-    return parse_json_object(_first_content(payload))
+    except (httpx.HTTPError, ModelServiceError, ValueError) as error:
+        log.warning(
+            "视觉调用失败，本次结果跳过 endpoint=%s model=%s response_format=json_object error_type=%s",
+            endpoint,
+            name,
+            type(error).__name__,
+        )
+        return None
+    text = _first_content(payload)
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    first = choices[0] if isinstance(choices, list) and choices else None
+    raw_finish_reason = first.get("finish_reason") if isinstance(first, dict) else None
+    finish_reason = (
+        raw_finish_reason
+        if raw_finish_reason in (None, "stop", "length", "tool_calls", "content_filter", "function_call")
+        else "unknown"
+    )
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    raw_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+    completion_tokens = raw_tokens if type(raw_tokens) is int and raw_tokens >= 0 else None
+    parsed = parse_json_object(text)
+    reason = "output_truncated" if finish_reason == "length" else "invalid_json" if parsed is None else None
+    if reason is not None:
+        # Status-only evidence: do not expose image content, prompts or raw answers.
+        log.warning(
+            "视觉 JSON 降级 endpoint=%s model=%s reason=%s "
+            "finish_reason=%s content_chars=%d completion_tokens=%s",
+            endpoint,
+            name,
+            reason,
+            finish_reason,
+            len(text),
+            completion_tokens,
+        )
+        return None
+    return parsed
 
 
 class OpenAIVlmObserver:

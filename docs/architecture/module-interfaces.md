@@ -412,6 +412,8 @@ class VlmObserver(Protocol):
 - 不猜姓名、不输出坐标、不做关系推断；
 - 失败（端点不可达、非 JSON、读图失败）返回 `None`，不抛；
 - 最多 3 次调用：首轮 → 缺自然语言补全 → 出现拉丁文则中文化；
+- 与照片问询、人物视觉共用 `chat_json`：固定 `temperature=0`、标准 `response_format={"type":"json_object"}`，输出预算 2048 不变；
+- 不支持 JSON 模式不重试或回退为自由生成；截断、解析失败与 HTTP 错误返回 `None`，warning 记录端点、模型及状态，不记录输入图片、提示词或回复正文；
 - 单次超时 `SENTRIX_VLM_TIMEOUT_S`（默认 180s）。
 
 **替换验收**
@@ -430,6 +432,7 @@ class VlmObserver(Protocol):
 **必须保持**
 
 - `fail -> None`，不抛；
+- 共用 §4.2 的固定采样、JSON 模式和可定位降级协议；
 - 图序 = 语义：裁剪件在前、原图在后；
 - `crop` 读不了时退回原图；
 - 结果交给 application 判断，适配器不做业务决策。
@@ -443,6 +446,7 @@ class VlmObserver(Protocol):
 **必须保持**
 
 - 一切失败返回 `None`；
+- 三条入口共用 §4.2 的固定采样、JSON 模式和可定位降级协议；
 - 提示词在 domain/application，适配器不拼业务提示词；
 - `clothing` 去重保序；
 - 不在导入前置路径上阻塞主链路。

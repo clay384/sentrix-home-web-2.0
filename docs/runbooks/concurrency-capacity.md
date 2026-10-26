@@ -70,8 +70,38 @@ python scripts/benchmarks/memory_snapshot.py restore \
 
 Creation holds the Qdrant lock, rejects live owners and symlinks, checks SQLite
 integrity and migrations, and verifies source stability across the copy.
-Restore verifies schema version, compatibility and every file hash before
-publishing a fresh directory. Keep data in the LAN artifact store. Commit only
+Snapshot schema 2 records the original absolute `source_root` as private provenance.
+Every `assets.path` must be a canonical path inside that root's `media` subtree
+and name a listed, existing media file. Root escapes, traversal, missing media
+and symlinks fail verification. Schema 1 can still be verified for historical
+integrity, but restore rejects it: recreate from the stopped source, never guess
+its original root.
+
+Restore checks every source and copied file, then updates only `assets.path` in
+the independent SQLite copy to the destination root. It consolidates the copied
+WAL, rechecks SQLite integrity and migration rows, and requires all media/Qdrant
+bytes to remain identical. Database validation uses private DB/WAL copies because
+even SQLite `mode=ro` can modify a shared-memory WAL index. The original snapshot
+and manifest remain untouched.
+
+A separate `data.restore-receipt.json` is published beside the new `data` directory
+(or choose `--receipt /private/evidence/restore.json`). It binds the original
+manifest byte SHA256 and identity to the old/new roots, relocated asset count,
+and resulting database SHA256/SQLite file inventory. It cannot overwrite a file
+or live inside the source, snapshot or restored data. Roots and media paths are
+private evidence; publish sanitized summaries only.
+
+Before starting the API, perform the full offline verification:
+
+```sh
+python scripts/benchmarks/memory_snapshot.py verify-restored \
+  --source /private/snapshots/baseline --destination /private/runs/c4/data \
+  --identity /private/memory-identity.json
+```
+
+Use the same `--receipt` if a custom path was chosen. Once the API starts, its DB
+may legitimately change: the capacity CLI validates receipt binding and active
+process data-root ownership, without hashing an active SQLite database. Keep data in the LAN artifact store. Commit only
 the sanitized identity, manifest hashes, deployment instructions and evidence
 summaries; never credentials, model weights, private media or full QA answers.
 

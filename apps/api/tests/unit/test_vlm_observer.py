@@ -10,6 +10,7 @@ http 那一层不在这里打真端点（8100 是 1.0 的服务，生命周期�
 
 from __future__ import annotations
 
+import base64
 import json
 import threading
 from collections.abc import Iterator
@@ -37,6 +38,7 @@ class _Endpoint(BaseHTTPRequestHandler):
 
     received: list[dict] = []
     reply: dict | None = None
+    reply_status = 200
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的接口
         payload = b'{"object":"list","data":[{"id":"fake-vlm","object":"model"}]}'
@@ -48,7 +50,7 @@ class _Endpoint(BaseHTTPRequestHandler):
         if type(self).reply is None:
             self._send(b'{"error":"boom"}', 503)
             return
-        self._send(json.dumps(type(self).reply).encode(), 200)
+        self._send(json.dumps(type(self).reply).encode(), type(self).reply_status)
 
     def _send(self, payload: bytes, status: int) -> None:
         self.send_response(status)
@@ -65,6 +67,7 @@ class _Endpoint(BaseHTTPRequestHandler):
 def _reset_endpoint() -> None:
     _Endpoint.received = []
     _Endpoint.reply = None
+    _Endpoint.reply_status = 200
 
 
 @pytest.fixture
@@ -349,3 +352,97 @@ def test_prompt_budget_constant_is_shared_with_the_chat_client(endpoint, image):
 
     assert _Endpoint.received, "观察器必须真的发出了请求，否则这条断言什么也没验"
     assert _Endpoint.received[0]["max_tokens"] == MAX_ANSWER_TOKENS
+
+
+def test_json_observation_request_fixes_sampling_and_constrains_format(endpoint, image):
+    _Endpoint.reply = {"choices": [{"message": {"content": '{"caption": "室内"}'}, "finish_reason": "stop"}]}
+    semantics = OpenAIVlmObserver(endpoint, ServedModel(endpoint)).observe(image)
+    assert semantics is not None
+    assert len(_Endpoint.received) == 1
+    assert _Endpoint.received[0]["temperature"] == 0
+    assert _Endpoint.received[0]["response_format"] == {"type": "json_object"}
+
+
+def test_invalid_json_is_reported_without_repair_retry_or_private_content(endpoint, image, caplog):
+    # Minimal reproduction of the observed mixed-quote error; no real image content.
+    content = """{"caption":"PRIVATE_RAW_CONTENT","facts":[{"object":"text', 'confidence":0.8}]}"""
+    _Endpoint.reply = {
+        "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+        "usage": {"completion_tokens": 50},
+    }
+    assert OpenAIVlmObserver(endpoint, ServedModel(endpoint)).observe(image) is None
+    assert len(_Endpoint.received) == 1
+    assert "reason=invalid_json" in caplog.text
+    assert "finish_reason=stop" in caplog.text
+    assert "completion_tokens=50" in caplog.text
+    assert "PRIVATE_RAW_CONTENT" not in caplog.text
+
+
+def test_truncated_json_is_not_accepted_even_when_a_prefix_object_parses(endpoint, image, caplog):
+    _Endpoint.reply = {
+        "choices": [{"message": {"content": '{"caption":"室内"}'}, "finish_reason": "length"}],
+        "usage": {"completion_tokens": 2048},
+    }
+    assert OpenAIVlmObserver(endpoint, ServedModel(endpoint)).observe(image) is None
+    assert len(_Endpoint.received) == 1
+    assert "reason=output_truncated" in caplog.text
+
+
+def test_unsupported_json_mode_is_visible_and_not_retried_unconstrained(endpoint, image, caplog):
+    _Endpoint.reply_status = 400
+    _Endpoint.reply = {"error": {"message": "response_format json_object unsupported"}}
+    assert OpenAIVlmObserver(endpoint, ServedModel(endpoint)).observe(image) is None
+    assert len(_Endpoint.received) == 1
+    assert _Endpoint.received[0]["response_format"] == {"type": "json_object"}
+    assert "http_status=400" in caplog.text
+    assert "response_format=json_object" in caplog.text
+
+
+def test_shared_json_protocol_preserves_inspection_image_order_and_person_appearance(
+    endpoint, image, tmp_path
+):
+    from sentrix.infrastructure.media.person_vision_model import OpenAIPersonVision
+    from sentrix.infrastructure.media.photo_inspector import OpenAIPhotoInspector
+
+    crop = tmp_path / "crop.jpg"
+    crop.write_bytes(b"synthetic-crop")
+    _Endpoint.reply = {
+        "choices": [
+            {
+                "message": {"content": '{"observation":"戴帽子","certainty":"supported"}'},
+                "finish_reason": "stop",
+            }
+        ]
+    }
+    result = OpenAIPhotoInspector(endpoint, ServedModel(endpoint)).inspect(image, "衣着如何？", crop=crop)
+    assert result == {"observation": "戴帽子", "certainty": "supported"}
+    images = _Endpoint.received[0]["messages"][0]["content"][1:]
+    assert [base64.b64decode(item["image_url"]["url"].split(",", 1)[1]) for item in images] == [
+        crop.read_bytes(),
+        image.read_bytes(),
+    ]
+
+    _Endpoint.reply = {
+        "choices": [
+            {"message": {"content": '{"clothing":["帽子"],"confidence":0.8}'}, "finish_reason": "stop"}
+        ]
+    }
+    result = OpenAIPersonVision(endpoint, ServedModel(endpoint)).analyze_person_appearance(str(crop))
+    assert result == {"clothing": ["帽子"], "confidence": 0.8}
+    assert len(_Endpoint.received) == 2
+    assert len(_Endpoint.received[1]["messages"][0]["content"]) == 2
+    for body in _Endpoint.received:
+        assert body["temperature"] == 0
+        assert body["response_format"] == {"type": "json_object"}
+        assert body["max_tokens"] == 2048
+
+
+def test_error_warning_does_not_echo_untrusted_response_metadata(endpoint, image, caplog):
+    _Endpoint.reply = {
+        "choices": [{"message": {"content": "not JSON"}, "finish_reason": "PRIVATE_METADATA"}],
+        "usage": {"completion_tokens": "PRIVATE_USAGE"},
+    }
+    assert OpenAIVlmObserver(endpoint, ServedModel(endpoint)).observe(image) is None
+    assert "finish_reason=unknown" in caplog.text
+    assert "completion_tokens=None" in caplog.text
+    assert "PRIVATE" not in caplog.text
