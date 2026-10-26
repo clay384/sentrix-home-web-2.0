@@ -298,8 +298,6 @@ def test_a_missing_scope_is_not_a_mismatch():
         ({"value_type": "event"}, "invalid_requirement"),
         ({"required": None}, "invalid_requirement"),
         ({"scope_body": {"country": "中国"}}, "invalid_requirement"),
-        ({"scope_body": {"place": "<地点>"}}, "invalid_requirement"),
-        ({"scope_body": {"time": "未知"}}, "invalid_requirement"),
     ),
 )
 def test_invalid_structured_requirement_is_rejected(kwargs: dict, expected: str):
@@ -307,6 +305,26 @@ def test_invalid_structured_requirement_is_rejected(kwargs: dict, expected: str)
         None,
         expected,
     )
+
+
+@pytest.mark.parametrize(
+    "scope_body",
+    (
+        {"place": "<地点>"},
+        {"time": "未知"},
+        {"person": ""},
+        {"place": "宜昌", "person": ""},
+    ),
+)
+def test_unusable_scope_values_are_dropped_not_fatal(scope_body: dict):
+    """可选的 scope 写空/未知/占位符时丢弃该键，而不是让整条规划失败。"""
+    requirements, reason = parse_declaration(
+        declaration("photo_set", scope_body=scope_body), scope_id=SCOPE, question="问题"
+    )
+
+    assert reason == ""
+    assert requirements is not None
+    assert dict(requirements[0].scope) == ({"place": "宜昌"} if scope_body.get("place") == "宜昌" else {})
 
 
 def test_structured_fields_are_preserved_on_the_requirement():

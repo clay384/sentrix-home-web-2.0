@@ -493,14 +493,17 @@ def parse_declaration(
         scope: list[tuple[str, str]] = []
         for key, value in raw_scope.items():
             key_text = str(key)
-            value_text = str(value or "").strip()
-            if (
-                key_text not in REQUIREMENT_SCOPE_KEYS
-                or not value_text
-                or _ANGLE_PLACEHOLDER.search(value_text)
-                or value_text.lower() in _UNKNOWN_SCOPE_VALUES
-            ):
+            if key_text not in REQUIREMENT_SCOPE_KEYS:
                 return None, "invalid_requirement"
+            value_text = str(value or "").strip()
+            # **空值/未知/占位符的 scope 键直接丢弃，不让整条规划失败。**
+            # 这些键本来就是可选的；模型写 ``person: ""`` 或 ``time: "未知"`` 只说明
+            # 它没有这条信息，重试三次仍会得到同样的输出，最后变成 planner_blocked。
+            # 丢弃不丢语义，保留其余可用的 scope。
+            if not value_text or _ANGLE_PLACEHOLDER.search(value_text):
+                continue
+            if value_text.lower() in _UNKNOWN_SCOPE_VALUES:
+                continue
             scope.append((key_text, value_text))
 
         requirements.append(
