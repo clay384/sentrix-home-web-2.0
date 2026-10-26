@@ -149,6 +149,39 @@ describe("agentTrace · 完整模型轨迹访问器", () => {
     ]);
   });
 
+  it("同一 step_id 有失败重试时，绑定成功的那次输入，工具只挂一次", () => {
+    const retry = {
+      runtime_turns: [
+        {
+          index: 0,
+          message: "车停在哪",
+          answer: "地下车库",
+          trace_bundle: {
+            debug_calls: [
+              {
+                step_id: "step_1",
+                call_type: "agent",
+                seq: 0,
+                status: "error",
+                messages: [{ role: "system", content: "失败尝试" }],
+                tools: [],
+                response: null,
+                error: "prompt too long",
+              },
+              { ...CALL(), seq: 1 },
+            ],
+          },
+          trace: [],
+        },
+      ],
+      tool_trace: ITEM.tool_trace,
+    };
+    expect(
+      debugCallForCall(retry, { step_id: "step_1", call_type: "agent", conversation_turn: 0 })?.messages?.[0],
+    ).toEqual({ role: "system", content: "你是相册助手" });
+    expect(turnTimeline(retry, 0).filter((entry) => entry.kind === "tool")).toHaveLength(1);
+  });
+
   it("消息、正文、思考通道都原样取出", () => {
     const call = CALL();
     expect(callMessages(call)).toHaveLength(2);
