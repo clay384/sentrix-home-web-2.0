@@ -176,9 +176,13 @@ describe("agentTrace · 完整模型轨迹访问器", () => {
       ],
       tool_trace: ITEM.tool_trace,
     };
-    expect(
-      debugCallForCall(retry, { step_id: "step_1", call_type: "agent", conversation_turn: 0 })?.messages?.[0],
-    ).toEqual({ role: "system", content: "你是相册助手" });
+    const bound = debugCallForCall(retry, {
+      step_id: "step_1",
+      call_type: "agent",
+      conversation_turn: 0,
+    });
+    expect(bound).not.toBeNull();
+    expect(callMessages(bound)[0]).toEqual({ role: "system", content: "你是相册助手" });
     expect(turnTimeline(retry, 0).filter((entry) => entry.kind === "tool")).toHaveLength(1);
   });
 
