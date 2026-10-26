@@ -230,6 +230,14 @@ def test_model_window_and_embedding_mismatch_rejected():
 
 def test_main_resume_observes_known_run_without_replaying_and_rejects_identity_change(tmp_path, monkeypatch):
     config, diag, models, kw = config_fixture()
+    consumer_root, migration_dir, pid_file, proc_root = consumer_process_fixture(tmp_path)
+    actual_binding = capacity.active_consumer_migrations
+    monkeypatch.setattr(
+        capacity,
+        "active_consumer_migrations",
+        lambda root, record: actual_binding(root, record, proc_root.parent),
+    )
+    contract = capacity.memory_snapshot.migration_contract(migration_dir)
     source = tmp_path / "qa.jsonl"
     source.write_text("".join(json.dumps(row) + "\n" for row in rows()))
     identity = tmp_path / "identity.json"
@@ -271,7 +279,12 @@ def test_main_resume_observes_known_run_without_replaying_and_rejects_identity_c
         raise AssertionError(url)
 
     monkeypatch.setattr(capacity, "get_text", get)
-    monkeypatch.setattr(capacity.memory_snapshot, "verify", lambda *_: {"identity": "checked"})
+    monkeypatch.setattr(
+        capacity.memory_snapshot,
+        "verify",
+        lambda *_, **__: {"identity": "checked", "migration_contract": contract},
+    )
+    monkeypatch.setattr(capacity.memory_snapshot, "verify_migrations", lambda *_: contract)
     monkeypatch.setattr(
         capacity.socket, "getaddrinfo", lambda host, *_: [(None, None, None, None, (host, 80))]
     )
@@ -288,6 +301,7 @@ def test_main_resume_observes_known_run_without_replaying_and_rejects_identity_c
             return None
 
     monkeypatch.setattr(capacity, "Sampler", FakeSampler)
+    monkeypatch.setattr(capacity, "process_sample", lambda *_: {"available": True, "start_time_ticks": "999"})
     sent = []
 
     class Response:
@@ -311,6 +325,10 @@ def test_main_resume_observes_known_run_without_replaying_and_rejects_identity_c
 
     monkeypatch.setattr(capacity, "opener", lambda: API())
     args = [
+        "--consumer-source-root",
+        str(consumer_root),
+        "--sentrix-pid-file",
+        str(pid_file),
         "--bench-url",
         "http://127.0.0.1:18772",
         "--sentrix-url",
@@ -419,7 +437,8 @@ def test_restore_receipt_binds_raw_manifest_and_destination_without_reading_live
     frozen.mkdir()
     # No active data directory/DB exists: this contract must only read the receipt.
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "migration_contract": {"sha256": "d" * 64},
         "source_root": str(source.resolve()),
         "identity_sha256": "b" * 64,
         "database": {"integrity_check": "ok"},
@@ -433,6 +452,7 @@ def test_restore_receipt_binds_raw_manifest_and_destination_without_reading_live
         "from_root": str(source.resolve()),
         "to_root": str(data.resolve()),
         "database": manifest["database"],
+        "migration_contract_sha256": "d" * 64,
         "relocated_assets": 344,
         "post_restore_database_sha256": "c" * 64,
         "sqlite_files": {"sentrix.db": {"sha256": "c" * 64}},
@@ -1027,3 +1047,134 @@ def test_terminal_cancel_does_not_extend_drain_with_full_item_hydration(tmp_path
     capacity.collect_final_evidence(result, "http://safe", "known", tmp_path, [])
     assert result["final_evidence_failure"] == "cancelled_round_full_evidence_deferred"
     assert result["failure"] == "operator_stop"
+
+
+def consumer_process_fixture(tmp_path):
+    source = tmp_path / "consumer"
+    package = source / "apps/api/src/sentrix"
+    package.mkdir(parents=True)
+    (package / "main.py").write_text("# consumer API source\n")
+    migrations = source / capacity.memory_snapshot.MIGRATIONS_RELATIVE
+    migrations.mkdir(parents=True)
+    (migrations / "0001_initial.sql").write_text("CREATE TABLE assets(id TEXT PRIMARY KEY,path TEXT);\n")
+    proc = tmp_path / "proc/1234"
+    proc.mkdir(parents=True)
+    (proc / "stat").write_text("1234 (sentrix api) " + " ".join(["S", *(["0"] * 18), "999"]))
+    (proc / "cwd").symlink_to(source, target_is_directory=True)
+    argv = ["python", "-m", "uvicorn", "--factory", "sentrix.main:create_app"]
+    (proc / "cmdline").write_bytes(b"\0".join(x.encode() for x in argv))
+    (proc / "environ").write_bytes(("PYTHONPATH=" + str(package.parent)).encode() + b"\0")
+    pid = tmp_path / "sentrix-process.json"
+    pid.write_text(json.dumps({"pid": 1234, "start_ticks": 999, "cwd": str(source), "argv": argv}))
+    return source, migrations, pid, proc
+
+
+def test_consumer_migrations_are_bound_to_actual_process_not_supplied_producer(tmp_path):
+    source, migrations, pid, proc = consumer_process_fixture(tmp_path)
+    assert capacity.active_consumer_migrations(source, pid, proc.parent) == migrations
+    other = tmp_path / "producer"
+    other.mkdir()
+    with pytest.raises(ValueError, match="actual Sentrix process cwd"):
+        capacity.active_consumer_migrations(other, pid, proc.parent)
+    (proc / "environ").write_bytes(b"PYTHONPATH=/unrelated/editable/source\0")
+    with pytest.raises(ValueError, match="PYTHONPATH"):
+        capacity.active_consumer_migrations(source, pid, proc.parent)
+
+
+def test_wrong_consumer_sql_stops_cli_before_any_http_or_post(tmp_path, monkeypatch):
+    import shutil
+    import sqlite3
+
+    source, migrations, pid, proc = consumer_process_fixture(tmp_path)
+    producer = tmp_path / "producer-migrations"
+    shutil.copytree(migrations, producer)
+    data = tmp_path / "data"
+    (data / "qdrant").mkdir(parents=True)
+    (data / "qdrant/.lock").touch()
+    with sqlite3.connect(data / "sentrix.db") as db:
+        db.execute("CREATE TABLE schema_migrations(version TEXT,applied_at TEXT)")
+        db.execute("INSERT INTO schema_migrations VALUES('0001','original-time')")
+        db.execute("CREATE TABLE assets(id TEXT PRIMARY KEY,path TEXT)")
+    stopped = tmp_path / "stopped.json"
+    stopped.write_text(json.dumps({"pid": 2147483647}))
+    identity = {
+        "dataset_sha256": "dataset",
+        "embedding": {"semantic": "same"},
+        "source_revision": "producer-revision",
+        "observation_model_sha256": "123-weights",
+        "pipeline_config": {"observation_model": {"node": "123"}},
+        "scope_id": "scope",
+    }
+    identity_file = tmp_path / "memory-identity.json"
+    identity_file.write_text(json.dumps(identity))
+    frozen = tmp_path / "frozen"
+    capacity.memory_snapshot.create(data, frozen, identity, stopped, producer_migrations=producer)
+    (migrations / "0001_initial.sql").write_text("CREATE TABLE assets(id INTEGER PRIMARY KEY,path TEXT);\n")
+    real_gate = capacity.active_consumer_migrations
+    monkeypatch.setattr(
+        capacity, "active_consumer_migrations", lambda root, record: real_gate(root, record, proc.parent)
+    )
+    calls = []
+    monkeypatch.setattr(
+        capacity,
+        "get_text",
+        lambda *args: calls.append(args) or pytest.fail("HTTP before compatibility gate"),
+    )
+    monkeypatch.setattr(
+        capacity,
+        "post_once",
+        lambda *args: calls.append(args) or pytest.fail("POST before compatibility gate"),
+    )
+    args = [
+        "--bench-url",
+        "http://127.0.0.1:18772",
+        "--sentrix-url",
+        "http://127.0.0.1:18191",
+        "--model-url",
+        "http://192.168.0.100:18104",
+        "--allow-bench-host",
+        "127.0.0.1",
+        "--allow-sentrix-host",
+        "127.0.0.1",
+        "--allow-model-host",
+        "192.168.0.100",
+        "--model",
+        "qwen35-4b-awq",
+        "--scope-id",
+        "scope",
+        "--album-id",
+        "3",
+        "--qa-set",
+        "fixed",
+        "--qa-sha256",
+        "unused-before-gate",
+        "--identity",
+        str(tmp_path / "100.json"),
+        "--expected-runtime-config",
+        str(tmp_path / "expected.json"),
+        "--consumer-source-root",
+        str(source),
+        "--memory-snapshot",
+        str(frozen),
+        "--memory-identity",
+        str(identity_file),
+        "--qa-source-file",
+        str(tmp_path / "qa.jsonl"),
+        "--output",
+        str(tmp_path / "out"),
+        "--window",
+        "262144",
+        "--qa-concurrency",
+        "1",
+        "--sentrix-pid-file",
+        str(pid),
+    ]
+    with pytest.raises(ValueError, match="incompatible consumer migration SQL"):
+        capacity.main(args)
+    assert calls == []
+    assert not (tmp_path / "out/dispatch.jsonl").exists()
+
+
+def test_capacity_certification_explains_missing_linux_process_evidence(tmp_path):
+    with pytest.raises(ValueError, match="requires Linux /proc on the tested Sentrix API host"):
+        capacity.active_consumer_migrations(tmp_path, None, tmp_path / "no-proc")

@@ -588,6 +588,51 @@ def poll_run(
     }
 
 
+def active_consumer_migrations(
+    source_root: Path, pid_file: Path | None, proc_root: Path = Path("/proc")
+) -> Path:
+    """Bind SQL compatibility to the selected running API, not an arbitrary directory."""
+    if not proc_root.is_dir():
+        raise ValueError(
+            "capacity certification requires Linux /proc on the tested Sentrix API host; "
+            "use memory_snapshot with an explicit consumer migrations directory for macOS restore"
+        )
+    if pid_file is None:
+        raise ValueError("consumer checkout verification requires the Sentrix PID record")
+    root = source_root.resolve(strict=True)
+    record = json.loads(pid_file.read_text())
+    pid = record.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ValueError("invalid Sentrix PID record")
+    proc = proc_root / str(pid)
+    ticks = (proc / "stat").read_text().rsplit(")", 1)[1].split()[19]
+    if ticks != str(record.get("start_ticks") or record.get("start_time_ticks") or ""):
+        raise ValueError("consumer Sentrix PID start identity changed")
+    if (proc / "cwd").resolve(strict=True) != root or Path(record.get("cwd", "")).resolve() != root:
+        raise ValueError("consumer checkout differs from actual Sentrix process cwd")
+    argv = [os.fsdecode(x) for x in (proc / "cmdline").read_bytes().split(b"\0") if x]
+    if "sentrix.main:create_app" not in argv or (record.get("argv") and argv != record["argv"]):
+        raise ValueError("consumer process is not the recorded Sentrix API")
+    pythonpath = next(
+        (
+            entry.partition(b"=")[2]
+            for entry in (proc / "environ").read_bytes().split(b"\0")
+            if entry.partition(b"=")[0] == b"PYTHONPATH"
+        ),
+        b"",
+    )
+    # Shared/old editable virtualenvs are common: cwd alone does not establish imports.
+    candidates = [
+        Path(part) if Path(part).is_absolute() else root / part
+        for part in os.fsdecode(pythonpath).split(os.pathsep)
+        if part
+    ]
+    imported = next((path.resolve() for path in candidates if (path / "sentrix/main.py").is_file()), None)
+    if imported != (root / "apps/api/src").resolve():
+        raise ValueError("consumer PYTHONPATH does not prove the selected Sentrix checkout")
+    return root / memory_snapshot.MIGRATIONS_RELATIVE
+
+
 def validate_active_data_copy(
     data_dir: Path | None,
     pid_file: Path | None,
@@ -726,6 +771,7 @@ def parser() -> argparse.ArgumentParser:
     for name in (
         "identity",
         "expected-runtime-config",
+        "consumer-source-root",
         "memory-snapshot",
         "memory-identity",
         "qa-source-file",
@@ -773,6 +819,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         or args.cancel_drain_s < 0
     ):
         raise ValueError("concurrency, windows and budgets must be positive")
+    consumer_migrations = active_consumer_migrations(args.consumer_source_root, args.sentrix_pid_file)
+    memory_identity = json.loads(args.memory_identity.read_text())
+    # This gate precedes every HTTP request/POST, including run creation.
+    memory_manifest = memory_snapshot.verify(
+        args.memory_snapshot, memory_identity, consumer_migrations=consumer_migrations
+    )
     bench = service_url(args.bench_url, args.allow_bench_host)
     sentrix = service_url(args.sentrix_url, args.allow_sentrix_host)
     model_base = validate_endpoint(args.model_url, args.allow_model_host)
@@ -813,6 +865,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         identity=identity,
         expected_runtime_config=expected_runtime,
         memory_identity=memory_identity,
+        consumer_migration_contract=memory_manifest["migration_contract"],
         memory_manifest_sha256=snapshot_manifest_sha,
         restore_receipt_sha256=receipt_sha,
         safety_protocol=dict(SAFETY_PROTOCOL),
@@ -839,7 +892,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
             }
             save_json(manifest_file, manifest)
-        memory_manifest = memory_snapshot.verify(args.memory_snapshot, memory_identity)
+        memory_snapshot.verify_migrations(memory_manifest, consumer_migrations)
         active_copy = validate_active_data_copy(
             args.sentrix_data_dir, args.sentrix_pid_file, args.memory_snapshot
         )

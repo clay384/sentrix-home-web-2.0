@@ -173,7 +173,7 @@ S11 做服务启停时接管的边界就是这三块。
 
 `scripts/benchmarks/photobench_capacity.py` 是独立真实 QA 容量命令行入口：只运行一轮 `mode=reuse`，由部署方先恢复独立副本并重启 Sentrix。使用 `memory_snapshot.verify` 核对冻结库；通过 PID start_ticks 与 `/proc/PID/environ` 中的 `SENTRIX_DATA_DIR` 核实活动实例采用本轮目录，不对正在写入的 SQLite 声称全文件哈希验证。真实 config/diagnostics/model 和题目内容、顺序、数量均须符合显式实验配置，拒绝受保护的 153。POST 前 fsync 派发证据；未知结果不重发，`--resume` 只恢复已知 run 的观测，不恢复 QA 或重评分。资源采样与安全协议复用 `remote_vllm_capacity`，阈值及源码指纹写入独立 manifest；CPU 事实注明所选 Sentrix 进程及客户端主机。最终读取完整 items 并调用 `summarize_photobench_capacity.summarize_run`，容量完成、答案质量和有效 Judge 覆盖分开记录。命令行不接产品生产装配、不自动升并发、不声称已找到最大值。验证见 `apps/photobench/tests/test_photobench_capacity.py`。
 
-`scripts/maintenance/embedding_identity.py` 是无模型加载、无网络、无全局状态的语义身份helper；两个legacy侧车在启动加载前后核验并缓存身份，health仅增加可选身份与运行元数据。`scripts/benchmarks/photobench_capacity.py` 通过实际端点health核对权重/分词器/配置/算法，expected-runtime单独核对PB与Sentrix连接。旧快照verify仍按原identity精确验证；连接身份不自动获得跨端点认证。验证 `test_embedding_identity.py`、`test_photobench_capacity.py`、`test_memory_snapshot.py`。
+`scripts/maintenance/embedding_identity.py` 是无模型加载、无网络、无全局状态的语义身份helper；两个legacy侧车在启动加载前后核验并缓存身份，health仅增加可选身份与运行元数据。`scripts/benchmarks/photobench_capacity.py` 通过实际端点health核对权重/分词器/配置/算法，expected-runtime单独核对PB与Sentrix连接。旧快照inspect仍按原identity精确检查历史完整性；schema 1/2 缺迁移SQL契约，不能通过恢复/跨分支兼容认证。连接身份不自动获得跨端点认证。验证 `test_embedding_identity.py`、`test_photobench_capacity.py`、`test_memory_snapshot.py`。
 
 `api/metrics_schema.py` 与 `web/src/api/types.ts` 追加版本1的 `operational_issue`（输出、上下文、步数、时间、服务拒绝、资源错误六类）及 `evaluation_status`；运行 summary、阶段及 progress 可携带 `operational.not_evaluable_count/by_kind`。执行状态保留 `operational_failure` 与未知结果；Judge 自身的输出/资源问题可标注 `scope=judge`，不会把空分改成0分。投影不执行质量判定，不把操作预算命中当作架构质量失败；历史字段、缺失、null、有效0分保持原值。验证见 `apps/photobench/tests/test_operational_metrics_schema.py`；OpenAPI由统一导出流程同步。
 
@@ -191,3 +191,5 @@ S11 做服务启停时接管的边界就是这三块。
 容量验收还保留检索资源故障：通道捕获 SQLite `SQLITE_BUSY/SQLITE_LOCKED`（含扩展码）、`TimeoutError`、`MemoryError`、`VectorIndexUnavailable` 时传递 `retrieval_channels[].operational_issue`，只含稳定码和异常类型，不含 SQL、路径或正文。向量索引 status/count/search 的故障即使 SQLite 回退有结果也保留该证据；未配置索引、索引陈旧和正常无命中不自动成为资源故障。PhotoBench 按既有不可评估规则排除质量评分，容量 CLI 停止派发并保存失败证据。
 
 VLM 完整响应的 JSON 格式错误以独立 `model_output_invalid` kind 进入不可评估统计和前端“模型输出格式错误”，不归为供应商拒绝或回答 0 分。已收到 `finish_reason=stop` 但无可解析对象时 `request_outcome_unknown=false`；响应封装/结束证据不完整仍为 `provider_response_invalid` 且 unknown=true。恢复保留原轨迹与终态，不自动重发。
+
+快照 schema 3：`memory_snapshot.migration_contract` 记录 producer 实际迁移 SQL 文件名/版本/原始 SHA256，并校验 SQLite 已应用版本，不将 applied_at 当兼容字段。`verify`/`restore`/`verify_restored` 必须传 consumer_migrations 并拒绝文件增加、删除或内容改变；`inspect_snapshot` 仅检查历史完整性。容量入口 `active_consumer_migrations` 将实际 Sentrix PID/start_ticks/cwd/argv/PYTHONPATH 绑定到 `--consumer-source-root`，在任何 HTTP 前检查迁移契约，防止借用另一 checkout 绕过。数据库与 embedding 兼容性独立于 VLM producer/QA consumer 端点；receipt 保存迁移契约哈希，活动 DB 不做哈希。验证见 test_memory_snapshot.py、test_photobench_capacity.py。

@@ -33,8 +33,10 @@ actual client hardware; a Linux server run does not validate M4 Mac capacity.
 Use the existing `mac` deployment profile for legacy BGE-M3 + Chinese-CLIP
 and CPU face inference. This experiment explicitly overrides its old 600 s / 180 s
 Agent/chat limits: Agent wall time 3600 s, chat and visual HTTP timeout 1800 s,
-30 model steps, and 28 tool/search/page/inspection calls. The remaining two steps
-reserve answer and internal review. Record these overrides; the 200 client is
+30 model steps, with tool/search/page/inspection caps explicitly disabled by
+the four nullable `SENTRIX_AGENT_MAX_*` settings (`null` as the environment value).
+The 30 steps include main-loop, internal review, recovery and forced-final calls;
+no hidden 28-call tool ceiling applies to this native experiment. Record these overrides; the 200 client is
 not evidence that an M4 has passed the same load.
 
 Set `SENTRIX_VLM_CONTEXT_TOKENS=262144`,
@@ -71,29 +73,45 @@ Prepare a JSON identity with these required fields:
 - `scope_id`: the completed build scope.
 
 Reuse requires the same memory-producing semantics, dataset and embedding space.
-A QA-only branch can keep the baseline provenance; a changed observation,
-indexing or embedding pipeline requires a new identity and new build. Do not
+A QA-only branch keeps the baseline producer provenance. The QA consumer can use
+a different VLM node/engine: for example, memory produced on 123 can be queried
+through 100 or 118 without rewriting the producer identity. New memory produced
+with changed observation/indexing/embedding semantics needs its own identity and
+build; querying existing memory does not retroactively change its producer. Do not
 silently change the expected identity just to bypass an incompatibility.
 
 ```sh
 python scripts/benchmarks/memory_snapshot.py create \
   --source /private/build-data --destination /private/snapshots/baseline \
   --identity /private/memory-identity.json \
+  --producer-migrations /private/build-source/apps/api/src/sentrix/infrastructure/persistence/migrations \
   --service-pid-file /private/runtime/sentrix-process.json
 
 python scripts/benchmarks/memory_snapshot.py restore \
   --source /private/snapshots/baseline --destination /private/runs/c4/data \
-  --identity /private/memory-identity.json
+  --identity /private/memory-identity.json \
+  --consumer-migrations /private/qa-checkout/apps/api/src/sentrix/infrastructure/persistence/migrations
 ```
 
 Creation holds the Qdrant lock, rejects live owners and symlinks, checks SQLite
 integrity and migrations, and verifies source stability across the copy.
-Snapshot schema 2 records the original absolute `source_root` as private provenance.
+Snapshot schema 3 records the original absolute `source_root` as private provenance
+and the complete producer migration SQL file set (filename, version, raw-byte SHA256
+and canonical contract SHA256). Creation requires its versions to match the DB
+ledger. The current SQLite ledger has no SQL checksums: its `applied_at` timestamps
+remain integrity evidence, never a compatibility key.
 Every `assets.path` must be a canonical path inside that root's `media` subtree
 and name a listed, existing media file. Root escapes, traversal, missing media
-and symlinks fail verification. Schema 1 can still be verified for historical
-integrity, but restore rejects it: recreate from the stopped source, never guess
-its original root.
+and symlinks fail verification. Schema 1/2 snapshots support the explicit `inspect`
+action for historical integrity only; `verify`, `restore` and `verify-restored`
+reject missing SQL contracts. Recreate from a stopped producer and its exact source
+checkout; never alter the old manifest or guess its original root/SQL contract.
+
+Before restore, the consumer checkout must contain the exact same SQL filenames,
+versions and bytes. Added, deleted, renamed or modified migration files fail closed
+before destination publication. Documentation and non-migration source changes do
+not affect SQL compatibility. This does not claim that arbitrary semantic changes
+in application code are compatible with the frozen memory producer.
 
 Restore checks every source and copied file, then updates only `assets.path` in
 the independent SQLite copy to the destination root. It consolidates the copied
@@ -105,7 +123,8 @@ and manifest remain untouched.
 A separate `data.restore-receipt.json` is published beside the new `data` directory
 (or choose `--receipt /private/evidence/restore.json`). It binds the original
 manifest byte SHA256 and identity to the old/new roots, relocated asset count,
-and resulting database SHA256/SQLite file inventory. It cannot overwrite a file
+resulting database SHA256/SQLite file inventory, migration contract SHA256 and
+consumer migration directory provenance. It cannot overwrite a file
 or live inside the source, snapshot or restored data. Roots and media paths are
 private evidence; publish sanitized summaries only.
 
@@ -114,12 +133,24 @@ Before starting the API, perform the full offline verification:
 ```sh
 python scripts/benchmarks/memory_snapshot.py verify-restored \
   --source /private/snapshots/baseline --destination /private/runs/c4/data \
-  --identity /private/memory-identity.json
+  --identity /private/memory-identity.json \
+  --consumer-migrations /private/qa-checkout/apps/api/src/sentrix/infrastructure/persistence/migrations
 ```
 
 Use the same `--receipt` if a custom path was chosen. Once the API starts, its DB
 may legitimately change: the capacity CLI validates receipt binding and active
-process data-root ownership, without hashing an active SQLite database. Keep data in the LAN artifact store. Commit only
+process data-root ownership, without hashing an active SQLite database. The CLI
+also requires `--consumer-source-root /private/qa-checkout` and the actual Sentrix
+PID record. On the Linux test client it binds PID/start time, command, cwd and
+explicit `PYTHONPATH` to that checkout, then checks its migration directory before
+any HTTP request. An arbitrary producer directory cannot substitute for the running
+consumer. Start Sentrix with that checkout's `apps/api/src` first in `PYTHONPATH`,
+including when reusing a virtualenv installed from another checkout. This capacity
+certification CLI must run on the tested Linux API host; missing `/proc` is an
+explicit unsupported certification error, not a successful check. The independent
+`memory_snapshot.py` create/restore path remains usable on macOS with its explicit
+producer/consumer migration directory. Reusing memory on a Mac does not require
+this Linux capacity CLI, and each M4 still needs its own capacity validation. Keep data in the LAN artifact store. Commit only
 the sanitized identity, manifest hashes, deployment instructions and evidence
 summaries; never credentials, model weights, private media or full QA answers.
 
@@ -195,9 +226,8 @@ sidecar reports the same model name. Device, PID/port, threads, parameter dtypes
 library versions are execution evidence, not URLs or paths inside the compatibility key;
 cross-device vectors are not claimed to be bitwise identical.
 
-Existing schema-1/schema-2 snapshots keep their original verification behavior. A legacy
-connection-only identity can still verify its immutable historical snapshot, but cannot
-pass this CLI's semantic compatibility gate. Do not edit its manifest or silently rename
+Existing schema-1/schema-2 snapshots remain available through read-only `inspect`. A legacy
+connection-only identity cannot pass this CLI's semantic or SQL compatibility gates. Do not edit its manifest or silently rename
 its identity. Create a new accepted snapshot with verified semantic provenance. For a
 build made before additive health identity existed, retain its original implementation
 SHA and complete model artifact hashes, compare unchanged inference ASTs/configuration,
