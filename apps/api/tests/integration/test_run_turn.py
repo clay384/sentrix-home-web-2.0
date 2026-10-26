@@ -1696,7 +1696,8 @@ def test_include_debug_records_planner_agent_and_judge_with_exact_messages(env):
     tool_messages = [message for message in second["messages"] if message["role"] == "tool"]
     assert tool_messages and "rs_1" in tool_messages[-1]["content"]
     assert second["response"]["tool_calls"][-1]["name"] == FINAL_ANSWER_TOOL
-    assert "这是你要的两张海边照片。" in second["response"]["tool_calls"][-1]["arguments"]
+    final_arguments = json.loads(second["response"]["tool_calls"][-1]["arguments"])
+    assert final_arguments["answer"] == "这是你要的两张海边照片。"
 
     judges = [call for call in calls if call["call_type"] == "faithfulness_judge"]
     assert len(judges) == 1
