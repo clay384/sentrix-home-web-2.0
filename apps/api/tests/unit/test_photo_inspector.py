@@ -26,6 +26,7 @@ from typing import Any, ClassVar
 
 import pytest
 
+from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.media.inspection import (
     CERTAINTY_SUPPORTED,
     CERTAINTY_UNCERTAIN,
@@ -287,6 +288,7 @@ class _RecordingEndpoint(BaseHTTPRequestHandler):
 
     posts: ClassVar[list[dict[str, Any]]] = []
     reply: ClassVar[dict[str, Any]] = {"observation": "戴了", "certainty": "supported"}
+    finish_reason: ClassVar[str | None] = "stop"
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的接口
         self._send(b'{"object":"list","data":[{"id":"fake-vlm","object":"model"}]}', 200)
@@ -294,7 +296,10 @@ class _RecordingEndpoint(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的接口
         length = int(self.headers.get("Content-Length") or 0)
         self.posts.append(json.loads(self.rfile.read(length)))
-        body = {"choices": [{"message": {"content": json.dumps(self.reply, ensure_ascii=False)}}]}
+        choice: dict[str, Any] = {"message": {"content": json.dumps(self.reply, ensure_ascii=False)}}
+        if self.finish_reason is not None:
+            choice["finish_reason"] = self.finish_reason
+        body = {"choices": [choice]}
         self._send(json.dumps(body).encode("utf-8"), 200)
 
     def _send(self, payload: bytes, status: int) -> None:
@@ -312,6 +317,7 @@ class _RecordingEndpoint(BaseHTTPRequestHandler):
 def inspector_factory() -> Iterator[Any]:
     """一个打到本文件自己起的端点上的真适配器（探测与调用都是真 HTTP）。"""
     _RecordingEndpoint.posts = []
+    _RecordingEndpoint.finish_reason = "stop"
     httpd = HTTPServer(("127.0.0.1", 0), _RecordingEndpoint)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     base_url = f"http://127.0.0.1:{httpd.server_port}/v1"
@@ -349,6 +355,19 @@ def test_the_wire_body_has_a_single_image_block_without_a_crop(inspector_factory
 
     content = _RecordingEndpoint.posts[0]["messages"][0]["content"]
     assert [block["type"] for block in content] == ["text", "image_url"]
+
+
+def test_wire_reply_without_finish_is_unknown_and_never_retried(
+    inspector_factory: Any, photo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Valid answer JSON alone does not prove that the generation completed."""
+    monkeypatch.setattr(_RecordingEndpoint, "finish_reason", None)
+    with pytest.raises(ModelServiceError) as caught:
+        inspector_factory().inspect(str(photo), QUESTION)
+    assert caught.value.error_code == "provider_response_invalid"
+    assert caught.value.request_policy["request_outcome_unknown"] is True
+    assert len(_RecordingEndpoint.posts) == 1
+    assert QUESTION in _RecordingEndpoint.posts[0]["messages"][0]["content"][0]["text"]
 
 
 # ---- 对照臂：这个端口做的事，``VlmObserver`` 结构上做不到 ---------------------------
