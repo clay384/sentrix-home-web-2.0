@@ -42,7 +42,9 @@ Set `SENTRIX_VLM_CONTEXT_TOKENS=262144`,
 `SENTRIX_VLM_GENERATION_PROFILE=qwen35_nonthinking`. The profile pins nonthinking,
 temperature 0.7, top-p 0.8, top-k 20, min-p 0, presence penalty 1.5 and seed 42.
 Native mode omits output token caps so the server's actual tokenizer determines
-the input-plus-output budget. The engine's `max_num_batched_tokens=2048` is a
+the input-plus-output budget. The 30-step budget is the Agent turn's execution
+loop (including its internal review), not a cap of 30 HTTP requests: planning
+and visual/tool subcalls are measured separately. The engine's `max_num_batched_tokens=2048` is a
 prefill scheduling chunk, **not** a 2048-token response or context limit.
 Likewise the synthetic native-window test's deliberate 512-token output is only
 its controlled measurement workload, not the real QA or build policy.
@@ -216,3 +218,9 @@ PhotoBench 只有结构化证据才标记 `operational_issue`：输出、上下�
 建库验收额外要求：`scope_build.status=ready` 且所有构建相位均为done。流水线非2xx或资产failures、memory_graph缺失、非空causal_issues或causal_status=degraded、family_graph.run.status=failed或run.stats.operational_issue，均应拒绝验收。PB会保存原memory_graph/family_graph，返回partial/failed和incomplete。离线快照工具的完整性校验本身不证明业务建库成功；只有部署验收方核对原始run证据后才能写入accepted身份。
 
 CN-CLIP身份清单按实际包的模型导入覆盖 `modeling_bert.py` 和 `configuration_bert.py`；不存在的旧假定文件名不能用空hash替代。缺身份时推理服务可继续报告运行状态，但容量/基线认证必须拒绝，直至在部署边界重新加载并验证完整身份。
+
+### 嵌入检索故障与运行预算
+
+容量实验的 expected-runtime 必须包含 text_embedder_timeout_s 和 legacy_clip_timeout_s，与 Sentrix /diagnostics.runtime_configuration 相等。本轮显式环境建议为 SENTRIX_TEXT_EMBEDDER_TIMEOUT_S=120、SENTRIX_LEGACY_CLIP_TIMEOUT_S=120；产品默认仍是 10 / 30 秒。修改预算形成新的实验条件，不能把旧超时样本改判为质量错误。
+
+BGE / CLIP 请求超时、HTTP 拒绝、不可用、空或非法向量现在有线程隔离的结构化证据，沿内部 retrieval_channels[].operational_issue 保留。PhotoBench 对这种样本记不可评估 / 空分、跳过 Judge；容量入口停止新派发。本轮失败并不自动成为已确认容量边界。正常检索无命中、合法 SQLite 索引回退和历史缺少 typed 证据的降级不猜测故障原因；后者需单独检查原始通道状态。

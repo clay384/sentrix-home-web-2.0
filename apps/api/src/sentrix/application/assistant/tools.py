@@ -280,6 +280,7 @@ class AssistantToolbox:
                 "latency_ms": trace.latency_ms,
                 "backend": trace.backend,
                 "reason": trace.reason,
+                **({"operational_issue": dict(trace.operational_issue)} if trace.operational_issue else {}),
             }
             for trace in result.channel_trace
         ]

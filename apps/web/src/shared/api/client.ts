@@ -118,6 +118,7 @@ export interface SearchChannelTrace {
   latency_ms: number;
   backend: string;
   reason: string;
+  operational_issue?: Record<string, unknown> | null;
 }
 
 export interface SearchResponse {

@@ -102,3 +102,11 @@ def test_contradictory_agent_limits_are_rejected():
         Settings(agent_max_steps=8, agent_max_tool_calls=30)
     with pytest.raises(ValueError, match="agent_max_search_calls"):
         Settings(agent_max_search_calls=7)
+
+
+def test_embedding_timeout_environment_is_in_runtime_evidence(monkeypatch):
+    monkeypatch.setenv("SENTRIX_TEXT_EMBEDDER_TIMEOUT_S", "120")
+    monkeypatch.setenv("SENTRIX_LEGACY_CLIP_TIMEOUT_S", "120")
+    actual = Settings().runtime_configuration()
+    assert actual["text_embedder_timeout_s"] == 120
+    assert actual["legacy_clip_timeout_s"] == 120

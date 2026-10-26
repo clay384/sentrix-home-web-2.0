@@ -27,6 +27,7 @@ import math
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -62,6 +63,8 @@ class _SidecarEmbedder:
         self._health_checked_at = 0.0
         self._health_value = False
         self._error = ""
+        # Evidence belongs to this caller, never to another concurrent query.
+        self._attempt = threading.local()
 
     @property
     def model_id(self) -> str:
@@ -75,6 +78,20 @@ class _SidecarEmbedder:
     def load_error(self) -> str:
         """最近一次失败的原因。与 ``available`` 分开，理由同 ``wemm.py``。"""
         return self._error
+
+    @property
+    def last_operational_issue(self) -> dict[str, Any] | None:
+        """Structured evidence for the most recent embedding call on this thread."""
+        value = getattr(self._attempt, "issue", None)
+        return {**value, "request_policy": dict(value["request_policy"])} if value else None
+
+    def _attempt_failed(self, code: str, cause: str, **facts: Any) -> None:
+        self._attempt.issue = {
+            "error_code": code,
+            "failure_code": cause,
+            "request_policy": {"request_timeout_s": self._timeout_s},
+            **facts,
+        }
 
     @property
     def available(self) -> bool:
@@ -95,24 +112,43 @@ class _SidecarEmbedder:
         return healthy
 
     def _embed(self, endpoint: str, payload: dict[str, str], what: str) -> list[float]:
+        self._attempt.issue = None
         if not any(value.strip() for value in payload.values()):
             # 空输入不是侧车的问题；记进熔断计数会让空查询把整条通道断开。
             return []
         with self._lock:
             if self._tripped_at and time.monotonic() - self._tripped_at < CIRCUIT_OPEN_S:
+                self._attempt_failed("provider_unavailable", "circuit_open")
                 return []
         try:
             values = self._request_values(endpoint, payload)
         except Exception as error:  # noqa: BLE001 - 见模块注释：降级，不抛
+            code, cause = "resource_error", "embedding_invalid_response"
+            facts: dict[str, Any] = {"error_type": type(error).__name__}
+            if isinstance(error, httpx.TimeoutException):
+                code, cause = "time_limit", "embedding_timeout"
+                facts["request_outcome_unknown"] = not isinstance(
+                    error, (httpx.ConnectTimeout, httpx.PoolTimeout)
+                )
+            elif isinstance(error, httpx.HTTPStatusError):
+                code, cause = "provider_rejected", "embedding_http_status"
+                facts["http_status"] = error.response.status_code
+            elif isinstance(error, httpx.RequestError):
+                code, cause = "provider_unavailable", "embedding_transport_error"
+                facts["request_outcome_unknown"] = not isinstance(error, httpx.ConnectError)
+            self._attempt_failed(code, cause, **facts)
             self._record_failure(f"{type(error).__name__}: {error}", what)
             return []
         if not values:
+            self._attempt_failed("resource_error", "empty_vector")
             self._record_failure("侧车返回了空向量", what)
             return []
         if len(values) != self._dimension:
+            self._attempt_failed("resource_error", "dimension_mismatch")
             self._record_failure(f"侧车返回 {len(values)} 维，方案声明 {self._dimension} 维", what)
             return []
         if not all(math.isfinite(value) for value in values):
+            self._attempt_failed("resource_error", "non_finite_vector")
             self._record_failure("嵌入含非有限数值", what)
             return []
         self._record_success()

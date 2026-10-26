@@ -1856,11 +1856,29 @@ def test_cancel_during_judge_checkpoint_retains_missing_score_and_backlog(monkey
 @pytest.mark.parametrize(
     "code", ["output_limit", "context_limit", "time_limit", "provider_rejected", "resource_error"]
 )
-def test_structured_model_limit_stops_next_turn_and_judge_and_is_not_replayed(monkeypatch, code):
+@pytest.mark.parametrize("source", ["model", "retrieval"])
+def test_structured_model_limit_stops_next_turn_and_judge_and_is_not_replayed(monkeypatch, code, source):
     first = _completed_turn()
     first["result"]["trace"] = {
         "model_calls": [{"error_code": code, "http_status": 400 if code == "provider_rejected" else None}]
     }
+    if source == "retrieval":
+        first["result"]["trace"] = {
+            "tool_calls": [
+                {
+                    "tool": "search_memories",
+                    "observation": {
+                        "retrieval_channels": [
+                            {
+                                "channel": "text_ann",
+                                "status": "degraded",
+                                "operational_issue": {"error_code": code},
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
     row = {
         **_rows()[0],
         "conversation": [

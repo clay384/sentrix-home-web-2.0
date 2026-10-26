@@ -241,3 +241,88 @@ def test_explicit_rejudge_keeps_valid_zero_and_failed_judge_targets_but_excludes
         {**base, "termination_reason": "step_budget_exhausted", "judge": {"score": 0}},
     ]
     assert RunSuites._rejudge_targets(items) == [(0, None), (1, None)]
+
+
+@pytest.mark.parametrize(
+    "record,kind,status",
+    [
+        ({"error_code": "time_limit", "request_outcome_unknown": True}, "time_limit", "outcome_unknown"),
+        ({"error_code": "provider_rejected", "http_status": 429}, "provider_rejected", "operational_failure"),
+        (
+            {"error_code": "provider_unavailable", "failure_code": "circuit_open"},
+            "provider_rejected",
+            "operational_failure",
+        ),
+        (
+            {"error_code": "resource_error", "failure_code": "empty_vector"},
+            "resource_error",
+            "operational_failure",
+        ),
+    ],
+)
+def test_retrieval_faults_are_not_quality_zero_and_unknown_is_not_replayable(record, kind, status):
+    item = {
+        "execution_status": "completed",
+        "judge": {"score": 0},
+        "judge_status": "completed",
+        "runtime_turns": [
+            {
+                "trace_bundle": {
+                    "tool_calls": [
+                        {
+                            "tool": "search_memories",
+                            "observation": {
+                                "retrieval_channels": [
+                                    {
+                                        "channel": "text_ann",
+                                        "status": "degraded",
+                                        "reason": "embedder_unavailable",
+                                        "operational_issue": record,
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            }
+        ],
+    }
+    result = exclude_operational_quality(item)
+    assert result["operational_issue"]["kind"] == kind
+    assert result["operational_issue"]["evidence"]["source"] == "retrieval_channel"
+    assert result["operational_issue"]["evidence"]["channel"] == "text_ann"
+    assert result["execution_status"] == status
+    assert result["judge"]["score"] is None and result["judge_status"] == "skipped"
+    assert result["runtime_turns"] == item["runtime_turns"]
+    assert exclude_operational_quality(result) == result
+
+
+@pytest.mark.parametrize(
+    "status,reason", [("ok", ""), ("degraded", "no_index_configured"), ("degraded", "embedder_unavailable")]
+)
+def test_no_hits_or_legacy_untyped_degradation_does_not_invent_fault_cause(status, reason):
+    item = {
+        "runtime_turns": [
+            {
+                "trace_bundle": {
+                    "tool_calls": [
+                        {
+                            "observation": {
+                                "retrieval_channels": [
+                                    {
+                                        "channel": "visual_ann",
+                                        "status": status,
+                                        "candidate_count": 0,
+                                        "reason": reason,
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "judge": {"score": 0},
+    }
+    assert operational_issue(item) is None
+    assert exclude_operational_quality(item) == item

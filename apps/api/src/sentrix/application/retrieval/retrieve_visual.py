@@ -21,12 +21,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from sentrix.application.retrieval.scheme_drift import scheme_drift_reason
 from sentrix.domain.retrieval import scheme
 from sentrix.domain.retrieval.fusion import fuse
 from sentrix.domain.retrieval.models import CandidateHit
 from sentrix.domain.retrieval.ports import (
+    EmbeddingDiagnostics,
     VectorHit,
     VectorIndex,
     VectorIndexStatus,
@@ -66,6 +68,7 @@ class VisualSearchResult:
     degraded_reason: str = ""
     # 权威存储里这个 space 有多少条向量。空结果时用来区分「没导入过」与「搜不到」。
     authoritative_vectors: int = 0
+    operational_issue: Mapping[str, Any] | None = None
 
 
 class RetrieveVisual:
@@ -92,6 +95,11 @@ class RetrieveVisual:
                 backend="none",
                 degraded=True,
                 degraded_reason="embedder_unavailable",
+                operational_issue=(
+                    self._embedder.last_operational_issue
+                    if isinstance(self._embedder, EmbeddingDiagnostics)
+                    else None
+                ),
             )
         if len(query) != self._embedder.dimension:
             return VisualSearchResult(

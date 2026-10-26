@@ -76,6 +76,8 @@ class Settings(BaseSettings):
                 "vlm_base_url",
                 "embedding_scheme",
                 "text_embedder_url",
+                "text_embedder_timeout_s",
+                "legacy_clip_timeout_s",
                 "legacy_clip_url",
                 "wemm_url",
                 "agent_wall_time_s",

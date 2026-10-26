@@ -53,7 +53,14 @@ RESOURCE_ERROR = re.compile(
     r"resource_exhausted|resource.?timeout|timed out|timeout|time_budget|deadline",
     re.IGNORECASE,
 )
-RUNTIME_KEYS = {"deployment_profile", "embedding_scheme", "agent_wall_time_s", "chat_timeout_s"}
+RUNTIME_KEYS = {
+    "deployment_profile",
+    "embedding_scheme",
+    "agent_wall_time_s",
+    "chat_timeout_s",
+    "text_embedder_timeout_s",
+    "legacy_clip_timeout_s",
+}
 
 
 def restore_evidence(
@@ -184,7 +191,8 @@ def validate_configuration(
         raise ValueError("Sentrix VLM URL differs from the explicit model endpoint")
     if not RUNTIME_KEYS.issubset(expected_runtime):
         raise ValueError(
-            "expected runtime must declare deployment profile, embedding scheme and both time budgets"
+            "expected runtime must declare deployment profile, embedding scheme "
+            "and Agent/model/embedding time budgets"
         )
     if not subset(expected_runtime, actual):
         raise ValueError("actual Sentrix runtime differs from the declared run budget")

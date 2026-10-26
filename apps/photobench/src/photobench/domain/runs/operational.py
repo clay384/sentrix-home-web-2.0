@@ -90,6 +90,7 @@ def _issue(
         "http_status",
         "error_code",
         "error_type",
+        "failure_code",
         "finish_reason",
         "prompt_tokens",
         "completion_tokens",
@@ -144,6 +145,14 @@ def operational_issue(item: Mapping[str, Any]) -> dict[str, Any] | None:
                 )
                 if issue:
                     return issue
+            channels = observation.get("retrieval_channels") if isinstance(observation, Mapping) else []
+            for channel in channels or []:
+                explicit = channel.get("operational_issue") if isinstance(channel, Mapping) else None
+                if isinstance(explicit, Mapping):
+                    issue = _issue(explicit, "retrieval_channel", index, tool_index)
+                    if issue:
+                        issue["evidence"]["channel"] = channel.get("channel")
+                        return issue
         calls = bundle.get("model_calls") if isinstance(bundle, Mapping) else []
         for call_index, record in enumerate(calls or []):
             if isinstance(record, Mapping) and (issue := _issue(record, "model_call", index, call_index)):
@@ -230,6 +239,11 @@ def exclude_operational_quality(item: Mapping[str, Any]) -> dict[str, Any]:
             explicit = observation.get("operational_issue") if isinstance(observation, Mapping) else None
             if isinstance(explicit, Mapping):
                 calls.append(explicit)
+            channels = observation.get("retrieval_channels") if isinstance(observation, Mapping) else []
+            for channel in channels or []:
+                explicit = channel.get("operational_issue") if isinstance(channel, Mapping) else None
+                if isinstance(explicit, Mapping):
+                    calls.append(explicit)
     if any(
         call.get("request_outcome_unknown") is True
         or (

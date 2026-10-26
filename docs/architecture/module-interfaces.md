@@ -510,6 +510,10 @@ legacy文本HTTP协议：优先`POST /embed`，仅404时协商`/v1/embeddings`�
 
 ---
 
+检索诊断另有可选 EmbeddingDiagnostics.last_operational_issue 端口：只读当前线程最近一次嵌入调用的结构化结果，不执行 I/O。legacy 适配器在每次调用（包括空输入）开始清空，成功后为空；超时、HTTP 拒绝、传输失败、非法向量、熔断按类型和响应状态记录安全字段，绝不以共享 load_error 给并发题目归因。现有 embed_query / embed_image 的空列表降级及计算语义不变。
+
+只读 QA 链路将该证据经 TextSearchResult / VisualSearchResult.operational_issue、ChannelTrace.operational_issue 传到搜索 API 和 Agent 内部 retrieval_channels；不进入模型可见内容。PhotoBench 将明确故障记为不可评估、保留原轨迹及未知结果而不重发，普通无命中和没有 typed 证据的旧降级不猜测原因。运行诊断同时报告既有 BGE/CLIP 超时，容量入口要求 expected-runtime 显式绑定；修改这些预算要独立记录实验条件。
+
 ### 4.6 向量索引（`VectorIndex`）
 
 **必须保持**

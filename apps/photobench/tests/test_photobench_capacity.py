@@ -26,6 +26,8 @@ def config_fixture():
         "embedding_scheme": "legacy",
         "agent_wall_time_s": 600,
         "chat_timeout_s": 180,
+        "text_embedder_timeout_s": 120,
+        "legacy_clip_timeout_s": 120,
         "text_embedder_url": "http://127.0.0.1:8101",
         "legacy_clip_url": "http://127.0.0.1:8103",
     }
@@ -660,3 +662,40 @@ def test_progress_cloud_budget_failure_stops_dispatch_without_marking_agent_reso
     }
     assert capacity.run_problem(observed, 64, 2, 4) == "operational_issue"
     assert not capacity.resource_failure(observed)
+
+
+def test_embedding_timeouts_are_mandatory_capacity_budget_facts():
+    config, diag, models, kw = config_fixture()
+    kw["expected_runtime"].pop("text_embedder_timeout_s")
+    with pytest.raises(ValueError, match="embedding time budgets"):
+        capacity.validate_configuration(config, diag, models, **kw)
+
+
+@pytest.mark.parametrize("kind", ["time_limit", "provider_rejected", "resource_error"])
+def test_embedding_operational_failure_stops_capacity_round(kind):
+    from photobench.domain.runs.operational import exclude_operational_quality
+
+    current = state()
+    current["items"] = [
+        exclude_operational_quality(
+            {
+                "execution_status": "completed",
+                "runtime_turns": [
+                    {
+                        "trace_bundle": {
+                            "tool_calls": [
+                                {
+                                    "observation": {
+                                        "retrieval_channels": [
+                                            {"channel": "text_ann", "operational_issue": {"error_code": kind}}
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ],
+            }
+        )
+    ]
+    assert capacity.run_problem(current, 64, 2, 4) in {"resource_failure", "operational_issue"}

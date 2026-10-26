@@ -231,6 +231,18 @@ class AssetVisualIndexer(Protocol):
     def index(self, asset: Asset) -> VisualIndexOutcome: ...
 
 
+@runtime_checkable
+class EmbeddingDiagnostics(Protocol):
+    """Optional request-local diagnostics; reading must not perform IO.
+
+    Cleared before each embedding attempt, including empty input. A shared
+    adapter must isolate this value between caller threads.
+    """
+
+    @property
+    def last_operational_issue(self) -> Mapping[str, Any] | None: ...
+
+
 class VisualEmbedder(Protocol):
     """跨模态视觉嵌入：同一空间里的文本查询向量与图像向量。
 

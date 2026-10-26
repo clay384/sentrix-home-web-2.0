@@ -30,12 +30,13 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from sentrix.application.retrieval.scheme_drift import scheme_drift_reason
 from sentrix.domain.retrieval import scheme
 from sentrix.domain.retrieval.fusion import fuse
 from sentrix.domain.retrieval.models import CandidateHit
-from sentrix.domain.retrieval.ports import TextEmbedder, VectorHit, VectorRepository
+from sentrix.domain.retrieval.ports import EmbeddingDiagnostics, TextEmbedder, VectorHit, VectorRepository
 
 # 与写入侧 ``IndexObservationText`` 同一个字面量。两处各写一遍是有代价的，
 # 但它比「从写入用例 import 一个常量」好：召回侧不该依赖写入侧的模块。
@@ -76,6 +77,7 @@ class TextSearchResult:
     degraded: bool = False
     degraded_reason: str = ""
     authoritative_vectors: int = 0
+    operational_issue: Mapping[str, Any] | None = None
 
 
 class RetrieveTextAnn:
@@ -100,6 +102,11 @@ class RetrieveTextAnn:
                 backend="none",
                 degraded=True,
                 degraded_reason="embedder_unavailable",
+                operational_issue=(
+                    self._embedder.last_operational_issue
+                    if isinstance(self._embedder, EmbeddingDiagnostics)
+                    else None
+                ),
             )
         if len(query) != self._embedder.dimension:
             return TextSearchResult(

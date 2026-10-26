@@ -183,3 +183,5 @@ S11 做服务启停时接管的边界就是这三块。
 
 前端结果投影同步：`web/src/lib/runSummary.ts` 的旧数据回算排除 `operational_issue` / `evaluation_status=not_evaluable`，云Judge限制另排质量判分；新operational契约里的显式null不被原始观察覆盖。`lib/format.ts` 输出不可评估/评分未完成及中文原因，`lib/telemetry.ts` 将两类覆盖缺口独立显示；模型调用和任务耗时仍使用全量观察。回归 `web/src/lib/operationalResults.test.ts`。
 | `photobench/domain/runs/operational.py` | 结构化预算/供应商/资源证据与质量分离；保留原轨迹、排除旧错误零分和不完整云Judge；无I/O | domain | — | `photobench/application/run_execution/judge.py`、`photobench/application/run_execution/service.py`、`photobench/application/runs/suites.py`、`photobench/domain/runs/analysis.py` |
+
+操作证据扩展：domain/runs/operational.py 也消费 trace_bundle.tool_calls[].observation.retrieval_channels[].operational_issue。只使用请求级 typed code / HTTP 状态；普通空结果、索引回退或历史 embedder_unavailable 字符串不被猜作超时。证据保留通道名、错误类型、失败代码和请求超时，执行中及恢复均跳过质量 Judge，未知结果不重发；容量脚本见到该条目的 operational 状态停止派发并判本轮失败。验证 test_operational_issues.py、test_run_execution.py、test_photobench_capacity.py。
