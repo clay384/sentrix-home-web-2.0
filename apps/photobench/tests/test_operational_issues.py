@@ -459,3 +459,124 @@ def test_known_model_output_format_error_has_own_reason_and_is_not_replayed():
     assert result["runtime_turns"] == raw["runtime_turns"]
     assert RunExecution.resume_item(result) == result
     assert effective_summary({"items": [result]})["operational"]["by_kind"]["model_output_invalid"] == 1
+
+
+@pytest.mark.parametrize("text", ["not JSON", '{"reason":"missing"}', '{"score":NaN,"reason":"invalid"}'])
+@pytest.mark.parametrize("status", ["completed", "failed", "outcome_unknown"])
+def test_received_invalid_judge_never_becomes_missing_judge_recovery(text, status):
+    from photobench.application.run_execution.service import RunExecution
+
+    original = {
+        "execution_status": "completed",
+        "judge_status": status,
+        "judge_dispatch_status": "finished" if status != "outcome_unknown" else "outcome_unknown",
+        "judge": {"score": None, "judge_status": status, "raw_text": text},
+    }
+    before = deepcopy(original)
+    result = RunExecution.resume_item(original)
+    assert result["execution_status"] == "completed"
+    assert result["judge_status"] == ("outcome_unknown" if status == "outcome_unknown" else "failed")
+    assert result["judge_status"] != "pending"
+    assert original == before
+    if status == "completed":
+        assert result["judge_issue"]["kind"] == "model_output_invalid"
+        assert result["judge_issue"]["evidence"]["request_outcome_unknown"] is False
+
+
+@pytest.mark.parametrize("dispatch,restored", [("not_started", "pending"), ("in_flight", "outcome_unknown")])
+def test_only_never_dispatched_judge_remains_pending_on_resume(dispatch, restored):
+    from photobench.application.run_execution.service import RunExecution
+
+    result = RunExecution.resume_item(
+        {
+            "execution_status": "completed",
+            "judge_status": "pending",
+            "judge_dispatch_status": dispatch,
+        }
+    )
+    assert result["judge_status"] == restored
+
+
+def test_request_configuration_is_not_evaluable_and_preserves_only_safe_policy():
+    from photobench.application.run_execution.service import RunExecution
+
+    policy = {
+        "request_phase": "request_validation",
+        "request_outcome_unknown": False,
+        "json_output_mode": "json_schema",
+        "json_schema_name": "observation",
+        "json_schema_sha256": "a" * 64,
+        "schema": {"private": "excluded"},
+        "messages": ["private"],
+        "api_key": "excluded",
+    }
+    original = {
+        "execution_status": "completed",
+        "judge_status": "pending",
+        "runtime_turns": [
+            {
+                "trace_bundle": {
+                    "model_calls": [
+                        {
+                            "error_code": "request_configuration_invalid",
+                            "request_policy": policy,
+                        }
+                    ]
+                }
+            }
+        ],
+        "judge": {"score": 0},
+    }
+    result = RunExecution.resume_item(original)
+    assert result["execution_status"] == "operational_failure"
+    assert result["evaluation_status"] == "not_evaluable"
+    issue = result["operational_issue"]
+    assert issue["kind"] == "configuration_error"
+    assert issue["evidence"]["request_policy"] == {
+        k: v for k, v in policy.items() if k not in {"schema", "messages", "api_key"}
+    }
+    assert result["judge"]["score"] is None
+    assert effective_summary({"items": [result]})["operational"]["by_kind"]["configuration_error"] == 1
+
+
+def test_historical_invalid_action_is_excluded_but_intentional_null_is_not_inferred_invalid():
+    from photobench.domain.runs.operational import item_judge_issue
+
+    invalid = {
+        "task_judge": {
+            "expected_action": "answer",
+            "actual_action": None,
+            "judge_status": "completed",
+            "raw_text": '{"reason":"missing"}',
+        }
+    }
+    assert item_judge_issue(invalid)["kind"] == "model_output_invalid"
+    for judge in [
+        {"score": None, "reason": "not_labeled"},
+        {"score": None, "reason": "not_applicable"},
+        {"score": 0},
+        {
+            "score": None,
+            "applicable": False,
+            "judge_status": "completed",
+            "raw_text": '{"applicable":false,"score":null,"reason":"no visual claims"}',
+        },
+    ]:
+        assert item_judge_issue({"evidence_judge" if "applicable" in judge else "judge": judge}) is None
+
+
+def test_historical_absent_finish_field_does_not_invent_unknown_or_replay():
+    from photobench.application.run_execution.service import RunExecution
+    from photobench.domain.runs.analysis import judge_projection
+
+    text = '{"score":0,"reason":"模型回答错误"}'
+    judge = {
+        "judge_status": "completed",
+        "score": 0,
+        "attempts": [{"raw_response": {"choices": [{"message": {"content": text}}]}}],
+    }
+    original = {"execution_status": "completed", "judge_status": "completed", "judge": judge}
+    restored = RunExecution.resume_item(original)
+    assert restored["execution_status"] == restored["judge_status"] == "completed"
+    assert judge_projection(judge)["score"] == 0
+    assert "judge_issue" not in restored

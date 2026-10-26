@@ -15,6 +15,7 @@ from photobench.api.metrics_schema import RunItemObservation, RunMetricsResponse
         "provider_rejected",
         "resource_error",
         "model_output_invalid",
+        "configuration_error",
     ],
 )
 def test_operational_item_keeps_execution_evidence_separate_from_judge_score(kind):

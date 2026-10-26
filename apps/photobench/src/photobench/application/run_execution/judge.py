@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import json
 import os
 import random
 import threading
@@ -51,7 +52,11 @@ from photobench.domain.runs.judge import (
     parse_judge_json,
     thinking_kwargs,
 )
-from photobench.domain.runs.operational import exclude_operational_quality, operational_issue
+from photobench.domain.runs.operational import (
+    exclude_operational_quality,
+    judge_format_issue,
+    operational_issue,
+)
 
 #: 1.0 的四个模块级常量（``:206-229``），同样由环境变量覆盖。
 JUDGE_RETRY_ATTEMPTS = max(1, int(os.environ.get("PHOTOBENCH_JUDGE_RETRY_ATTEMPTS", "6")))
@@ -73,38 +78,90 @@ InlineImages = Callable[
 ]
 
 
-def _truncated_judge_response(raw: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any] | None:
-    choices = raw.get("choices") or []
-    if not choices or not isinstance(choices[0], Mapping):
+def _judge_response_problem(raw: Any, payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    choices = raw.get("choices") if isinstance(raw, Mapping) else None
+    choice = choices[0] if isinstance(choices, list) and len(choices) == 1 else None
+    message = choice.get("message") if isinstance(choice, Mapping) else None
+    finish_reason = choice.get("finish_reason") if isinstance(choice, Mapping) else None
+    content = message.get("content") if isinstance(message, Mapping) else None
+    if finish_reason in ("length", "content_filter"):
+        code = kind = "output_limit" if finish_reason == "length" else "provider_rejected"
+        field, value, unknown = "finish_reason", finish_reason, False
+    elif (
+        not isinstance(message, Mapping)
+        or not isinstance(content, str)
+        or finish_reason != "stop"
+        or message.get("tool_calls")
+        or message.get("function_call")
+    ):
+        code, kind = "provider_response_invalid", "provider_rejected"
+        field, value, unknown = "response_contract", "invalid_grading_envelope", True
+    else:
         return None
-    finish_reason = choices[0].get("finish_reason")
-    if finish_reason not in ("length", "content_filter"):
-        return None
-    kind = "output_limit" if finish_reason == "length" else "provider_rejected"
-    # Complete-looking JSON cannot turn an explicitly truncated/filtered response into a score.
+    # Valid-looking JSON cannot prove completion of an invalid/truncated protocol.
     return {
         "score": None,
         "correct": None,
         "actual_action": None,
-        "judge_status": "failed",
-        "reason": "judge_" + kind,
+        "judge_status": "outcome_unknown" if unknown else "failed",
+        "reason": "judge_" + code,
         "operational_issue": {
             "version": 1,
             "scope": "judge",
             "kind": kind,
             "evidence": {
                 "source": "judge_response",
-                "field": "finish_reason",
-                "value": finish_reason,
-                "error_code": kind,
+                "field": field,
+                "value": value,
+                "error_code": code,
+                "request_outcome_unknown": unknown,
                 "max_tokens": payload.get("max_tokens"),
             },
         },
         "input": dict(payload),
-        "raw_response": dict(raw),
-        "raw_text": str((choices[0].get("message") or {}).get("content") or ""),
-        "attempts": [{"input": dict(payload), "raw_response": dict(raw)}],
+        "raw_response": raw,
+        "raw_text": content if isinstance(content, str) else "",
+        "attempts": [{"input": dict(payload), "raw_response": raw}],
     }
+
+
+def _judge_request_failure(exc: Exception) -> dict[str, Any]:
+    if not isinstance(exc, RequestOutcomeUnknownError):
+        return {}
+    result: dict[str, Any] = {"request_failure": exc.facts}
+    if exc.facts.get("error_code") == "provider_response_invalid":
+        result["operational_issue"] = {
+            "version": 1,
+            "scope": "judge",
+            "kind": "provider_rejected",
+            "evidence": {
+                "source": "judge_response",
+                "field": "response_contract",
+                "value": "invalid_json_envelope",
+                "error_code": "provider_response_invalid",
+                "request_outcome_unknown": True,
+            },
+        }
+    return result
+
+
+def _invalid_judge_output(
+    raw: Mapping[str, Any], payload: Mapping[str, Any], text: str, judge_kind: str
+) -> dict[str, Any] | None:
+    if issue := judge_format_issue(text, judge_kind):
+        return {
+            "score": None,
+            "correct": None,
+            "actual_action": None,
+            "judge_status": "failed",
+            "reason": "judge_model_output_invalid",
+            "operational_issue": issue,
+            "input": dict(payload),
+            "raw_response": dict(raw),
+            "raw_text": text,
+            "attempts": [{"input": dict(payload), "raw_response": dict(raw), "raw_text": text}],
+        }
+    return None
 
 
 class JudgeRunner:
@@ -237,7 +294,7 @@ class JudgeRunner:
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.judge_api_key}"} if self.judge_api_key else {}
 
-    def _request(self, payload: dict[str, Any], timeout: int = 180) -> tuple[dict[str, Any], int]:
+    def _request(self, payload: dict[str, Any], timeout: int = 180) -> tuple[Any, int]:
         """1.0 ``_judge_request``（``:4433``）：带退避的重试；4xx 立刻抛。"""
         last_error: Exception | None = None
         for attempt in range(1, JUDGE_RETRY_ATTEMPTS + 1):
@@ -276,11 +333,15 @@ class JudgeRunner:
                     raise
                 finally:
                     self._request_metric("in_flight", -1)
-                if not isinstance(response, dict):
-                    raise ValueError("judge response is not an object")
                 return response, attempt
             except (RunCancelledError, RequestOutcomeUnknownError):
                 raise
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                error = RequestOutcomeUnknownError(
+                    method="POST", cause_type=type(exc).__name__, attempts=attempt
+                )
+                error.facts.update(error_code="provider_response_invalid", request_outcome_unknown=True)
+                raise error from exc
             except Exception as exc:  # noqa: BLE001 —— 1.0 在这里把一切收成「重试或放弃」
                 last_error = exc
                 client_code = self._client_error_code(exc)
@@ -362,13 +423,21 @@ class JudgeRunner:
             for consistency_attempt in range(2):
                 raw, request_attempts = self._request(payload)
                 retry_attempts += request_attempts
-                if truncated := _truncated_judge_response(raw, payload):
+                if truncated := _judge_response_problem(raw, payload):
                     return {
                         **truncated,
                         "judge_retry_attempts": retry_attempts,
                         "attempts": [*attempts, *truncated["attempts"]],
                     }
                 text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
+                if invalid := _invalid_judge_output(raw, payload, text, "judge"):
+                    return {
+                        **invalid,
+                        "score_normalization_version": JUDGE_SCORE_NORMALIZATION_VERSION,
+                        "score_normalization": normalize_judge_score(parse_judge_json(text).get("score")),
+                        "judge_retry_attempts": retry_attempts,
+                        "attempts": [*attempts, *invalid["attempts"]],
+                    }
                 parsed = parse_judge_json(text)
                 normalization = normalize_judge_score(parsed.get("score"))
                 score = normalization["score"]
@@ -387,8 +456,30 @@ class JudgeRunner:
                 if consistent:
                     break
                 if consistency_attempt == 1:
-                    score, reason = None, "judge_inconsistent_score_reason"
-                    break
+                    return {
+                        "score": None,
+                        "reason": "judge_inconsistent_score_reason",
+                        "judge_status": "failed",
+                        "operational_issue": {
+                            "version": 1,
+                            "scope": "judge",
+                            "kind": "model_output_invalid",
+                            "evidence": {
+                                "source": "judge_response",
+                                "field": "response_contract",
+                                "value": "score_reason_inconsistent",
+                                "error_code": "model_output_invalid",
+                                "request_outcome_unknown": False,
+                            },
+                        },
+                        "input": payload,
+                        "raw_text": text,
+                        "attempts": attempts,
+                        "score_normalization_version": JUDGE_SCORE_NORMALIZATION_VERSION,
+                        "score_normalization": normalization,
+                        "consistency_version": JUDGE_CONSISTENCY_VERSION,
+                        "judge_retry_attempts": retry_attempts,
+                    }
                 payload = {
                     **payload,
                     "messages": [
@@ -429,7 +520,7 @@ class JudgeRunner:
                 "judge_status": "outcome_unknown"
                 if isinstance(exc, RequestOutcomeUnknownError)
                 else "failed",
-                **({"request_failure": exc.facts} if isinstance(exc, RequestOutcomeUnknownError) else {}),
+                **_judge_request_failure(exc),
             }
 
     def judge_task_action(
@@ -480,9 +571,11 @@ class JudgeRunner:
         }
         try:
             raw, _ = self._request(payload)
-            if truncated := _truncated_judge_response(raw, payload):
+            if truncated := _judge_response_problem(raw, payload):
                 return truncated
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
+            if invalid := _invalid_judge_output(raw, payload, text, "task_judge"):
+                return {**invalid, "expected_action": expected_action}
             parsed = parse_judge_json(text)
             actual = (
                 parsed.get("actual_action")
@@ -509,7 +602,7 @@ class JudgeRunner:
                 "judge_status": "outcome_unknown"
                 if isinstance(exc, RequestOutcomeUnknownError)
                 else "failed",
-                **({"request_failure": exc.facts} if isinstance(exc, RequestOutcomeUnknownError) else {}),
+                **_judge_request_failure(exc),
             }
 
     def _inline_images(
@@ -564,9 +657,11 @@ class JudgeRunner:
         }
         try:
             raw, _ = self._request(payload)
-            if truncated := _truncated_judge_response(raw, payload):
+            if truncated := _judge_response_problem(raw, payload):
                 return truncated
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
+            if invalid := _invalid_judge_output(raw, payload, text, "evidence_judge"):
+                return invalid
             parsed = parse_judge_json(text)
             applicable = parsed.get("applicable") is not False
             if not applicable:
@@ -608,7 +703,7 @@ class JudgeRunner:
                 "judge_status": "outcome_unknown"
                 if isinstance(exc, RequestOutcomeUnknownError)
                 else "failed",
-                **({"request_failure": exc.facts} if isinstance(exc, RequestOutcomeUnknownError) else {}),
+                **_judge_request_failure(exc),
             }
 
     # ---- 一个 item 的编排 ---------------------------------------------------

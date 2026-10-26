@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from photobench.domain.runs.judge import normalize_judge_score, parse_judge_json
+
 KINDS = frozenset(
     {
         "output_limit",
@@ -14,6 +16,7 @@ KINDS = frozenset(
         "provider_rejected",
         "resource_error",
         "model_output_invalid",
+        "configuration_error",
     }
 )
 _CODES = {
@@ -37,6 +40,8 @@ _CODES = {
     "provider_unavailable": "provider_rejected",
     "provider_response_invalid": "provider_rejected",
     "model_output_invalid": "model_output_invalid",
+    "request_configuration_invalid": "configuration_error",
+    "configuration_error": "configuration_error",
     "resource_error": "resource_error",
     "out_of_memory": "resource_error",
     "cuda_error": "resource_error",
@@ -66,6 +71,8 @@ _POLICY_KEYS = frozenset(
         "request_timeout_s",
         "request_phase",
         "json_output_mode",
+        "json_schema_name",
+        "json_schema_sha256",
         "strict_model_step_budget",
         "request_outcome_unknown",
         "max_tool_calls",
@@ -197,7 +204,43 @@ def operational_issue(item: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def incomplete_judge_issue(judge: Mapping[str, Any]) -> dict[str, Any] | None:
+def judge_format_issue(text: str, judge_kind: str) -> dict[str, Any] | None:
+    """Validate received grading content; null alone never proves a failure."""
+    parsed = parse_judge_json(text)
+    problem = None
+    if not parsed:
+        problem = "json_object_invalid"
+    elif not isinstance(parsed.get("reason"), str) or not parsed["reason"].strip():
+        problem = "reason_missing_or_invalid"
+    elif judge_kind == "task_judge":
+        action = parsed.get("actual_action")
+        if not isinstance(action, str) or action not in {"answer", "refuse", "clarify", "none"}:
+            problem = "actual_action_missing_or_invalid"
+    elif judge_kind == "evidence_judge" and "applicable" in parsed and type(parsed["applicable"]) is not bool:
+        problem = "applicable_invalid"
+    elif judge_kind == "evidence_judge" and parsed.get("applicable") is False:
+        # An explicitly inapplicable evidence grade is a valid, intentional null.
+        return None
+    elif normalize_judge_score(parsed.get("score"))["score"] is None:
+        problem = "score_missing_or_invalid"
+    if problem is None:
+        return None
+    return {
+        "version": 1,
+        "scope": "judge",
+        "kind": "model_output_invalid",
+        "evidence": {
+            "source": "judge_response",
+            "field": "response_contract",
+            "value": problem,
+            "error_code": "model_output_invalid",
+            "request_outcome_unknown": False,
+            "judge_kind": judge_kind,
+        },
+    }
+
+
+def incomplete_judge_issue(judge: Mapping[str, Any], judge_kind: str | None = None) -> dict[str, Any] | None:
     existing = judge.get("operational_issue")
     if isinstance(existing, dict) and existing.get("scope") == "judge":
         return dict(existing)
@@ -228,6 +271,21 @@ def incomplete_judge_issue(judge: Mapping[str, Any]) -> dict[str, Any] | None:
                 "error_code": kind,
             },
         }
+    if judge.get("judge_status") not in {"failed", "outcome_unknown"}:
+        # Historical responses are evidence, not permission to send another request.
+        kind = judge_kind or (
+            "task_judge"
+            if "expected_action" in judge or "actual_action" in judge
+            else "evidence_judge"
+            if "applicable" in judge
+            else "judge"
+        )
+        text = judge.get("raw_text")
+        if not isinstance(text, str) and isinstance(choices, list) and choices:
+            message = choices[0].get("message") if isinstance(choices[0], Mapping) else None
+            text = message.get("content") if isinstance(message, Mapping) else None
+        if isinstance(text, str):
+            return judge_format_issue(text, kind)
     return None
 
 
@@ -239,7 +297,7 @@ def item_judge_issue(item: Mapping[str, Any]) -> dict[str, Any] | None:
     for record in records:
         for key in ("judge", "task_judge", "evidence_judge"):
             observation = record.get(key)
-            if isinstance(observation, Mapping) and (issue := incomplete_judge_issue(observation)):
+            if isinstance(observation, Mapping) and (issue := incomplete_judge_issue(observation, key)):
                 return issue
     return None
 

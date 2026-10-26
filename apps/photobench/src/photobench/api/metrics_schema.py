@@ -20,6 +20,7 @@ class OperationalIssue(BaseModel):
         "provider_rejected",
         "resource_error",
         "model_output_invalid",
+        "configuration_error",
     ]
     evidence: dict[str, Any]
     scope: Literal["judge"] | None = None

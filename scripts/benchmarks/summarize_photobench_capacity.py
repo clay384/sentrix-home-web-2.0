@@ -256,6 +256,8 @@ def operational_coverage(state: Mapping[str, Any]) -> Json:
         "time_limit",
         "provider_rejected",
         "resource_error",
+        "model_output_invalid",
+        "configuration_error",
     )
     raw_items = state.get("items")
     items = [item for item in raw_items if isinstance(item, Mapping)] if isinstance(raw_items, list) else []

@@ -1351,6 +1351,7 @@ components:
           - provider_rejected
           - resource_error
           - model_output_invalid
+          - configuration_error
           title: Kind
         evidence:
           additionalProperties: true

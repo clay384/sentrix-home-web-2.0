@@ -692,7 +692,10 @@ def test_explicit_rejudge_archives_and_replaces_old_cloud_budget_issue(tmp_path)
     item["runtime_turns"][0]["task_judge"] = {"correct": None, "operational_issue": issue}
     item["runtime_turns"][0]["evidence_judge"] = {"score": None, "operational_issue": issue}
     http = FakeHttpClient(
-        [judge_reply('{"score":2,"reason":"正确"}'), judge_reply('{"actual_action":"answer"}')]
+        [
+            judge_reply('{"score":2,"reason":"正确"}'),
+            judge_reply('{"actual_action":"answer","reason":"回答了问题"}'),
+        ]
     )
     suites = _suites(tmp_path, store=FakeRunStore({"run-1": state}), writer=FakeResultWriter(), http=http)
     suites.start_rejudge("run-1", {"system_prompt": "new"})

@@ -56,3 +56,19 @@ it("names a model output format failure separately from provider refusal", () =>
   expect(judgeScoreLabel({ operational_issue: { kind: "model_output_invalid" } }, null))
     .toBe("不可评估（模型输出格式错误）");
 });
+
+
+it("shows request configuration failure without counting it as a quality zero", () => {
+  expect(judgeScoreLabel({ operational_issue: { kind: "configuration_error" }, judge: { score: 0 } }, null))
+    .toBe("不可评估（请求配置错误）");
+  const summary = effectiveRunSummary({ items: [
+    { operational_issue: { kind: "configuration_error" }, judge: { score: 0 } },
+    { judge: { score: 0 } },
+  ] } as unknown as Run);
+  expect(summary.judge_valid_count).toBe(1);
+  expect(summary.answer_quality_mean).toBe(0);
+  const rows = keyMetricRows({}, { operational: {
+    not_evaluable_count: 1, by_kind: { configuration_error: 1 },
+  } });
+  expect(rows.find((row) => row.label === "不可评估")).toMatchObject({ note: "请求配置错误 1 题" });
+});

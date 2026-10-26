@@ -2027,3 +2027,26 @@ def test_vlm_build_failure_cannot_be_accepted_in_response_or_http_error(monkeypa
     assert phase["status"] == ("failed" if http_failure else "partial")
     assert state["scope_build"]["status"] == "incomplete"
     assert "output_limit" in (state["fatal_error"] if http_failure else phase["error_details"][0]["reason"])
+
+
+@pytest.mark.parametrize("judge_status", ["completed", "failed", "outcome_unknown"])
+def test_resume_received_invalid_judge_never_dispatches_qa_or_judge(monkeypatch, judge_status):
+    execution, *_ = _execution()
+    monkeypatch.setattr(execution, "_evaluate_one", lambda *_: pytest.fail("QA replayed"))
+    monkeypatch.setattr(execution, "_probe_endpoint_health", lambda: pytest.fail("model health not needed"))
+    monkeypatch.setattr(
+        execution, "_judge", SimpleNamespace(judge_item=lambda *_: pytest.fail("Judge replayed"))
+    )
+    prior = {
+        "qa_id": "q1",
+        "execution_status": "completed",
+        "judge_status": judge_status,
+        "judge_dispatch_status": "finished",
+        "judge": {"score": None, "judge_status": judge_status, "raw_text": "not valid JSON"},
+    }
+    state = RunState({"scope_id": "s", "album_id": ALBUM})
+    execution._phase_qa_eval(state, _request(prior_items=[prior]))
+    result = state.data["items"][0]
+    assert result["execution_status"] == "completed"
+    assert result["judge_status"] == ("outcome_unknown" if judge_status == "outcome_unknown" else "failed")
+    assert result["judge"]["score"] is None

@@ -878,3 +878,46 @@ def test_model_output_format_error_is_unevaluable_and_stops_capacity_dispatch():
     assert current["items"][0]["judge"]["score"] is None
     assert capacity.run_problem(current, 64, 2, 4) == "operational_issue"
     assert not capacity.resource_failure(current)  # A format failure does not establish a capacity maximum.
+
+
+@pytest.mark.parametrize("kind", ["model_output_invalid", "configuration_error"])
+def test_new_operational_categories_are_not_evaluable_and_cannot_pass_capacity(kind):
+    current = state("completed_with_errors")
+    current["items"] = [{"operational_issue": {"kind": kind}}]
+    assert capacity.run_problem(current, 64, 2, 4) == "operational_issue"
+    report = capacity.summarize_run(current)
+    assert report["operational"]["not_evaluable_count"] == 1
+    assert report["operational"]["by_kind"][kind] == 1
+    report.update(resource_failure=False, judge_failure_count=0)
+    result = {"passed": True}
+    capacity.apply_final_evidence(result, report)
+    assert result["passed"] is False and result["failure"] == "operational_issue"
+
+
+def test_invalid_cloud_content_cannot_qualify_as_completed_capacity(monkeypatch):
+    from fakes_execution import FakeHttpClient, judge_reply
+
+    from photobench.application.run_execution import judge as judge_module
+
+    monkeypatch.setattr(judge_module, "JUDGE_REQUEST_INTERVAL_SECONDS", 0)
+    http = FakeHttpClient([judge_reply("not JSON")])
+    runner = judge_module.JudgeRunner(http=http, judge_url="http://fake", judge_model="fake")
+    item = runner.judge_item(
+        {
+            "execution_status": "completed",
+            "runtime_turns": [{"message": "q", "answer": "a", "expected_action": "answer"}],
+        },
+        {"answer": "r"},
+        {},
+    )
+    current = state("completed")
+    current["items"] = [item]
+    assert len(http.calls) == 1
+    assert capacity.run_problem(current, 64, 2, 4) == "operational_issue"
+    report = capacity.summarize_run(current)
+    report.update(resource_failure=False, judge_failure_count=capacity.judge_failure_count(current))
+    result = {"passed": True}
+    capacity.apply_final_evidence(result, report)
+    assert result["passed"] is False
+    assert report["operational"]["judge_by_kind"]["model_output_invalid"] == 1
+    assert report["operational"]["not_evaluable_count"] == 0
