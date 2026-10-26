@@ -165,3 +165,12 @@ def test_json_output_mode_is_independent_explicit_and_reported(monkeypatch):
     assert Settings().vlm_json_output_mode == "json_object"
     with pytest.raises(ValueError):
         Settings(vlm_json_output_mode="auto")
+
+
+def test_schema_output_mode_is_explicit_and_does_not_enable_new_budgets(monkeypatch):
+    monkeypatch.setenv("SENTRIX_VLM_JSON_OUTPUT_MODE", "json_schema")
+    settings = Settings()
+    assert settings.vlm_json_output_mode == "json_schema"
+    assert settings.runtime_configuration()["vlm_json_output_mode"] == "json_schema"
+    assert settings.vlm_json_streaming is False
+    assert settings.vlm_native_output_budget is False

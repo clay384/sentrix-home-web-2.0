@@ -28,6 +28,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from sentrix.domain.assistant.ports import ModelServiceError
+from sentrix.infrastructure.media.json_output_contracts import response_format_identity
 
 log = logging.getLogger(__name__)
 _STATUS_INTERVAL_S = 5.0
@@ -111,9 +112,7 @@ def _request_identity(endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
     return {
         **_generation_identity(body),
         "model": body.get("model"),
-        "json_output_mode": "json_object"
-        if body.get("response_format") == {"type": "json_object"}
-        else "prompt_only",
+        **response_format_identity(body),
         "endpoint": urlunsplit((parsed.scheme, netloc, parsed.path, "", "")),
         "prompt_sha256": hashlib.sha256(
             json.dumps(text_parts, ensure_ascii=False, separators=(",", ":")).encode()

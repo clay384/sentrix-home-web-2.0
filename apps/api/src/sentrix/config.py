@@ -174,7 +174,7 @@ class Settings(BaseSettings):
     # vLLM computes remaining context using its actual tokenizer and chat template.
     vlm_native_output_budget: bool = False
     # Transport/diagnostic deployment facts; they do not change model sampling.
-    vlm_json_output_mode: Literal["json_object", "prompt_only"] = "json_object"
+    vlm_json_output_mode: Literal["json_object", "prompt_only", "json_schema"] = "json_object"
     vlm_json_streaming: bool = False
     vlm_json_private_content: bool = False
 

@@ -139,3 +139,8 @@
 ### 2026-10-27：流式请求实际生成参数证据
 
 每条 VLM SSE 状态增加 `generation_parameters`，从最终请求 body 提取 temperature/top_p/top_k/min_p/presence_penalty/repetition_penalty/seed、chat_template_kwargs.enable_thinking，以及显式 max_tokens/max_completion_tokens；不从 profile 声明推断。`generation_parameters_omitted` 明确缺省字段，显式 null 仍保留在参数内；非预期类型仅在 `generation_parameters_invalid` 记字段名，不记录其内容、不改请求。安全参数、排序后的缺省/无效字段清单共同以 sorted-key、紧凑 ASCII JSON 计算 SHA256，格式为 `whitelisted_parameters_omitted_invalid_sorted_json_v1`。该指纹只覆盖列明的生成参数，不是完整请求或服务端默认值的认证；正文/图片/密钥不进入参数记录。所有派发、进度和终态继承同一指纹，正常结束不能掩盖诊断 presence_penalty=0 与产品1.5的差异。此补充仅观测，不改变采样、解析、默认JSON模式、重试或原生预算。验证：`apps/api/tests/integration/test_vlm_json_stream.py`。
+
+
+### 2026-10-27：按业务显式约束 JSON 结构
+
+`json_schema` 是第三种显式视觉输出模式，默认不变；各调用方提供已有业务契约，不能给人物/复核任务套观察八字段。缺失配置在任何模型发现/生成前报 `request_configuration_invalid`，是已知配置故障；完整但不符合契约的回复报已知 `model_output_invalid`。保留原提示、native无输出帽与官方采样；不增加maxLength，人物瞬间/衣物不新增maxItems。实际schema名/排序JSON SHA进入安全policy/流式状态，不记录schema原文。旧json_object基线仍按原生产者身份复用，未来schema建库单独绑定契约源码与模式。验证为 `test_json_output_contracts.py`、`test_vlm_json_stream.py` 的五业务HTTP与三观察阶段回归、API typed错误契约。

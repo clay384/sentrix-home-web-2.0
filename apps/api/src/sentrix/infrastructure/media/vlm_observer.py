@@ -24,7 +24,8 @@
 在生产装配下恒为空元组，门禁全开也写不出一条事实。
 
 所有 JSON 调用复用 ServedModel 的显式采样策略；默认请求 response_format=json_object，
-显式 prompt_only 模式仅省略该字段，不自动降级或重试。
+显式 prompt_only 模式仅省略该字段；json_schema 模式使用调用方的既有业务契约，
+派发前核对契约，完整响应再次校验形状。不自动降级或重试。
 不指定 max_tokens/max_completion_tokens，让后端按实际输入计算原生剩余窗口。
 不支持该模式的端点不会被静默重试或降为非约束生成。结构化错误与诊断日志均不含原文。
 
@@ -43,7 +44,7 @@ import base64
 import json
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,11 @@ from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.media.models import MODEL_FACT_CONFIDENCE, ObservationFact
 from sentrix.domain.media.ports import ObservationSemantics
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
+from sentrix.infrastructure.media.json_output_contracts import (
+    OBSERVATION_SCHEMA,
+    matches_output_contract,
+    prepare_output_contract,
+)
 from sentrix.infrastructure.media.vlm_json_stream import stream_json_response
 
 log = logging.getLogger(__name__)
@@ -190,6 +196,9 @@ def chat_json(
     prompt: str,
     image: str | Sequence[str] | None,
     timeout_s: float,
+    *,
+    output_schema: Mapping[str, Any] | None = None,
+    schema_name: str | None = None,
 ) -> dict[str, Any] | None:
     """一次「提示词（+ 一张或多张图）→ JSON 对象」的往返。格式/运行失败抛结构化类型错误。
 
@@ -209,13 +218,13 @@ def chat_json(
         content.append({"type": "image_url", "image_url": {"url": url}})
     name = "unresolved"
     dispatched = False
-    format_parameters: dict[str, Any] = (
-        {"response_format": {"type": "json_object"}} if model.json_output_mode == "json_object" else {}
+    # Validate the explicit business contract before model discovery or generation.
+    format_parameters, format_policy, contract = prepare_output_contract(
+        model.json_output_mode, output_schema, schema_name
     )
     policy: dict[str, Any] = {
         **model.generation_parameters(),
-        **format_parameters,
-        "json_output_mode": model.json_output_mode,
+        **format_policy,
         "output_budget_policy": "native_remaining_context",
         "timeout_s": timeout_s,
     }
@@ -352,11 +361,11 @@ def chat_json(
             http_status=status_code,
             request_policy={**policy, "request_outcome_unknown": True},
         )
-    if parsed is None:
+    if parsed is None or (contract is not None and not matches_output_contract(parsed, contract)):
         # A known completed generation with unusable structure is not a lost request.
         raw_prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
         raise ModelServiceError(
-            "模型输出格式错误（model_output_invalid）：完整响应中没有可解析的 JSON 对象；未自动重试。",
+            "模型输出格式错误（model_output_invalid）：完整响应不是可用的业务 JSON 对象；未自动重试。",
             error_code="model_output_invalid",
             http_status=status_code,
             request_policy={**policy, "request_outcome_unknown": False},
@@ -416,7 +425,15 @@ class OpenAIVlmObserver:
         return semantics_from_payload(parsed)
 
     def _chat(self, prompt: str, image: str | None) -> dict[str, Any] | None:
-        return chat_json(self._endpoint, self._model, prompt, image, self._timeout)
+        return chat_json(
+            self._endpoint,
+            self._model,
+            prompt,
+            image,
+            self._timeout,
+            output_schema=OBSERVATION_SCHEMA,
+            schema_name="sentrix_observation_v1",
+        )
 
 
 def _first_content(payload: object) -> str:

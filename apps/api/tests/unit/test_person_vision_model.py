@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -71,7 +72,7 @@ class ScriptedVision(OpenAIPersonVision):
         self.prompts: list[str] = []
         self.images: list[str | None] = []
 
-    def _chat(self, prompt: str, image: str | None) -> dict | None:
+    def _chat(self, prompt: str, image: str | None, **_contract: Any) -> dict | None:
         self.prompts.append(prompt)
         self.images.append(image)
         return self.replies[min(len(self.prompts) - 1, len(self.replies) - 1)]

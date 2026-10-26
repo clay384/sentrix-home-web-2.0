@@ -12,6 +12,7 @@ bbox 非法）：它们不是用例的结论，而是请求本身在这里就没
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -62,6 +63,7 @@ _OPERATIONAL_ERRORS = {
     "output_limit": (502, "模型输出达到可用上限；本次操作未完成。"),
     "provider_response_invalid": (502, "模型服务响应封装不可识别；本次操作未完成。"),
     "model_output_invalid": (502, "模型输出格式错误；本次操作未完成。"),
+    "request_configuration_invalid": (500, "请求配置错误；本次操作未派发模型请求。"),
 }
 
 
@@ -97,11 +99,21 @@ def _safe_request_policy(policy: Mapping[str, Any]) -> dict[str, object]:
     chat = policy.get("chat_template_kwargs")
     if isinstance(chat, dict) and type(chat.get("enable_thinking")) is bool:
         safe["chat_template_kwargs"] = {"enable_thinking": chat["enable_thinking"]}
-    if policy.get("json_output_mode") in ("json_object", "prompt_only"):
+    if policy.get("json_output_mode") in ("json_object", "prompt_only", "json_schema"):
         safe["json_output_mode"] = policy["json_output_mode"]
+    if policy.get("request_phase") in ("request_validation", "model_discovery"):
+        safe["request_phase"] = policy["request_phase"]
+    name = policy.get("json_schema_name")
+    if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+        safe["json_schema_name"] = name
+    checksum = policy.get("json_schema_sha256")
+    if isinstance(checksum, str) and re.fullmatch(r"[0-9a-f]{64}", checksum):
+        safe["json_schema_sha256"] = checksum
+    if policy.get("json_schema_hash_format") == "sorted_compact_ascii_json_v1":
+        safe["json_schema_hash_format"] = policy["json_schema_hash_format"]
     response_format = policy.get("response_format")
-    if isinstance(response_format, dict) and response_format.get("type") == "json_object":
-        safe["response_format"] = {"type": "json_object"}
+    if isinstance(response_format, dict) and response_format.get("type") in ("json_object", "json_schema"):
+        safe["response_format"] = {"type": response_format["type"]}
     return safe
 
 

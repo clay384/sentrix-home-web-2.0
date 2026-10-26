@@ -81,7 +81,7 @@ class ServedModel:
         self.native_output_budget = native_output_budget
         if json_private_content and (not json_streaming or json_evidence_dir is None):
             raise ValueError("private JSON evidence requires streaming and a local evidence directory")
-        if json_output_mode not in {"json_object", "prompt_only"}:
+        if json_output_mode not in {"json_object", "prompt_only", "json_schema"}:
             raise ValueError("unknown JSON output mode")
         self.json_output_mode = json_output_mode
         self.json_streaming = json_streaming

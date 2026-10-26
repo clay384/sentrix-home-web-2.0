@@ -37,6 +37,7 @@ USAGE = b'data: {"choices":[],"usage":{"prompt_tokens":17,"completion_tokens":29
 def server() -> Iterator[Any]:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
+            state.gets += 1
             body = b'{"data":[{"id":"test-vlm"}]}'
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
@@ -47,7 +48,12 @@ def server() -> Iterator[Any]:
             state.posts.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
             state.request_ids.append(self.headers.get("X-Request-Id"))
             if state.json_response is not None:
-                payload = json.dumps(state.json_response).encode()
+                response = (
+                    state.json_response.pop(0)
+                    if isinstance(state.json_response, list)
+                    else state.json_response
+                )
+                payload = json.dumps(response).encode()
                 self.send_response(state.status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
@@ -86,6 +92,7 @@ def server() -> Iterator[Any]:
 
     state = State()
     state.posts, state.request_ids = [], []
+    state.gets = 0
     state.status, state.endless, state.silent = 200, False, False
     state.json_response = None
     state.chunks = [event('{"caption":"ok"}'), event(finish="stop"), USAGE, DONE]
@@ -111,6 +118,8 @@ def call(
     timeout: float = 2.0,
     streamed: bool = True,
     mode: str = "json_object",
+    output_schema: dict[str, Any] | None = None,
+    schema_name: str | None = None,
 ) -> Any:
     model = ServedModel(
         server.url,
@@ -122,7 +131,15 @@ def call(
         json_private_content=private,
     )
     image = "data:image/jpeg;base64," + base64.b64encode(b"secret-image").decode()
-    return chat_json(server.url + "/chat/completions", model, "private-prompt", image, timeout)
+    return chat_json(
+        server.url + "/chat/completions",
+        model,
+        "private-prompt",
+        image,
+        timeout,
+        output_schema=output_schema,
+        schema_name=schema_name,
+    )
 
 
 def status_rows(tmp_path: Path) -> list[dict[str, Any]]:
@@ -528,3 +545,243 @@ def test_generation_identity_whitelist_never_copies_private_or_malformed_values(
     )
     assert malformed_template["generation_parameters_invalid"] == ["chat_template_kwargs.enable_thinking"]
     assert "private-thinking" not in json.dumps(malformed_template)
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+def test_schema_wire_policy_and_stream_identity_are_actual_and_safe(server, tmp_path, streamed):
+    from sentrix.infrastructure.media.json_output_contracts import INSPECTION_SCHEMA, schema_identity
+
+    result = {"observation": "看到帽子", "certainty": "supported", "target_face_id": ""}
+    server.chunks = [event(json.dumps(result)), event(finish="stop"), USAGE, DONE]
+    if not streamed:
+        server.json_response = {
+            "choices": [{"message": {"content": json.dumps(result)}, "finish_reason": "stop"}]
+        }
+    assert (
+        call(
+            server,
+            tmp_path,
+            streamed=streamed,
+            mode="json_schema",
+            output_schema=INSPECTION_SCHEMA,
+            schema_name="sentrix_photo_inspection_v1",
+        )
+        == result
+    )
+    body = server.posts[0]
+    assert len(server.posts) == 1 and server.gets == 1
+    assert body["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "sentrix_photo_inspection_v1", "schema": INSPECTION_SCHEMA, "strict": True},
+    }
+    assert body["presence_penalty"] == 1.5 and body["seed"] == 42
+    assert "max_tokens" not in body and "max_completion_tokens" not in body
+    if streamed:
+        identity = schema_identity("sentrix_photo_inspection_v1", INSPECTION_SCHEMA)
+        for row in status_rows(tmp_path):
+            assert row["json_output_mode"] == "json_schema"
+            assert all(row[key] == value for key, value in identity.items())
+            assert "schema" not in row and "response_format" not in row
+
+
+@pytest.mark.parametrize(
+    "schema,name",
+    [
+        (None, "missing_v1"),
+        ({"type": "object"}, None),
+        ({"type": "object", "$ref": "https://private.test"}, "unsupported_v1"),
+    ],
+)
+def test_schema_configuration_error_precedes_discovery_and_post(server, tmp_path, schema, name):
+    with pytest.raises(ModelServiceError) as caught:
+        call(server, tmp_path, mode="json_schema", output_schema=schema, schema_name=name)
+    assert caught.value.error_code == "request_configuration_invalid"
+    assert caught.value.request_policy["request_outcome_unknown"] is False
+    assert server.gets == 0 and server.posts == []
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+def test_unsupported_schema_provider_does_not_fallback_or_replay(server, tmp_path, streamed):
+    from sentrix.infrastructure.media.json_output_contracts import INSPECTION_SCHEMA
+
+    server.status = 400
+    if not streamed:
+        server.json_response = {"error": "PRIVATE_PROVIDER_BODY"}
+    with pytest.raises(ModelServiceError) as caught:
+        call(
+            server,
+            tmp_path,
+            streamed=streamed,
+            mode="json_schema",
+            output_schema=INSPECTION_SCHEMA,
+            schema_name="inspection_v1",
+        )
+    error = caught.value
+    assert error.error_code == "provider_rejected"
+    assert error.request_policy["json_output_mode"] == "json_schema"
+    assert error.request_policy["json_schema_name"] == "inspection_v1"
+    assert "schema" not in error.request_policy["response_format"]
+    assert len(server.posts) == 1 and "PRIVATE" not in str(error)
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+def test_complete_json_that_violates_explicit_business_schema_is_known_output_error(
+    server, tmp_path, streamed
+):
+    from sentrix.infrastructure.media.json_output_contracts import INSPECTION_SCHEMA
+
+    server.chunks = [event('{"caption":"wrong-business-shape"}'), event(finish="stop"), USAGE, DONE]
+    if not streamed:
+        server.json_response = {
+            "choices": [
+                {"message": {"content": '{"caption":"wrong-business-shape"}'}, "finish_reason": "stop"}
+            ]
+        }
+    with pytest.raises(ModelServiceError) as caught:
+        call(
+            server,
+            tmp_path,
+            streamed=streamed,
+            mode="json_schema",
+            output_schema=INSPECTION_SCHEMA,
+            schema_name="inspection_v1",
+        )
+    error = caught.value
+    assert error.error_code == "model_output_invalid" and error.finish_reason == "stop"
+    assert error.request_policy["request_outcome_unknown"] is False
+    assert len(server.posts) == 1
+
+
+@pytest.mark.parametrize("business", ["observation", "portrait", "moments", "appearance", "inspection"])
+def test_each_visual_business_sends_its_own_existing_contract(server, tmp_path, business):
+    from sentrix.infrastructure.media.json_output_contracts import (
+        APPEARANCE_SCHEMA,
+        INSPECTION_SCHEMA,
+        MOMENTS_SCHEMA,
+        OBSERVATION_SCHEMA,
+        PORTRAIT_SCHEMA,
+    )
+    from sentrix.infrastructure.media.person_vision_model import OpenAIPersonVision
+    from sentrix.infrastructure.media.photo_inspector import OpenAIPhotoInspector
+    from sentrix.infrastructure.media.vlm_observer import OpenAIVlmObserver
+
+    contracts = {
+        "observation": OBSERVATION_SCHEMA,
+        "portrait": PORTRAIT_SCHEMA,
+        "moments": MOMENTS_SCHEMA,
+        "appearance": APPEARANCE_SCHEMA,
+        "inspection": INSPECTION_SCHEMA,
+    }
+    outputs = {
+        "observation": {
+            "caption": "公园",
+            "activity": "活动",
+            "place": "公园",
+            "event_type": "出游",
+            "objects": [],
+            "clothing": [],
+            "ocr_text": "",
+            "facts": [],
+        },
+        "portrait": {
+            "portrait_text": "从照片看，这个人喜欢公园活动。",
+            "themes": [
+                {
+                    "title": "出游",
+                    "summary": "公园活动",
+                    "evidence_refs": [{"kind": "person_moment", "id": "one"}],
+                },
+                {
+                    "title": "陪伴",
+                    "summary": "一起活动",
+                    "evidence_refs": [{"kind": "relationship", "id": "two"}],
+                },
+            ],
+        },
+        "moments": {
+            "moments": [
+                {
+                    "label": "P1",
+                    "action_text": "活动",
+                    "interaction_labels": [],
+                    "interaction_text": "",
+                    "participation_style": "共同参与",
+                    "visible_affect": "",
+                    "social_role_cues": [],
+                    "narrative_note": "",
+                    "confidence": 0.8,
+                }
+            ]
+        },
+        "appearance": {"clothing": ["衣物"] * 14, "confidence": 0.8},
+        "inspection": {"observation": "戴了帽子", "certainty": "supported", "target_face_id": ""},
+    }
+    server.json_response = {
+        "choices": [{"message": {"content": json.dumps(outputs[business])}, "finish_reason": "stop"}]
+    }
+    image = tmp_path / "photo.jpg"
+    image.write_bytes(b"private-local-image")
+    model = ServedModel(
+        server.url,
+        json_output_mode="json_schema",
+        generation_profile="qwen35_nonthinking",
+        native_output_budget=True,
+    )
+    person = OpenAIPersonVision(server.url, model)
+    if business == "observation":
+        assert OpenAIVlmObserver(server.url, model).observe(image) is not None
+    elif business == "portrait":
+        assert person.write_person_portrait({}) is not None
+    elif business == "moments":
+        assert person.analyze_person_moments(str(image), ["P1"]) is not None
+    elif business == "appearance":
+        assert person.analyze_person_appearance(str(image)) is not None
+    else:
+        assert OpenAIPhotoInspector(server.url, model).inspect(image, "有人戴帽子吗？") is not None
+    assert len(server.posts) == 1
+    body = server.posts[0]
+    assert body["response_format"]["json_schema"]["schema"] == contracts[business]
+    assert body["presence_penalty"] == 1.5 and "max_tokens" not in body
+    assert "max_completion_tokens" not in body
+    if business != "observation":
+        assert body["response_format"]["json_schema"]["schema"] != OBSERVATION_SCHEMA
+
+
+def test_all_three_observer_stages_use_observation_contract_without_changing_prompts(server, tmp_path):
+    from sentrix.infrastructure.media.json_output_contracts import OBSERVATION_SCHEMA
+    from sentrix.infrastructure.media.vlm_observer import (
+        _CANONICAL_PROMPT,
+        _OBSERVE_PROMPT,
+        _RECOVERY_PROMPT,
+        OpenAIVlmObserver,
+    )
+
+    empty = {
+        "caption": "",
+        "activity": "",
+        "place": "",
+        "event_type": "",
+        "ocr_text": "",
+        "objects": [],
+        "clothing": [],
+        "facts": [],
+    }
+    recovery = {**empty, "caption": "English"}
+    canonical = {**empty, "caption": "中文"}
+    server.json_response = [
+        {"choices": [{"message": {"content": json.dumps(value)}, "finish_reason": "stop"}]}
+        for value in (empty, recovery, canonical)
+    ]
+    image = tmp_path / "photo.jpg"
+    image.write_bytes(b"private-image")
+    model = ServedModel(server.url, json_output_mode="json_schema", native_output_budget=True)
+    assert OpenAIVlmObserver(server.url, model).observe(image).caption == "中文"
+    assert len(server.posts) == 3
+    assert all(
+        body["response_format"]["json_schema"]["schema"] == OBSERVATION_SCHEMA for body in server.posts
+    )
+    prompts = [body["messages"][0]["content"][0]["text"] for body in server.posts]
+    assert prompts[:2] == [_OBSERVE_PROMPT, _RECOVERY_PROMPT]
+    assert prompts[2].startswith(_CANONICAL_PROMPT)
+    assert [len(body["messages"][0]["content"]) for body in server.posts] == [2, 2, 1]

@@ -1261,3 +1261,14 @@ Judge一致性v3进一步限定为明确“模型/助手的回答/答案/结论�
 保留同步 `POST /api/v1/imports`，新增可选 `operation_id` 和独立 `GET /api/v1/imports/{operation_id}/progress`。产品仅输出通用处理事实；`completed = imported + deduplicated + failed`，`total` 为实际扫描并应用 limit 后的支持媒体数，扫描前为 null。媒体计数完成后仍依次进行事件总结、参与者刷新、家庭图谱、人物画像，只有同步请求完成才终态。updated_at 是步骤更新时间，observed_at 是查询时间，不能互换。查询不会重放导入。
 
 由 domain ImportProgressStore 端口、application TrackImport 和 bootstrap 装配的有界进程内适配器实现；最多32个活跃跟踪、128条终态，重启或淘汰后404。重复在册ID409，容量不足429，均发生在副作用前。此能力不是持久作业队列，不承诺跨进程查询或取消产品执行。PhotoBench 使用运行快照中的同一客户端，每秒轮询、单次3秒超时，保存最后事实及查询故障；不盲重试导入POST。旧服务无进度时明确不可用。
+
+
+### 2026-10-27：视觉 JSON 的显式业务契约
+
+`chat_json(..., *, output_schema=None, schema_name=None)` 在 `SENTRIX_VLM_JSON_OUTPUT_MODE=json_schema` 时，使用调用方的 schema 发送 `response_format={type:json_schema,json_schema:{name,schema,strict:true}}`。默认仍为 `json_object`；`prompt_only` 仍只省略格式字段。契约配置在模型发现 GET 和生成 POST 前校验，缺失或不支持时抛 `ModelServiceError(error_code=request_configuration_invalid)`，policy 明确 `request_phase=request_validation`、`request_outcome_unknown=false`；公共错误为500/“请求配置错误”，PhotoBench独立归configuration_error，不作为回答质量0。
+
+`infrastructure/media/json_output_contracts.py` 定义五种契约：观察（初始/补全/中文化共用），人物画像，人物瞬间，人物外观，图片复核。只有原提示明确的观察 objects≤40/clothing≤12/facts≤8，以及原画像校验器的 themes 2–6/每主题至少一个引用写入数组约束；瞬间和外观不增加数量上限。画像引用kind保留既有合法person_moment/relationship，复核certainty保留supported/uncertain。保留原提示，不加字符串或token预算，不改变官方采样。契约子集仅object/array/string/number/required/additionalProperties/enum/minItems/maxItems，未知关键字不会被忽略执行；没有远程schema引用。
+
+显式schema模式沿用 `parse_json_object` 的对象提取（包括既有围栏/正文提取），对提取后的业务形状校验，不等同于原始整串 strict JSON 验收；真实协议实验仍须单独记录 strict json.loads 结果。完成的JSON若不满足同一契约则报已知 `model_output_invalid`，不修补、不截断、不自动降级或重发；默认两模式的合法空对象处理保持原样。实际请求的 `json_schema_name/json_schema_sha256/json_schema_hash_format` 进入安全policy与全部SSE状态；指纹采用排序键、紧凑ASCII JSON，原schema内容不进入日志。派发后的传输未完成仍按unknown处理。
+
+未来使用schema新建库，应在该库producer_sources中加入契约模块实际源码哈希，并绑定本次生成模式及实际schema指纹。已经由json_object生产的v2快照按其原冻结producer identity验证；查询侧改用schema不能强迫旧清单补字段或使原库失效。本接口不修改快照格式、既有清单或原生上下文。
