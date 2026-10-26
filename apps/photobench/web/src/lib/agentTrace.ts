@@ -85,6 +85,10 @@ export function debugCallForCall(item: unknown, call: unknown): Dict | null {
  */
 export function debugCallForStep(turn: unknown, step: unknown): Dict | null {
   const s = dict(step);
+  // 两个来源：PhotoBench 投影过的 `debug_trace`（字段在顶层）与主 API 的原始
+  // `trace` 事件（字段在 `payload` 里）。同一个函数要同时认，否则「运行时事件」
+  // 清单里的步骤会挂不到模型调用上。
+  const payload = dict(s.payload);
   const calls = turnDebugCalls(turn);
   if (!calls.length) return null;
   const type = String(s.type || s.kind || "");
@@ -93,7 +97,7 @@ export function debugCallForStep(turn: unknown, step: unknown): Dict | null {
     return planners[planners.length - 1] ?? null;
   }
   if (type === "model_action") {
-    const stepId = String(s.parent_step_id || "");
+    const stepId = String(s.parent_step_id ?? payload.parent_step_id ?? "");
     return (
       calls.find(
         (call) => String(call.call_type) === "agent" && String(call.step_id || "") === stepId,
@@ -101,7 +105,7 @@ export function debugCallForStep(turn: unknown, step: unknown): Dict | null {
     );
   }
   if (type === "judge") {
-    const callId = String(s.call_id || "");
+    const callId = String(s.call_id ?? payload.call_id ?? "");
     return (
       calls.find(
         (call) =>
