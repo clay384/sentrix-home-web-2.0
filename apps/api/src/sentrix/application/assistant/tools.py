@@ -37,6 +37,7 @@ from typing import Any
 from sentrix.application.assistant.query_memory_facts import QueryMemoryFacts
 from sentrix.application.retrieval.retrieve_evidence import EvidenceRequest, RetrieveEvidence
 from sentrix.application.retrieval.retrieve_graph import graph_direction, graph_intent
+from sentrix.domain.assistant.evidence_binding import fact_value_type
 from sentrix.domain.assistant.evidence_ledger import EvidenceType
 from sentrix.domain.assistant.models import Attachment
 from sentrix.domain.assistant.ports import PersonDirectory, ResultSetRepository
@@ -239,16 +240,44 @@ class AssistantToolbox:
         )
         if isinstance(answer, FactRejection):
             return ToolOutcome(
-                observation={"status": answer.status, "reason": answer.reason},
+                observation={
+                    "status": answer.status,
+                    "reason": answer.reason,
+                    "filters_applied": {},
+                    "filters_not_applied": [],
+                },
                 model_visible={"status": answer.status, "reason": answer.reason},
                 failure_reason=answer.reason,
             )
+        raw_filters = arguments.get("filters")
+        requested = (
+            {
+                str(key): str(value)
+                for key, value in raw_filters.items()
+                if key in {"time", "media", "place", "person"} and str(value or "").strip()
+            }
+            if isinstance(raw_filters, Mapping)
+            else {}
+        )
+        applied = dict(answer.filters_applied)
+        not_applied = sorted(key for key in requested if key not in applied)
+        value_type = fact_value_type(answer.fact_type)
         return ToolOutcome(
             observation={
                 "fact_type": answer.fact_type,
+                # **把「这个工具实际产出的是什么值类型」写在观察里。** 绑定器读它，
+                # 轨迹也读它；少了这一格，``asset_count`` 与「婚宴花了多少钱」在
+                # 观察层就没有区别。
+                "value_type": value_type.value if value_type else "",
                 "value": answer.value,
                 "total": answer.total,
-                "filters_applied": dict(answer.filters_applied),
+                "filters_applied": applied,
+                "filters_requested": requested,
+                # 参数里有、实际没应用：不能当已应用。时间表达式解析失败就是这条，
+                # 静默忽略会把「2017 年那场婚礼」的统计退化成整个相册。
+                "filters_not_applied": not_applied,
+                "coverage": dict(answer.coverage),
+                "confidence": 1.0,
             },
             model_visible=answer.visible(),
         )
@@ -470,18 +499,47 @@ class AssistantToolbox:
 
     # ---- 交付（终止动作上的一个字段）-----------------------------------------
 
-    def deliver(self, result_set_id: str, handles: Sequence[Any], *, scope_id: str) -> ToolOutcome:
+    def deliver(
+        self,
+        result_set_id: str,
+        handles: Sequence[Any],
+        *,
+        scope_id: str,
+        fallback_result_set_ids: Sequence[str] = (),
+    ) -> ToolOutcome:
         """把终止动作里的 ``selected_image_handles`` 解成可打开的附件。
 
         **它不是一次工具调用**：调用方是 ``run_turn`` 的收尾分支，交付与作答在同一步里
         完成（1.0 ``runtime.py:309`` 的 ``final`` 动作字段）。走 ``execute()`` 那条路
         等于把它重新变成一次独立的工具调用——那正是这一版要修掉的东西。
+
+        ``fallback_result_set_ids`` 是本轮更早的结果集。模型可能先检索 A、再检索 B，
+        最后交付 A 里的 handle；只认 ``current_result_set_id`` 会把这种正确交付判成
+        ``unknown_result_set``（实测 41 次）。按顺序尝试，第一个存在且 scope 匹配的胜出。
         """
-        result_set = self._result_sets.get(result_set_id)
+        candidates = [result_set_id, *fallback_result_set_ids]
+        result_set = None
+        for candidate in candidates:
+            if not candidate:
+                continue
+            found = self._result_sets.get(candidate)
+            if found is not None and found.scope_id == scope_id:
+                result_set = found
+                break
         if result_set is None:
+            # **空交付在没有结果集时是合法的。** 模型明确回答「这轮不交图」，
+            # 不该因为一次检索都没做就变成 unknown_result_set。
+            if not handles:
+                return ToolOutcome(
+                    observation={"result_set_id": "", "delivered": 0, "rejected": []},
+                    model_visible={
+                        "result_set_id": "",
+                        "delivered": 0,
+                        "rejected": [],
+                        "note": "这一轮没有要展示给用户的照片。",
+                    },
+                )
             return _failure("unknown_result_set", "结果集不存在。请先调用 search_memories。")
-        if result_set.scope_id != scope_id:
-            return _failure("scope_mismatch", "这个结果集不属于当前相册。")
 
         raw_handles = handles
         if not isinstance(raw_handles, (list, tuple)):

@@ -41,9 +41,11 @@ from sentrix.domain.assistant.intent import (
     correction_hint,
     history_prompt_suffix,
     parse_declaration,
+    planner_chat_template_kwargs,
+    planner_response_format,
 )
 from sentrix.domain.assistant.models import ChatMessage, ChatRole
-from sentrix.domain.assistant.ports import ChatModel, ModelServiceError
+from sentrix.domain.assistant.ports import ChatModel, ModelServiceError, StructuredChatModel
 
 log = logging.getLogger("sentrix.assistant.goal_planner")
 
@@ -128,7 +130,16 @@ class GoalPlanner:
                 }
             try:
                 # 规划不带工具：它要的是一段 JSON 声明，不是一次工具往返。
-                reply = self._model.complete(messages, ())
+                # 端点支持时用 JSON Schema 约束解码；不支持的 fake/后端走原路径。
+                if isinstance(self._model, StructuredChatModel):
+                    reply = self._model.complete_structured(
+                        messages,
+                        (),
+                        response_format=planner_response_format(),
+                        chat_template_kwargs=planner_chat_template_kwargs(),
+                    )
+                else:
+                    reply = self._model.complete(messages, ())
                 call.update(
                     status="complete",
                     prompt_tokens=reply.prompt_tokens,

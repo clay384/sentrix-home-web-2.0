@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from sentrix.domain.assistant.models import (
     Attachment,
@@ -79,6 +79,25 @@ class ChatModel(Protocol):
     """
 
     def complete(self, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> ModelReply: ...
+
+
+@runtime_checkable
+class StructuredChatModel(Protocol):
+    """**可选**能力：用 JSON Schema 约束解码。
+
+    单独成一个端口，而不是给 ``ChatModel.complete`` 加参数：测试里十几个 fake 只实现
+    ``complete``，加必填参数会把它们全部改成样板代码；规划器按 ``isinstance`` 探测，
+    探测不到就退回普通 ``complete``，行为与今天完全一致。
+    """
+
+    def complete_structured(
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec],
+        *,
+        response_format: Mapping[str, Any],
+        chat_template_kwargs: Mapping[str, Any] | None = None,
+    ) -> ModelReply: ...
 
 
 class ConversationRepository(Protocol):

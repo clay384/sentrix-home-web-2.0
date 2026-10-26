@@ -81,6 +81,30 @@ class RequirementStatus(StrEnum):
     BLOCKED = "blocked"
 
 
+class RequirementValueType(StrEnum):
+    """用户最终想要的值，而不是「用哪类证据回答」。
+
+    ``EvidenceType`` 回答的是「去哪个工具取材料」，``RequirementValueType`` 回答的是
+    「答案本身是什么形态」。两者分开之后，``photo_set`` 里翻到 95 张候选不能自动等于
+    「婚宴花了多少钱」——金额要么由 ``structured_fact`` 给出，要么如实标成 unsupported。
+    """
+
+    PLACE = "place"
+    TIME = "time"
+    DURATION = "duration"
+    AMOUNT = "amount"
+    COUNT = "count"
+    PERSON = "person"
+    MEDIA_SET = "media_set"
+    DESCRIPTION = "description"
+    BOOLEAN = "boolean"
+    VALUE = "value"
+
+
+#: scope 只允许这四个键；时间/地点/人物是限定条件，不是需求本身。
+REQUIREMENT_SCOPE_KEYS = frozenset({"event", "time", "place", "person"})
+
+
 @dataclass
 class EvidenceRequirement:
     id: str
@@ -90,6 +114,12 @@ class EvidenceRequirement:
     status: RequirementStatus = RequirementStatus.OPEN
     satisfied_by: tuple[str, ...] = ()
     unmet_reason: str = ""
+    #: 规划器输出的结构化绑定字段。旧形状（没有这三格）仍然合法：
+    #: ``value_type`` 为 ``None`` 表示「这条需求没有声明答案形态」，
+    #: 绑定器会退化成只按 evidence_type 判定，不假装它满足任何具体值类型。
+    predicate: str = ""
+    value_type: RequirementValueType | None = None
+    scope: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -190,6 +220,9 @@ class EvidenceLedger:
                 "status": item.status.value,
                 "satisfied_by": list(item.satisfied_by),
                 "unmet_reason": item.unmet_reason,
+                "predicate": item.predicate,
+                "value_type": item.value_type.value if item.value_type else "",
+                "scope": dict(item.scope),
             }
             for item in self.requirements
         )

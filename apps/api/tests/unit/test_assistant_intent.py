@@ -30,13 +30,28 @@ from sentrix.domain.assistant.models import ChatMessage, ModelReply
 SCOPE = "album_cbfbfce14789"
 
 
-def declaration(*evidence_types: str, goal: str = "找海边的照片", scope: str | None = None) -> str:
+def declaration(
+    *evidence_types: str,
+    goal: str = "找海边的照片",
+    scope: str | None = None,
+    value_type: str = "media_set",
+    required: object = True,
+    scope_body: dict | None = None,
+) -> str:
     payload: dict = {
         "action": "declare",
         "declaration": {
             "goal": goal,
             "requirements": [
-                {"id": f"req_{index + 1}", "evidence_type": item, "description": f"需要 {item}"}
+                {
+                    "id": f"req_{index + 1}",
+                    "evidence_type": item,
+                    "description": f"需要 {item}",
+                    "predicate": "check",
+                    "value_type": value_type,
+                    "scope": scope_body or {},
+                    "required": required,
+                }
                 for index, item in enumerate(evidence_types)
             ],
         },
@@ -100,6 +115,16 @@ def test_delivered_photo_is_declared_by_default_for_real_album_questions():
     assert "普通聊天" in prompt
 
 
+def test_the_prompt_declares_the_value_type_contract():
+    prompt = build_prompt()
+
+    for value_type in ("place", "time", "duration", "amount", "count", "person", "media_set", "description", "boolean", "value"):
+        assert value_type in prompt
+    assert "scope" in prompt
+    assert "required" in prompt
+    assert "哪几类" in prompt
+
+
 def test_the_prompt_never_shows_a_real_scope_id():
     """1.0 的教训：示例里出现真实 scope_id 会被小模型整段照抄，抄错一位就 scope_mismatch。"""
     assert SCOPE not in build_prompt()
@@ -115,6 +140,8 @@ def test_each_failure_reason_has_its_own_correction_hint():
     assert "scope_id" in correction_hint("scope_mismatch")
     assert "完整闭合" in correction_hint("invalid_planner_action")
     assert "至少要声明一条" in correction_hint("no_requirements")
+    assert "value_type" in correction_hint("invalid_requirement")
+    assert "required" in correction_hint("invalid_requirement")
     # 认不出来的原因也要给一句通用的修正指令，不能返回空串。
     assert correction_hint("something_else").startswith("你上一次的输出无法被解析")
 
@@ -146,6 +173,15 @@ def test_more_than_one_missing_brace_is_not_repaired():
     """只在「根括号正好差一个」时补——乱补会把坏输出修成一个看似合法的错输出。"""
     with pytest.raises(ValueError):
         parse_json('{"action":"declare","declaration":{"goal":"g"')
+
+
+def test_trailing_think_tag_and_a_duplicate_object_take_the_first():
+    """2026-10-26 实测：模型会在 ``</think>`` 后再重复一个 JSON。"""
+    first = '{"action":"declare","declaration":{"goal":"g","requirements":[]}}'
+    assert parse_json(first + " </think> " + first) == {
+        "action": "declare",
+        "declaration": {"goal": "g", "requirements": []},
+    }
 
 
 def test_root_brace_balance_ignores_braces_inside_strings():
@@ -245,6 +281,36 @@ def test_a_missing_scope_is_not_a_mismatch():
     assert requirements is not None
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    (
+        ({"value_type": "event"}, "invalid_requirement"),
+        ({"required": None}, "invalid_requirement"),
+        ({"scope_body": {"country": "中国"}}, "invalid_requirement"),
+        ({"scope_body": {"place": "<地点>"}}, "invalid_requirement"),
+        ({"scope_body": {"time": "未知"}}, "invalid_requirement"),
+    ),
+)
+def test_invalid_structured_requirement_is_rejected(kwargs: dict, expected: str):
+    assert parse_declaration(
+        declaration("photo_set", **kwargs), scope_id=SCOPE, question="问题"
+    ) == (None, expected)
+
+
+def test_structured_fields_are_preserved_on_the_requirement():
+    raw = declaration("photo_set", value_type="place", scope_body={"place": "宜昌"})
+
+    requirements, reason = parse_declaration(raw, scope_id=SCOPE, question="问题")
+
+    assert reason == ""
+    assert requirements is not None
+    item = requirements[0]
+    assert item.predicate == "check"
+    assert item.value_type.value == "place"
+    assert dict(item.scope) == {"place": "宜昌"}
+    assert item.required is True
+
+
 def test_garbage_is_an_invalid_planner_action():
     assert parse_declaration("我不知道该怎么规划。", scope_id=SCOPE, question="问题") == (
         None,
@@ -285,6 +351,50 @@ class ScriptedPlannerModel:
         if isinstance(reply, Exception):
             raise reply
         return ModelReply(content=reply, finish_reason="stop")
+
+
+class StructuredPlannerModel:
+    """实现可选的结构化能力；规划器应优先走它。"""
+
+    def __init__(self, reply: str) -> None:
+        self.reply = reply
+        self.calls: list[dict[str, object]] = []
+
+    def complete(self, messages: Sequence[ChatMessage], tools: Sequence[object]) -> ModelReply:
+        raise AssertionError("有结构化能力时不应退回普通 complete")
+
+    def complete_structured(
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[object],
+        *,
+        response_format: dict,
+        chat_template_kwargs: dict | None = None,
+    ) -> ModelReply:
+        self.calls.append(
+            {
+                "messages": list(messages),
+                "tools": tuple(tools),
+                "response_format": response_format,
+                "chat_template_kwargs": chat_template_kwargs,
+            }
+        )
+        return ModelReply(content=self.reply, finish_reason="stop")
+
+
+def test_planner_uses_structured_completion_when_available():
+    model = StructuredPlannerModel(declaration("photo_set"))
+
+    result = GoalPlanner(model).declare("给我看看海边的照片", scope_id=SCOPE)
+
+    assert result.ok
+    assert len(model.calls) == 1
+    call = model.calls[0]
+    assert call["tools"] == ()
+    response_format = call["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    assert call["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def test_a_clean_declaration_costs_exactly_one_call():
