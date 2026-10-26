@@ -396,10 +396,14 @@ def test_include_debug_puts_the_exact_model_calls_in_the_turn_trace(client: Test
     trace = body["result"]["trace"]
     assert trace["include_debug"] is True
     calls = trace["debug_calls"]
-    assert [call["call_type"] for call in calls] == ["planner", "agent"]
+    # 第一次正文收尾之后门禁会提醒一次，所以 agent 调用可能不止一条；
+    # 这里只钉住「planner 在最前、其余都是 agent、每条都有原始输入输出」。
+    assert calls[0]["call_type"] == "planner"
+    assert {call["call_type"] for call in calls[1:]} == {"agent"}
     assert calls[0]["messages"][1]["content"] == "你好"
     assert calls[1]["messages"][0]["role"] == "system"
     assert calls[1]["response"]["content"] == "你好。"
+    assert [call["seq"] for call in calls] == list(range(len(calls)))
 
 
 def test_the_debug_trace_is_empty_without_include_debug(client: TestClient):
