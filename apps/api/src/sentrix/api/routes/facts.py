@@ -13,6 +13,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 
 from sentrix.api.deps import get_container
+from sentrix.api.routes.media import refresh_memory_graph
 from sentrix.api.schemas.facts import FactListResponse, FactPayload
 from sentrix.application.memories.review_fact import ReviewFact
 from sentrix.bootstrap.container import Container
@@ -68,9 +69,13 @@ def list_facts(
 
 @router.post("/facts/{fact_id}/confirm")
 def confirm_fact(fact_id: str, container: Container = Depends(get_container)) -> FactPayload:
-    return _payload(_review_fact(container).confirm(fact_id))
+    fact = _review_fact(container).confirm(fact_id)
+    refresh_memory_graph(container, fact.scope_id)
+    return _payload(fact)
 
 
 @router.post("/facts/{fact_id}/reject")
 def reject_fact(fact_id: str, container: Container = Depends(get_container)) -> FactPayload:
-    return _payload(_review_fact(container).reject(fact_id))
+    fact = _review_fact(container).reject(fact_id)
+    refresh_memory_graph(container, fact.scope_id)
+    return _payload(fact)

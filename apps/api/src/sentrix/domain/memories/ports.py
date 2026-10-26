@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Protocol
 
-from sentrix.domain.memories.events import EventParticipantRecord, EventRecord
+from sentrix.domain.memories.causality import CausalVerdict
+from sentrix.domain.memories.events import EventEntityRecord, EventParticipantRecord, EventRecord
 from sentrix.domain.memories.facts import Fact
+from sentrix.domain.memories.graph import (
+    GraphBuildStats,
+    GraphEdge,
+    GraphExpansionHit,
+    GraphNode,
+    GraphStatus,
+)
 
 
 class EventRepository(Protocol):
@@ -191,6 +199,10 @@ class EventParticipantRepository(Protocol):
 
     def list_participants(self, event_id: str) -> Sequence[EventParticipantRecord]: ...
 
+    def list_event_entities(self, event_id: str) -> Sequence[EventEntityRecord]:
+        """读取事件的非人物实体投影，供记忆图等派生读侧使用。"""
+        ...
+
     def cooccurrence_event_count(self, left_person_id: str, right_person_id: str) -> int:
         """两人**同时**以 ``visible_subject`` 出现在同一个事件里的**事件数**。
 
@@ -241,3 +253,45 @@ class FactRepository(Protocol):
         ...
 
     def supersede_others(self, *, scope_id: str, subject: str, predicate: str, keep_fact_id: str) -> int: ...
+
+
+class MemoryGraphRepository(Protocol):
+    """记忆图的派生存储与有限遍历。
+
+    这个端口只接收已经结构化的节点/边，因此图模块不依赖关键帧抽取、VLM 观察或
+    事件归并的具体实现。图是可重建的派生投影，原始事件/观察/实体表仍然是权威来源。
+    ``expand_assets`` 在图不存在时返回空结果并由 ``status`` 报出原因，不能把图缺席
+    伪装成「检索无结果」。
+    """
+
+    def replace_scope(
+        self,
+        scope_id: str,
+        *,
+        nodes: Sequence[GraphNode],
+        edges: Sequence[GraphEdge],
+        build_revision: str,
+    ) -> GraphBuildStats: ...
+
+    def expand_assets(
+        self,
+        seed_asset_ids: Sequence[str],
+        *,
+        scope_id: str,
+        max_hops: int,
+        limit: int,
+        intent: str = "general",
+        direction: str = "",
+    ) -> Sequence[GraphExpansionHit]: ...
+
+    def status(self, scope_id: str) -> GraphStatus: ...
+
+    def quality(self, scope_id: str) -> Mapping[str, object]:
+        """返回不读取 benchmark GT 的图结构审计指标。"""
+        ...
+
+
+class CausalJudge(Protocol):
+    """对规则筛出的帧对做文本因果判定。失败必须抛异常，不能把故障当无因果边。"""
+
+    def judge(self, prompt: str, *, expected_count: int) -> Sequence[CausalVerdict]: ...

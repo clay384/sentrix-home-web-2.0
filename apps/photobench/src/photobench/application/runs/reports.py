@@ -23,13 +23,15 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Sequence
 from typing import Any
 from urllib.parse import quote
 
+from photobench.domain.datasets.ports import AlbumSource
 from photobench.domain.http.ports import JsonHttpClient
 from photobench.domain.results.ports import RunStore
-from photobench.domain.runs import exports, keyframe_analysis, memory_effectiveness
+from photobench.domain.runs import exports, graph_quality, keyframe_analysis, memory_effectiveness
 
 #: 2.0 的 REST 前缀。1.0 是 ``/api``。
 API_PREFIX = "/api/v1"
@@ -62,10 +64,12 @@ class RunReports:
         store: RunStore,
         http: JsonHttpClient,
         sentrix_url: Callable[[], str],
+        albums: AlbumSource | None = None,
     ) -> None:
         self._store = store
         self._http = http
         self._sentrix_url = sentrix_url
+        self._albums = albums
 
     def _base(self) -> str:
         return self._sentrix_url().rstrip("/")
@@ -148,6 +152,80 @@ class RunReports:
             fetched, _ = self._assets(scope_id)
             assets = fetched or []
         return memory_effectiveness.memory_effectiveness(state, assets)
+
+    def _graph_snapshot(self, scope_id: str) -> dict[str, Any]:
+        try:
+            payload = self._http.request_json(
+                f"{self._base()}{API_PREFIX}/memory-graph/quality?scope_id={_quote(scope_id)}",
+                method="GET",
+                timeout=60,
+            )
+        except Exception as exc:  # noqa: BLE001 - 图诊断不应让整页 500
+            return {"available": False, "reason": str(exc)}
+        return (
+            dict(payload) if isinstance(payload, dict) else {"available": False, "reason": "invalid response"}
+        )
+
+    def _face_clusters(self, scope_id: str) -> list[dict[str, Any]]:
+        try:
+            payload = self._http.request_json(
+                f"{self._base()}{API_PREFIX}/face-clusters?scope_id={_quote(scope_id)}&include_all_samples=true",
+                method="GET",
+                timeout=60,
+            )
+        except Exception:
+            return []
+        clusters = payload.get("clusters") if isinstance(payload, dict) else None
+        return [dict(cluster) for cluster in (clusters or []) if isinstance(cluster, dict)]
+
+    def _identity_truth(self, album_id: str) -> dict[str, list[str]] | None:
+        """读取 benchmark sidecar；生产 API 永远看不到这份 GT。"""
+
+        if self._albums is None or not album_id:
+            return None
+        for relative in ("identity/face_info_cn.json", "faceid/face_info_cn.json", "face_info_cn.json"):
+            try:
+                value = json.loads(self._albums.read_file(album_id, relative).decode("utf-8"))
+            except (KeyError, OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                continue
+            raw = value.get("image_to_face_ids") if isinstance(value, dict) else None
+            if not isinstance(raw, dict):
+                continue
+            return {
+                str(name): [str(identity) for identity in labels]
+                for name, labels in raw.items()
+                if isinstance(labels, list)
+            }
+        return None
+
+    def graph_quality(self, run_id: str) -> dict[str, Any]:
+        """1.0 图效果面板的 2.0 HTTP-only 读侧。"""
+
+        state = self._state(run_id)
+        scope_id = str(state.get("scope_id") or "").strip()
+        items = [item for item in (state.get("items") or []) if isinstance(item, dict)]
+        report: dict[str, Any] = {
+            "status": "available" if scope_id else "unavailable",
+            "run_id": run_id,
+            "scope_id": scope_id,
+            "graph": self._graph_snapshot(scope_id)
+            if scope_id
+            else {"available": False, "reason": "scope_missing"},
+            "face_clustering": {"available": False, "reason": "scope_missing"},
+            "graph_qa_by_type": graph_quality.aggregate_graph_qa_by_type(items),
+        }
+        if scope_id:
+            truth = self._identity_truth(str(state.get("album_id") or ""))
+            assets, _ = self._assets(scope_id)
+            asset_names = (
+                {str(asset.get("file_name") or "") for asset in assets if asset.get("file_name")}
+                if assets is not None
+                else None
+            )
+            report["face_clustering"] = graph_quality.face_clustering_quality(
+                self._face_clusters(scope_id), truth, asset_names=asset_names
+            )
+        return report
 
     def export_traces(
         self, run_id: str, *, scores: Sequence[int] | None = None, min_score: int | None = None

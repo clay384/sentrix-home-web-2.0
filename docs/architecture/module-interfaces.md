@@ -290,6 +290,8 @@ make lint format-check typecheck arch photobench-check check-docs coverage
 | `EventRepository` | `domain/memories/ports.py:13` | 15 | `SqliteEventRepository` |
 | `EventParticipantRepository` | `:135` | 5 | `SqliteEventParticipantRepository` |
 | `FactRepository` | `:219` | 8 | `SqliteFactRepository` |
+| `MemoryGraphRepository` | `domain/memories/ports.py` | 4 | `SqliteMemoryGraphRepository` |
+| `CausalJudge` | `domain/memories/ports.py` | `judge(prompt, expected_count)` | `OpenAICausalJudge`（8100 文本判定，失败抛异常） |
 | `FaceDetector` | `domain/identity/ports.py:55` | `detect` / `detect_identity_photo` | `FaceAdapter` |
 | `FaceEnroller` | `:88` | `prepare/commit` | `EnrollFaces`（application） |
 | `FaceRepository` | `:105` | 28 | `SqliteFaceRepository` |
@@ -317,6 +319,16 @@ make lint format-check typecheck arch photobench-check check-docs coverage
 | `VideoRepository.cleanup_derivatives` | 先删随行，再删主行 |
 | `VectorRepository.update_metadata` | 整份替换，避免并发写入互相覆盖 |
 | `FaceEnroller.commit` | 匹配建簇必须在 commit 内完成（要读同批刚写的簇） |
+
+**结构化记忆图的独立接入约束**
+
+- 记忆生成只用 2.0 原有流水线。`BuildMemoryGraph` 消费 `AssetRepository`、`ObservationRepository`、`EventRepository`、参与者、实体、事实、关系及权威 `VectorRepository` 端口；不读取关键帧文件、Qdrant payload 或旧版 `backend` 存储。视觉近邻只比较同一模型/维度的向量，top-3 互选且余弦 ≥0.80。
+- 关键帧时序、同视频对象/关系边（高频阈值 30 转枢纽；关系窗口 60 秒）和地点/日期上下文边来自标准来源字段。因果/视觉推断边不算进确定性“可验边”的参考集；参考边须由节点来源字段独立重建，不能从已落库的边复制。无人工边 GT 时 P/R/F1 只能叫 source-consistency，不能叫真实图准确率。
+- 因果候选只从同一源视频的关键帧观察产生：最多后继 2 帧、30 秒；规则要求稳定场景和关系变化，文本判定器只接收结构信号，不接图片。当前 Observation 无 bbox 时按 hpq 的 label-only 回退，不得把时间邻接当成因果边。
+- `CausalJudge` 通过独立端口装配，共用 8100 的模型名探测与超时；失败抛异常，图构建用例保留其它派生边并报告 `causal_status=degraded`。`LEADS_TO` / `ENABLES` 带置信度、理由、推断来源；检索只使用置信度 ≥0.60 的边，默认沿因到果，明确询问原因时可逆向追溯，但不得把逆向遍历描述为“结果导致原因”。
+- 图是 SQLite 中的可重建派生投影，按 `scope_id` 原子替换；权威记忆仍在标准记忆表里，图构建失败不得阻断导入主链路。
+- `RetrieveGraph` 是独立的 `graph` 拓展通道：先用 primary 召回结果作种子，再按 object/action/temporal/scene/causal/multi-hop 意图做最多 4 hop 的有界遍历；明确的“之前/之后”问句决定时序方向，“为什么”可沿因果边反查原因。没有明确 scope 或图尚未构建时必须在 channel trace 中显式降级。
+- 冻结的 `adjacency` 通道不被重新启用；`graph` 只在应用层覆盖新能力的 0.5 权重，不修改 `DEFAULT_CHANNEL_WEIGHTS` 行为基线。
 
 ### 3.7 PhotoBench
 

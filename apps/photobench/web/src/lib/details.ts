@@ -232,6 +232,7 @@ export function phaseSummary(key: string, phase: unknown, itemCount: unknown = n
     // 不拆的话 64 分钟全叫「导入」，读起来像复制文件花了 64 分钟。
     const timings = dict(p.timings);
     const parts: string[] = [];
+    if (timings.asset_import != null) parts.push(`资产落库 ${fmtSeconds(timings.asset_import)}`);
     if (timings.prepare != null) parts.push(`观察 ${fmtSeconds(timings.prepare)}`);
     if (timings.finish != null) parts.push(`归属 ${fmtSeconds(timings.finish)}`);
     if (timings.summarize != null) parts.push(`总结 ${fmtSeconds(timings.summarize)}`);
@@ -261,7 +262,13 @@ export function phaseSummary(key: string, phase: unknown, itemCount: unknown = n
   }
   if (key === "pipeline_processing" && p.progress) {
     const progress = dict(p.progress);
-    return `${progress.processed || 0}/${progress.total || 0} 资产完成 · ${progress.failed || 0} 失败 · ${progress.skipped || 0} 跳过 · 阶段墙钟 ${fmtSeconds(phaseSeconds(phase))}`;
+    const timings = dict(p.timings);
+    const parts: string[] = [];
+    if (timings.video_keyframe_extraction != null) parts.push(`关键帧 ${fmtSeconds(timings.video_keyframe_extraction)}`);
+    if (timings.video_keyframe_memory != null) parts.push(`帧记忆 ${fmtSeconds(timings.video_keyframe_memory)}`);
+    if (timings.memory_graph != null) parts.push(`图构建 ${fmtSeconds(timings.memory_graph)}`);
+    const breakdown = parts.length ? ` · ${parts.join(" · ")}` : "";
+    return `${progress.processed || 0}/${progress.total || 0} 资产完成 · ${progress.failed || 0} 失败 · ${progress.skipped || 0} 跳过 · 阶段墙钟 ${fmtSeconds(phaseSeconds(phase))}${breakdown}`;
   }
   if (key === "qa_eval") {
     const progress = p.progress;
@@ -336,6 +343,7 @@ export function pipelineMetricRows(phase: Phase = {}): MetricRow[] {
   const p = dict(phase);
   const metrics = dict(p.pipeline_metrics);
   const timings = dict(metrics.stage_timings);
+  const pipelineTimings = dict(p.timings);
   const imageCount = Number(metrics.image_count);
   const wallSeconds = phaseSeconds(phase);
   const hasImageCount = Number.isFinite(imageCount) && imageCount > 0;
@@ -357,7 +365,23 @@ export function pipelineMetricRows(phase: Phase = {}): MetricRow[] {
       `${v.count ?? "-"} 次调用累计 ${fmtSeconds(v.sum_seconds)} · P95 ${fmtSeconds(v.p95_seconds)}；并发调用可使累计耗时大于阶段墙钟`,
     ];
   };
-  return ([
+  const explicitTimingRows = (
+    [
+      ["源媒体模型准备", "source_memory_prepare", "并发 worker 累计耗时"],
+      ["源媒体记忆提交", "source_memory_commit", "按目录顺序串行提交"],
+      ["关键帧提取", "video_keyframe_extraction", "ffmpeg 抽帧墙钟累计"],
+      ["关键帧记忆构建", "video_keyframe_memory", "VLM/OCR/人脸/实体/事实累计"],
+      ["事件总结", "event_summarize", "批末事件摘要"],
+      ["参与者投影", "participant_projection", "已确认身份投影到事件"],
+      ["记忆图构建", "memory_graph", "结构化图节点与边重建"],
+      ["因果边判定", "causal_graph", "规则信号筛选与文本模型因果判定；包含在记忆图构建耗时内"],
+      ["家庭图谱", "family_graph", "家庭关系推断"],
+      ["人物画像", "person_insights", "人物画像收尾"],
+    ] as Array<[string, string, string]>
+  )
+    .filter(([, key]) => pipelineTimings[key] != null)
+    .map(([label, key, note]) => [label, fmtSeconds(pipelineTimings[key]), note] as MetricRow);
+  const legacyRows = ([
     [
       "评测图片墙钟均值",
       averageWallSeconds == null ? "未记录" : fmtSeconds(averageWallSeconds),
@@ -382,4 +406,5 @@ export function pipelineMetricRows(phase: Phase = {}): MetricRow[] {
     row("event_clustering_seconds", "事件聚类"),
     row("text_embedding_seconds", "文本 embedding"),
   ] as Array<MetricRow | null>).filter((r): r is MetricRow => r !== null);
+  return [...explicitTimingRows, ...legacyRows];
 }

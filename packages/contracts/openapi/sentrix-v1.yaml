@@ -620,6 +620,36 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/memory-graph/quality:
+    get:
+      tags:
+      - diagnostics
+      summary: Memory Graph Quality
+      description: 返回当前 scope 图的结构契约审计，不读取任何 PhotoBench GT。
+      operationId: memory_graph_quality_api_v1_memory_graph_quality_get
+      parameters:
+      - name: scope_id
+        in: query
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          title: Scope Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Memory Graph Quality Api V1 Memory Graph Quality Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/timeline:
     get:
       tags:
@@ -766,6 +796,61 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ImportProgressResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/imports/assets:
+    post:
+      tags:
+      - timeline
+      summary: Import Album Assets
+      description: '仅导入媒体资产；重活统一留给 ``POST /pipeline/process``。
+
+
+        这是新增兼容接口，既有 ``POST /imports`` 仍保留完整同步链，避免破坏产品端调用方。'
+      operationId: import_album_assets_api_v1_imports_assets_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportBatchRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetImportBatchResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/pipeline/process:
+    post:
+      tags:
+      - timeline
+      summary: Process Album Pipeline
+      description: 同步执行关键帧、记忆构建和图构建，并返回逐阶段耗时。
+      operationId: process_album_pipeline_api_v1_pipeline_process_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PipelineProcessRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineProcessResponse'
         '422':
           description: Validation Error
           content:
@@ -922,6 +1007,13 @@ paths:
           - type: string
           - type: 'null'
           title: Scope Id
+      - name: include_all_samples
+        in: query
+        required: false
+        schema:
+          type: boolean
+          default: false
+          title: Include All Samples
       responses:
         '200':
           description: Successful Response
@@ -2176,6 +2268,46 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
 components:
   schemas:
+    AssetImportBatchResponse:
+      properties:
+        scope_id:
+          type: string
+          title: Scope Id
+        directory:
+          type: string
+          title: Directory
+        imported:
+          type: integer
+          title: Imported
+        deduplicated:
+          type: integer
+          title: Deduplicated
+        asset_ids:
+          items:
+            type: string
+          type: array
+          title: Asset Ids
+        timings:
+          additionalProperties:
+            type: number
+          type: object
+          title: Timings
+          default: {}
+        failures:
+          items:
+            $ref: '#/components/schemas/ImportFailure'
+          type: array
+          title: Failures
+      type: object
+      required:
+      - scope_id
+      - directory
+      - imported
+      - deduplicated
+      - asset_ids
+      - failures
+      title: AssetImportBatchResponse
+      description: 资产导入阶段响应：只落盘/登记，不包含关键帧、记忆或图构建。
     AssetListResponse:
       properties:
         items:
@@ -3687,6 +3819,9 @@ components:
         quality:
           type: number
           title: Quality
+        validity:
+          type: string
+          title: Validity
         crop_url:
           type: string
           title: Crop Url
@@ -3700,6 +3835,7 @@ components:
       - bbox
       - detection_confidence
       - quality
+      - validity
       - crop_url
       title: FaceCropRef
       description: 簇里的一张样本脸。``crop_url`` 直接可打开，前端不再拼路径。
@@ -4755,6 +4891,63 @@ components:
         少掉的四个里 ``include_in_people`` 是有语义的，但 2.0 的 ``MemorySpace``
 
         模型就没带它——那是 S1 定下的形状，不在本次范围内。'
+    MemoryGraphBuildResponse:
+      properties:
+        scope_id:
+          type: string
+          title: Scope Id
+        node_count:
+          type: integer
+          title: Node Count
+        edge_count:
+          type: integer
+          title: Edge Count
+        causal_candidate_pairs:
+          type: integer
+          title: Causal Candidate Pairs
+          default: 0
+        causal_edges:
+          type: integer
+          title: Causal Edges
+          default: 0
+        causal_status:
+          type: string
+          title: Causal Status
+          default: not_configured
+        causal_seconds:
+          type: number
+          title: Causal Seconds
+          default: 0.0
+        keyframe_count:
+          type: integer
+          title: Keyframe Count
+          default: 0
+        keyframe_temporal_edges:
+          type: integer
+          title: Keyframe Temporal Edges
+          default: 0
+        keyframe_object_edges:
+          type: integer
+          title: Keyframe Object Edges
+          default: 0
+        keyframe_relation_edges:
+          type: integer
+          title: Keyframe Relation Edges
+          default: 0
+        keyframe_visual_edges:
+          type: integer
+          title: Keyframe Visual Edges
+          default: 0
+        keyframe_visual_status:
+          type: string
+          title: Keyframe Visual Status
+          default: no_frames
+      type: object
+      required:
+      - scope_id
+      - node_count
+      - edge_count
+      title: MemoryGraphBuildResponse
     MergeClustersRequest:
       properties:
         target_cluster_id:
@@ -4869,6 +5062,81 @@ components:
       - aliases
       title: PersonPayload
       description: 一个人物实体。``confirmed`` 与 ``status`` 并存是 1.0 的契约（``app.py:1518``）。
+    PipelineProcessRequest:
+      properties:
+        scope_id:
+          type: string
+          maxLength: 255
+          minLength: 1
+          title: Scope Id
+        asset_ids:
+          items:
+            type: string
+          type: array
+          maxItems: 1000
+          title: Asset Ids
+      type: object
+      required:
+      - scope_id
+      title: PipelineProcessRequest
+      description: 显式流水线请求。``asset_ids`` 的顺序是语义提交顺序。
+    PipelineProcessResponse:
+      properties:
+        scope_id:
+          type: string
+          title: Scope Id
+        processed:
+          type: integer
+          title: Processed
+        skipped:
+          type: integer
+          title: Skipped
+        events:
+          type: integer
+          title: Events
+        lexical_terms:
+          type: integer
+          title: Lexical Terms
+        video_scenes:
+          type: integer
+          title: Video Scenes
+        summarized:
+          type: integer
+          title: Summarized
+        timings:
+          additionalProperties:
+            type: number
+          type: object
+          title: Timings
+          default: {}
+        failures:
+          items:
+            $ref: '#/components/schemas/ImportFailure'
+          type: array
+          title: Failures
+        memory_graph:
+          anyOf:
+          - $ref: '#/components/schemas/MemoryGraphBuildResponse'
+          - type: 'null'
+        insights:
+          anyOf:
+          - $ref: '#/components/schemas/InsightCounts'
+          - type: 'null'
+        family_graph:
+          anyOf:
+          - $ref: '#/components/schemas/FamilyRunResponse'
+          - type: 'null'
+      type: object
+      required:
+      - scope_id
+      - processed
+      - skipped
+      - events
+      - lexical_terms
+      - video_scenes
+      - summarized
+      - failures
+      title: PipelineProcessResponse
     PortraitFeedbackRequest:
       properties:
         feedback:

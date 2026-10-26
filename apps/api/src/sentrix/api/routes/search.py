@@ -13,6 +13,7 @@ from sentrix.api.schemas.search import ChannelTrace, SearchHit, SearchResponse
 from sentrix.application.retrieval.evaluate_conditions import EvaluateConditions
 from sentrix.application.retrieval.retrieve_entity import RetrieveEntity
 from sentrix.application.retrieval.retrieve_evidence import EvidenceRequest, RetrieveEvidence
+from sentrix.application.retrieval.retrieve_graph import RetrieveGraph
 from sentrix.application.retrieval.retrieve_lexical import RetrieveLexical
 from sentrix.application.retrieval.retrieve_metadata import RetrieveMetadata
 from sentrix.application.retrieval.retrieve_text_ann import RetrieveTextAnn
@@ -61,6 +62,7 @@ def build_retrieve_evidence(container: Container) -> RetrieveEvidence:
             aliases=container.place_aliases,
             confirmed_people=_confirmed_people(container),
         ),
+        graph=RetrieveGraph(graph=container.memory_graph),
     )
 
 

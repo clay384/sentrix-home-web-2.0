@@ -80,6 +80,29 @@ DEFAULT_SENTRIX_START_COMMAND = (
 )
 
 
+def _sentrix_environment() -> tuple[tuple[str, str], ...]:
+    """Collect the deployment environment that a PhotoBench restart must preserve.
+
+    The 2.0 API reads its embedding scheme and provider selection at process start.
+    A PhotoBench-triggered restart therefore has to pass those values along with
+    ``SENTRIX_VLM_BASE_URL``; otherwise a Mac legacy process silently falls back to
+    the WEMM defaults even though the sidecars on 8101/8103 are healthy.
+    """
+    names = (
+        "SENTRIX_EMBEDDING_SCHEME",
+        "SENTRIX_TEXT_EMBEDDER_URL",
+        "SENTRIX_LEGACY_CLIP_URL",
+        "FACE_PROVIDERS",
+        "RETINAFACE_PROVIDERS",
+    )
+    values: list[tuple[str, str]] = []
+    for name in names:
+        value = os.environ.get(f"PHOTOBENCH_{name}", "").strip()
+        if value:
+            values.append((name, value))
+    return tuple(values)
+
+
 @dataclass(frozen=True)
 class Settings:
     config_root: Path
@@ -96,6 +119,10 @@ class Settings:
     sentrix_repo_root: Path = APP_ROOT.parents[1]
     #: 启动命令。默认等于 ``make dev``，见上面的常量。
     sentrix_start_command: str = DEFAULT_SENTRIX_START_COMMAND
+    #: Environment passed to a PhotoBench-triggered API restart. The prefix keeps
+    #: deployment choices out of the ``photobench`` package's own ``SENTRIX_*``
+    #: runtime while still making the restart reproducible on Mac legacy.
+    sentrix_environment: tuple[tuple[str, str], ...] = ()
     #: 上一次由 PhotoBench 启动的 2.0 的 pid 与端点记录。**它同时是「当前端点」的
     #: 真相来源**——重启前要拿它判断「是不是已经指着这里了，不用动」。
     sentrix_pid_file: Path = APP_ROOT / "logs" / "sentrix-process.json"
@@ -162,6 +189,7 @@ class Settings:
             sentrix_start_command=os.environ.get(
                 "PHOTOBENCH_SENTRIX_START_COMMAND", DEFAULT_SENTRIX_START_COMMAND
             ).strip(),
+            sentrix_environment=_sentrix_environment(),
             sentrix_pid_file=_root("PHOTOBENCH_SENTRIX_PID_FILE", APP_ROOT / "logs" / "sentrix-process.json"),
             sentrix_log_path=_root("PHOTOBENCH_SENTRIX_LOG_PATH", APP_ROOT / "logs" / "sentrix.log"),
             sentrix_service_unit=os.environ.get("PHOTOBENCH_SENTRIX_SERVICE_UNIT", "").strip(),

@@ -113,3 +113,53 @@ class ImportBatchResponse(BaseModel):
     # **2.0 自加的第二个键**（``insights`` 是第一个，同一条理由）：批末触发是**同步**的，
     # 装作异步只会把「跑没跑、跑成没成」藏起来。1.0 那边它是后台线程，响应里什么都没有。
     family_graph: FamilyRunResponse | None = None
+
+
+class AssetImportBatchResponse(BaseModel):
+    """资产导入阶段响应：只落盘/登记，不包含关键帧、记忆或图构建。"""
+
+    scope_id: str
+    directory: str
+    imported: int
+    deduplicated: int
+    asset_ids: list[str]
+    timings: dict[str, float] = {}
+    failures: list[ImportFailure]
+
+
+class PipelineProcessRequest(BaseModel):
+    """显式流水线请求。``asset_ids`` 的顺序是语义提交顺序。"""
+
+    scope_id: str = Field(..., min_length=1, max_length=255)
+    asset_ids: list[str] = Field(default_factory=list, max_length=1000)
+
+
+class MemoryGraphBuildResponse(BaseModel):
+    scope_id: str
+    node_count: int
+    edge_count: int
+    causal_candidate_pairs: int = 0
+    causal_edges: int = 0
+    causal_status: str = "not_configured"
+    causal_seconds: float = 0.0
+    keyframe_count: int = 0
+    keyframe_temporal_edges: int = 0
+    keyframe_object_edges: int = 0
+    keyframe_relation_edges: int = 0
+    keyframe_visual_edges: int = 0
+    keyframe_visual_status: str = "no_frames"
+
+
+class PipelineProcessResponse(BaseModel):
+    scope_id: str
+    processed: int
+    skipped: int
+    events: int
+    lexical_terms: int
+    video_scenes: int
+    summarized: int
+    timings: dict[str, float] = {}
+    failures: list[ImportFailure]
+    memory_graph: MemoryGraphBuildResponse | None = None
+    insights: InsightCounts | None = None
+    family_graph: FamilyRunResponse | None = None

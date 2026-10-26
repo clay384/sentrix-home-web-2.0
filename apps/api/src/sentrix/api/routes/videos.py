@@ -16,7 +16,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 
 from sentrix.api.deps import get_container
-from sentrix.api.routes.media import build_video_scenes
+from sentrix.api.routes.media import build_video_scenes, refresh_memory_graph
 from sentrix.api.schemas.videos import (
     KeyframeAssetPayload,
     SourceVideoPayload,
@@ -198,9 +198,10 @@ def reprocess_video(asset_id: str, container: Container = Depends(get_container)
     ``processed``，响应的 ``status`` 也如实回它——回 1.0 那个「排队中」的阶段名
     （``video-queued``）在同步执行下是一句假话。
     """
-    _require_video(asset_id, container)
+    asset = _require_video(asset_id, container)
     container.video_repository.cleanup_derivatives(asset_id)
     container.asset_repository.update_status(asset_id, AssetStatus.QUEUED)
     build_video_scenes(container).execute(asset_id)
     container.asset_repository.update_status(asset_id, AssetStatus.PROCESSED)
+    refresh_memory_graph(container, asset.scope_id)
     return VideoReprocessResponse(accepted=True, asset_id=asset_id, status=REPROCESS_STATUS)

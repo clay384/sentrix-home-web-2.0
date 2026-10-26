@@ -9,8 +9,8 @@
 ``POST /api/memory-spaces``  **没有**：导入时内部 ensure   （相位里只记 id）
 ``POST /api/people/seed-batch``  ``/v1/people/seed``（单人）  ``seed_person``
 ``POST /api/relationships/batch``  ✅ 同路径加 ``/v1``    ``import_relationships``
-``POST /api/import``      ``/v1/imports``（服务端目录）   ``import_album``
-``POST /ingest-batches/{id}/complete``  **没有**：并入 imports  （相位里不做）
+``POST /api/import``      ``/v1/imports/assets``（服务端目录） ``import_assets``
+``POST /ingest-batches/{id}/complete``  ``/v1/pipeline/process`` ``process_pipeline``
 ``GET /api/assets``       ✅ ``/v1/assets``               ``list_assets``
 ``POST /api/assistant/turn``  **两段式**：建会话 + 发起回合  ``start_conversation`` /
                                                           ``start_turn``
@@ -19,11 +19,12 @@
 
 **三处形状差异不是口味，是 2.0 的接口事实（每一条都核过代码）：**
 
-1. **导入按「服务端目录」而不是按「上传字节」**。``POST /api/v1/imports`` 收的是
+1. **导入按「服务端目录」而不是按「上传字节」**。兼容入口 ``POST /api/v1/imports`` 与
+   评测入口 ``POST /api/v1/imports/assets`` 收的都是
    ``{directory, scope_id, limit}``，``ImportAlbum.execute`` 用 ``root.iterdir()``
    **非递归**扫后缀（``application/media/import_album.py:100-102``）。所以这个方法的
    入参是**目录**，返回体的键名沿用 2.0 的响应
-   （``{scope_id, directory, imported, deduplicated, events, ...}``）。1.0 那种
+   （资产-only 返回 ``asset_ids``，供后续显式流水线按序处理）。1.0 那种
    「manifest 列了哪些文件就传哪些」的能力 2.0 的端点给不了——**目录里的文件集合
    才是权威**，这条差异记在行为基线里。
 2. **种身份是单人一次**。1.0 的 ``seed-batch`` 一次带 N 个人 + N 张参考图；2.0 的
@@ -101,6 +102,14 @@ class SentrixClient(Protocol):
         视觉向量 → 观察 → 人物 → 事件 → 事实 → 词法」整条链，再跑批末总结
         （``api/routes/timeline.py:130-142``）。超时必须由调用方给足。
         """
+        ...
+
+    def import_assets(self, *, scope_id: str, directory: str, limit: int, timeout: int) -> dict[str, Any]:
+        """``POST /api/v1/imports/assets``：只落盘并登记资产，返回有序 ``asset_ids``。"""
+        ...
+
+    def process_pipeline(self, *, scope_id: str, asset_ids: Sequence[str], timeout: int) -> dict[str, Any]:
+        """``POST /api/v1/pipeline/process``：同步执行关键帧、记忆与图构建。"""
         ...
 
     def list_assets(self, *, scope_id: str, limit: int, timeout: int = 60) -> list[dict[str, Any]]:

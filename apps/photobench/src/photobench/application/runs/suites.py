@@ -248,6 +248,7 @@ class RunSuites:
         runtime_framework = self._detect_framework(
             str(payload.get("runtime_framework") or ""), model_base_url
         )
+        endpoint_model = str(payload.get("endpoint_model") or "").strip()
         if not manager_url and not model_base_url:
             # 没有 Manager 也没有直连端点时退回配置里的端点（与 container 的 run_execution
             # 同一条兜底）——但**不**替调用方填 Manager：那是「要不要管模型」的决定。
@@ -301,6 +302,7 @@ class RunSuites:
                     sentrix_url=sentrix_url,
                     manager_url=deps.manager_url,
                     model_base_url=deps.model_base_url,
+                    endpoint_model=endpoint_model,
                     run_id=run_id,
                     mode=mode,
                     qa_concurrency=int(
@@ -408,6 +410,7 @@ class RunSuites:
             sentrix_url=str(saved.get("sentrix_url") or self._config.sentrix_url),
             manager_url=str(saved.get("manager_url") or ""),
             model_base_url=str(saved.get("model_base_url") or self._config.model_base_url),
+            endpoint_model=str(saved.get("endpoint_model") or ""),
             run_id=new_run_id,
             mode="reuse",
             scope_id=scope_id,

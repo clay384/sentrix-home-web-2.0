@@ -47,6 +47,12 @@ def _quote(value: str) -> str:
 class HttpxSentrixClient:
     """``SentrixClient`` 的组合实现：一个 ``JsonHttpClient`` + 一个 base_url 取值函数。"""
 
+    #: 2.0 的整册导入端点仍是同步长请求；评测端可据此在旁路轮询资产数量，
+    #: 不改变主 API 的响应契约。其它实现不声明该能力时自动走原路径。
+    supports_live_import_progress = True
+    #: 新版主 API 支持“资产导入 / 真实流水线”两阶段接口。
+    supports_explicit_pipeline = True
+
     def __init__(self, http: JsonHttpClient, base_url: Callable[[], str]) -> None:
         self._http = http
         self._base_url = base_url
@@ -135,6 +141,16 @@ class HttpxSentrixClient:
             )
         )
 
+    def import_assets(self, *, scope_id: str, directory: str, limit: int, timeout: int) -> dict[str, Any]:
+        return dict(
+            self._http.request_json(
+                self._url("/imports/assets"),
+                {"scope_id": scope_id, "directory": directory, "limit": limit},
+                "POST",
+                timeout,
+            )
+        )
+
     def import_album_tracked(
         self,
         *,
@@ -148,6 +164,16 @@ class HttpxSentrixClient:
             self._http.request_json(
                 self._url("/imports"),
                 {"scope_id": scope_id, "directory": directory, "limit": limit, "operation_id": operation_id},
+                "POST",
+                timeout,
+            )
+        )
+
+    def process_pipeline(self, *, scope_id: str, asset_ids: Sequence[str], timeout: int) -> dict[str, Any]:
+        return dict(
+            self._http.request_json(
+                self._url("/pipeline/process"),
+                {"scope_id": scope_id, "asset_ids": list(asset_ids)},
                 "POST",
                 timeout,
             )

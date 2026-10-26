@@ -164,6 +164,21 @@ class EventParticipantRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class EventEntityRecord:
+    """``event_entities`` 一行：事件与非人物实体的结构化关联。
+
+    这张投影由观察实体维护阶段写入，图构建只需要实体 id、关系、证据和置信度；
+    实体的展示属性仍由 ``EntityRepository`` 统一提供。
+    """
+
+    event_id: str
+    entity_id: str
+    relation: str
+    evidence_ids: tuple[str, ...] = ()
+    confidence: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
 class VisualSignal:
     """候选观察与目标事件之间最强的视觉相似度。
 

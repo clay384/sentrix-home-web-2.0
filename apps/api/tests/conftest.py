@@ -29,6 +29,8 @@ ENVIRONMENTAL_LOAD_FAILURES = (
     "cublas",  # onnxruntime CUDA provider 建不起来
     "bfc_arena",  # onnxruntime 分配器分配失败
     "no registered plugin ep device",  # CUDA EP 在这台机器上不可用
+    "connection refused",  # 模型侧车未启动
+    "all connection attempts failed",  # httpx 对本地侧车拒绝连接的措辞
 )
 
 

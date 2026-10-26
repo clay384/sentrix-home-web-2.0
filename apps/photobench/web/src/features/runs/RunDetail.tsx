@@ -25,7 +25,7 @@
  */
 import type { ReactNode } from "react";
 
-import type { Run } from "../../api/types.ts";
+import type { GraphQuality, Run } from "../../api/types.ts";
 import { EXECUTION_PHASES } from "../../lib/constants.ts";
 import { albumName, duration, fmtDate, modelName, qaName, statusLabel } from "../../lib/format.ts";
 import { MemoryLayerPanel } from "../memory/MemoryLayerPanel.tsx";
@@ -35,6 +35,7 @@ import { PhaseList } from "./PhaseList.tsx";
 import { RejudgeCard } from "./RejudgeCard.tsx";
 import type { RejudgeCardProps } from "./RejudgeCard.tsx";
 import { ResultMetrics } from "./ResultMetrics.tsx";
+import { GraphQualityPanel } from "./GraphQualityPanel.tsx";
 import { TelemetryCard } from "./telemetry/TelemetryCard.tsx";
 
 /** 1.0 `:3057` 的 `<p class="run-meta">` 里 reuse/build 两段模板。 */
@@ -82,6 +83,7 @@ export interface RunDetailProps {
   rejudge: RejudgeCardProps;
   /** 1.0 `:3147-3284` 记忆层级面板的数据；缺省（组合层尚未接入）时不渲染该面板。 */
   memory?: MemoryLayerPanelProps;
+  graphQuality?: GraphQuality | null;
   onLoadTelemetry?: () => void;
 }
 
@@ -93,6 +95,7 @@ export function RunDetail({
   onExportSftTraces,
   rejudge,
   memory,
+  graphQuality,
   onLoadTelemetry,
 }: RunDetailProps) {
   return (
@@ -152,6 +155,7 @@ export function RunDetail({
           <PhaseList activeRun={activeRun} />
           <KeyMetrics run={activeRun} />
           {memory ? <MemoryLayerPanel key={activeRun.run_id} {...memory} /> : null}
+          <GraphQualityPanel quality={graphQuality ?? null} />
           <h3 className="result-heading">结果指标</h3>
           {activeRun.history_mode === "checkpoint" ? (
             <p className="muted">当前为最近保存的摘要和遥测窗口。

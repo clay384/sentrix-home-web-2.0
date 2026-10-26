@@ -61,6 +61,16 @@ describe("modelName / albumName / qaName (:324-326)", () => {
     expect(modelName({ model_profile: "p", model_name: "n" })).toBe("n");
     expect(modelName({ model_name: "n", profile: "pf" })).toBe("n");
     expect(modelName({ profile: "pf" })).toBe("pf");
+    expect(modelName({ model_profile: "__current__", endpoint_model: "qwen35-q4km" })).toBe("qwen35-q4km");
+    expect(
+      modelName({
+        model_profile: "__current__",
+        model_name: "__current__",
+        album_id: "album3-ai-video13",
+        scope_name: "PhotoBench-20261021-220518-album3-ai-video13-qwen35-q4km",
+      }),
+    ).toBe("qwen35-q4km");
+    expect(modelName({ model_profile: "__current__" })).toBe("current");
     expect(modelName({})).toBe("unknown");
     expect(modelName(null)).toBe("unknown");
 

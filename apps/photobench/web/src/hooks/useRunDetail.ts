@@ -28,6 +28,7 @@ import { effectiveRunSummary } from "../lib/runSummary.ts";
 import type {
   KeyframeAnalysis,
   MemoryEffectiveness,
+  GraphQuality,
   RejudgeTask,
   ReviewsResponse,
   Run,
@@ -113,6 +114,7 @@ export function useRunDetail(options: RunDetailOptions) {
   const [keyframeAnalysisLoading, setKeyframeAnalysisLoading] = useState(false);
   const [keyframeAnalysisError, setKeyframeAnalysisError] = useState("");
   const [memoryEffectiveness, setMemoryEffectiveness] = useState<MemoryEffectiveness | null>(null);
+  const [graphQuality, setGraphQuality] = useState<GraphQuality | null>(null);
   const [reviewDrafts, setReviewDrafts] = useState<ReviewDrafts>({});
   const [reviewSaving, setReviewSaving] = useState(false);
   // 1.0 `:2487` `exportScores = ref(["0","1","2"])`。
@@ -185,6 +187,23 @@ export function useRunDetail(options: RunDetailOptions) {
     [activeRunIdRef],
   );
 
+  const loadGraphQuality = useCallback(
+    async (runId: string) => {
+      try {
+        const payload = await api<GraphQuality>(
+          `/runs/${encodeURIComponent(runId)}/graph-quality`,
+          { timeoutMs: 60000 },
+        );
+        if (activeRunIdRef.current === runId) setGraphQuality(payload);
+      } catch (error) {
+        if (activeRunIdRef.current === runId) {
+          setGraphQuality({ status: "unavailable", reason: (error as Error).message || "图质量分析失败" });
+        }
+      }
+    },
+    [activeRunIdRef],
+  );
+
   /** 1.0 `:2328`（内联在 `loadActiveRun` 的 resetPage 分支）。 */
   const loadReviews = useCallback(
     async (runId?: string) => {
@@ -231,12 +250,18 @@ export function useRunDetail(options: RunDetailOptions) {
         setKeyframeAnalysis(null);
         setKeyframeAnalysisError("");
         setMemoryEffectiveness(null);
+        setGraphQuality(null);
         resetQaState?.();
         setReviewDrafts({});
         await loadReviews(runId);
       }
       await Promise.all([
-        ...(analysisOpen.current ? [loadKeyframeAnalysis(runId), loadMemoryEffectiveness(runId)] : []),
+        ...(analysisOpen.current
+          ? [loadKeyframeAnalysis(runId), loadMemoryEffectiveness(runId)]
+          : []),
+        // 图质量面板始终展示在 run 详情中，不应依赖记忆分析面板是否展开。
+        // resetPage 表示刚切换到一条 run，此时立即读取一次；后续展开时再复用同一入口。
+        ...(resetPage || analysisOpen.current ? [loadGraphQuality(runId)] : []),
         loadQaPage ? loadQaPage(resetPage ? 1 : undefined) : Promise.resolve(),
       ]);
     },
@@ -247,6 +272,7 @@ export function useRunDetail(options: RunDetailOptions) {
       loadReviews,
       loadKeyframeAnalysis,
       loadMemoryEffectiveness,
+      loadGraphQuality,
       loadQaPage,
     ],
   );
@@ -254,8 +280,14 @@ export function useRunDetail(options: RunDetailOptions) {
   const setAnalysisOpen = useCallback((open: boolean) => {
     analysisOpen.current = open;
     const runId = activeRunIdRef.current;
-    if (open && runId) void Promise.all([loadKeyframeAnalysis(runId), loadMemoryEffectiveness(runId)]);
-  }, [activeRunIdRef, loadKeyframeAnalysis, loadMemoryEffectiveness]);
+    if (open && runId) {
+      void Promise.all([
+        loadKeyframeAnalysis(runId),
+        loadMemoryEffectiveness(runId),
+        loadGraphQuality(runId),
+      ]);
+    }
+  }, [activeRunIdRef, loadKeyframeAnalysis, loadMemoryEffectiveness, loadGraphQuality]);
 
   /**
    * 1.0 `:2333` 是「惰性建草稿」的副作用版本，React 里 render 不能写 state，
@@ -459,10 +491,12 @@ export function useRunDetail(options: RunDetailOptions) {
     keyframeAnalysisLoading,
     keyframeAnalysisError,
     memoryEffectiveness,
+    graphQuality,
     loadActiveRun,
     setAnalysisOpen,
     loadKeyframeAnalysis,
     loadMemoryEffectiveness,
+    loadGraphQuality,
     loadReviews,
     reviewDrafts,
     reviewFor,

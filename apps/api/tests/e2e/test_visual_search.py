@@ -184,6 +184,9 @@ def test_scope_isolation_holds_through_the_whole_chain(real_client: TestClient, 
 def test_locked_index_still_answers_with_the_right_photo(real_client: TestClient, tmp_path: Path):
     """S2 的硬约束端到端版本：Qdrant 目录被别的进程占用时，检索必须仍然给出正确照片，
     并把降级如实报出来（1.0 在这里是静默返回空）。"""
+    # 先验明模型环境，再起锁目录子进程；缺侧车时无需创建进程，且 macOS 上
+    # 已加载 ONNX/torch 后再 fork 曾在这一行触发段错误。
+    require_visual_embedder(real_client)
     locked_dir = tmp_path / "locked-qdrant"
     holder = subprocess.Popen(
         [sys.executable, "-c", _LOCK_HOLDER, str(locked_dir)],

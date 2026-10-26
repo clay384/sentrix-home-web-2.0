@@ -108,14 +108,14 @@ class WeMMSidecarEmbedder:
         try:
             response = self._client.get(f"{self._base_url}/health")
             healthy = response.status_code == 200
-            error = "" if healthy else f"sidecar_http_{response.status_code}"
-        except Exception:  # noqa: BLE001 - 探活失败就是不可用，不该让调用方处理异常
+            error = "" if healthy else (self._error or f"health returned HTTP {response.status_code}")
+        except Exception as exc:  # noqa: BLE001 - 探活失败就是不可用，不该让调用方处理异常
             healthy = False
-            error = "sidecar_unreachable"
+            error = self._error or str(exc)
         with self._lock:
             self._health_checked_at = time.monotonic()
             self._health_value = healthy
-            self._error = "" if healthy else (self._error or error)
+            self._error = error
         return healthy
 
     def embed_query(self, text: str) -> list[float]:

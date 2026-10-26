@@ -33,6 +33,13 @@ def memory_effectiveness(request: Request, run_id: str) -> dict[str, Any]:
     return get_container(request).reports.memory_effectiveness(run_id)
 
 
+@router.get("/runs/{run_id}/graph-quality")
+def graph_quality(request: Request, run_id: str) -> dict[str, Any]:
+    """可验边、人脸身份聚类和分题型图 QA 的只读汇总。"""
+
+    return get_container(request).reports.graph_quality(run_id)
+
+
 def _download(payload: Any, file_name: str) -> Response:
     """1.0 的下载响应：JSON 字节 + ``Content-Disposition``。
 

@@ -22,5 +22,8 @@ htmlcov/
 apps/web/node_modules/
 apps/web/dist/
 apps/api/build/
+logs/
+.idea/
+*.env.local
 /data/
 *.egg-info/

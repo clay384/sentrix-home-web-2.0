@@ -37,7 +37,7 @@ import logging
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +48,8 @@ from sentrix.application.media.import_assets import (
     PreparedImage,
     StagedImport,
 )
+from sentrix.domain.media.models import Asset, AssetStatus
+from sentrix.domain.media.ports import AssetRepository
 
 log = logging.getLogger("sentrix.media.import_album")
 
@@ -110,6 +112,43 @@ class AlbumImportResult:
         return self.imported + self.deduplicated + len(self.failures)
 
 
+@dataclass(frozen=True, slots=True)
+class AlbumStageResult:
+    """只负责把目录里的媒体落盘并登记为 ``queued``，不做任何记忆推理。"""
+
+    scope_id: str
+    directory: str
+    imported: int = 0
+    deduplicated: int = 0
+    asset_ids: tuple[str, ...] = ()
+    failures: tuple[AlbumFailure, ...] = ()
+    timings: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def scanned(self) -> int:
+        return self.imported + self.deduplicated + len(self.failures)
+
+
+@dataclass(frozen=True, slots=True)
+class AlbumProcessRequest:
+    scope_id: str
+    # 顺序就是目录扫描顺序；事件提交必须严格遵守它，不能按推理完成顺序提交。
+    asset_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AlbumProcessResult:
+    scope_id: str
+    processed: int = 0
+    skipped: int = 0
+    events: int = 0
+    lexical_terms: int = 0
+    video_scenes: int = 0
+    summarized: int = 0
+    failures: tuple[AlbumFailure, ...] = ()
+    timings: dict[str, float] = field(default_factory=dict)
+
+
 class ImportAlbum:
     def __init__(
         self,
@@ -127,13 +166,7 @@ class ImportAlbum:
         self._summarize_event = summarize_event
 
     def execute(self, request: AlbumImportRequest) -> AlbumImportResult:
-        root = Path(request.directory)
-        if not root.is_dir():
-            raise NotADirectoryError(str(root))
-
-        paths = sorted(
-            path for path in root.iterdir() if path.is_file() and path.suffix.lower() in SCAN_SUFFIXES
-        )[: max(1, int(request.limit))]
+        root, paths = self._paths(request)
 
         self._report(stage="media_processing", total=len(paths))
         imported = deduplicated = events = lexical_terms = 0
@@ -272,18 +305,65 @@ class ImportAlbum:
             failures=tuple(failures[index] for index in sorted(failures)),
         )
 
+    def stage_only(self, request: AlbumImportRequest) -> AlbumStageResult:
+        """只导入资产：目录扫描、去重、落盘、EXIF/ffprobe 与资产登记。
+
+        新资产状态写成 ``queued``；VLM/OCR、人脸、事件、事实、实体、关键帧与图结构都
+        不在这里执行。既有 ``execute`` 完整导入入口保持不变，兼容产品端原调用方。
+        """
+        root, paths = self._paths(request)
+        total_started = time.perf_counter()
+        imported = deduplicated = 0
+        asset_ids: list[str] = []
+        failures: list[AlbumFailure] = []
+        for path in paths:
+            try:
+                outcome = self._importer.stage(self._request_for(request, path, defer_processing=True))
+            except Exception as error:  # 一张坏媒体不阻断整册
+                failures.append(AlbumFailure(file_name=path.name, reason=f"{type(error).__name__}: {error}"))
+                continue
+            asset_id = outcome.asset_id if isinstance(outcome, ImportResult) else outcome.asset.id
+            asset_ids.append(asset_id)
+            if isinstance(outcome, ImportResult):
+                deduplicated += 1
+            else:
+                imported += 1
+        total_seconds = time.perf_counter() - total_started
+        return AlbumStageResult(
+            scope_id=request.scope_id,
+            directory=str(root),
+            imported=imported,
+            deduplicated=deduplicated,
+            asset_ids=tuple(asset_ids),
+            failures=tuple(failures),
+            timings={"asset_import": round(total_seconds, 3), "total": round(total_seconds, 3)},
+        )
+
     def _report(self, **changes: Any) -> None:
         if self._progress is not None:
             self._progress(**changes)
 
     @staticmethod
-    def _request_for(request: AlbumImportRequest, path: Path) -> ImportRequest:
+    def _paths(request: AlbumImportRequest) -> tuple[Path, list[Path]]:
+        root = Path(request.directory)
+        if not root.is_dir():
+            raise NotADirectoryError(str(root))
+        paths = sorted(
+            path for path in root.iterdir() if path.is_file() and path.suffix.lower() in SCAN_SUFFIXES
+        )[: max(1, int(request.limit))]
+        return root, paths
+
+    @staticmethod
+    def _request_for(
+        request: AlbumImportRequest, path: Path, *, defer_processing: bool = False
+    ) -> ImportRequest:
         """磁盘上的一张图 → 一次导入请求。整册导入没有 upload 的 content-type 可依。"""
         return ImportRequest(
             scope_id=request.scope_id,
             file_name=path.name,
             content_type=None,
             content=path.read_bytes(),
+            defer_processing=defer_processing,
         )
 
     def _summarize_events(self, event_ids: list[str]) -> int:
@@ -300,6 +380,128 @@ class ImportAlbum:
                 self._summarize_event(event_id)
             except Exception as error:  # noqa: BLE001 - 一个事件总结失败不该让整个相册归零
                 log.warning("事件总结失败，事件保留占位内容: %s: %s", event_id, error)
+                continue
+            summarized += 1
+        return summarized
+
+
+class ProcessAlbumPipeline:
+    """对已导入的源资产执行真实流水线：推理并行、提交按请求顺序串行。"""
+
+    def __init__(
+        self,
+        *,
+        importer: ImportAssets,
+        assets: AssetRepository,
+        summarize_event: Callable[[str], object] | None = None,
+        workers: int = DEFAULT_ALBUM_WORKERS,
+    ) -> None:
+        self._importer = importer
+        self._assets = assets
+        self._summarize_event = summarize_event
+        self._workers = max(1, int(workers))
+
+    def execute(self, request: AlbumProcessRequest) -> AlbumProcessResult:
+        total_started = time.perf_counter()
+        # 保序去重，防止客户端拼多个目录时把同一资产重复提交。
+        ordered_ids = list(dict.fromkeys(request.asset_ids))
+        targets: list[Asset | None] = []
+        failures: dict[int, AlbumFailure] = {}
+        skipped = 0
+        for index, asset_id in enumerate(ordered_ids):
+            asset = self._assets.get(asset_id)
+            if asset is None:
+                failures[index] = AlbumFailure(asset_id, "asset not found")
+                targets.append(None)
+                continue
+            if asset.scope_id != request.scope_id:
+                failures[index] = AlbumFailure(asset.file_name, "asset scope mismatch")
+                targets.append(None)
+                continue
+            if asset.parent_asset_id is not None:
+                failures[index] = AlbumFailure(asset.file_name, "derived asset cannot be a pipeline source")
+                targets.append(None)
+                continue
+            if asset.status is AssetStatus.PROCESSED:
+                skipped += 1
+                targets.append(None)
+                continue
+            if asset.status is not AssetStatus.QUEUED:
+                failures[index] = AlbumFailure(asset.file_name, f"asset is not queued: {asset.status.value}")
+                targets.append(None)
+                continue
+            targets.append(asset)
+
+        processed = events = lexical_terms = video_scenes = 0
+        event_ids: list[str] = []
+        timing_totals: dict[str, float] = {}
+        prepared: dict[int, Future[PreparedImage]] = {}
+        next_submit = next_finish = 0
+
+        with ThreadPoolExecutor(max_workers=self._workers, thread_name_prefix="sentrix-pipeline") as pool:
+            while next_finish < len(targets):
+                while next_submit < len(targets) and next_submit - next_finish < self._workers:
+                    index = next_submit
+                    next_submit += 1
+                    asset = targets[index]
+                    if asset is None:
+                        continue
+                    self._assets.update_status(asset.id, AssetStatus.PROCESSING)
+                    prepared[index] = pool.submit(self._importer.prepare_image, asset)
+
+                index = next_finish
+                next_finish += 1
+                asset = targets[index]
+                if asset is None:
+                    continue
+                future = prepared.pop(index)
+                try:
+                    inference = future.result()
+                    result = self._importer.finish(self._importer.resume(asset), inference)
+                except Exception as error:  # 一张失败不中断后续资产
+                    self._assets.update_status(asset.id, AssetStatus.FAILED)
+                    failures[index] = AlbumFailure(asset.file_name, f"{type(error).__name__}: {error}")
+                    continue
+                self._assets.update_status(asset.id, AssetStatus.PROCESSED)
+                result = replace(result, status=AssetStatus.PROCESSED)
+                processed += 1
+                lexical_terms += result.lexical_terms
+                video_scenes += result.video_scenes
+                if result.event_id is not None:
+                    events += 1
+                    if result.event_id not in event_ids:
+                        event_ids.append(result.event_id)
+                for key, value in result.timings.items():
+                    if key == "total":
+                        continue
+                    timing_totals[key] = timing_totals.get(key, 0.0) + float(value)
+
+        summarize_started = time.perf_counter()
+        summarized = self._summarize_events(event_ids)
+        timing_totals["event_summarize"] = time.perf_counter() - summarize_started
+        total_seconds = time.perf_counter() - total_started
+        timing_totals["pipeline_core"] = total_seconds
+        return AlbumProcessResult(
+            scope_id=request.scope_id,
+            processed=processed,
+            skipped=skipped,
+            events=events,
+            lexical_terms=lexical_terms,
+            video_scenes=video_scenes,
+            summarized=summarized,
+            failures=tuple(failures[index] for index in sorted(failures)),
+            timings={key: round(value, 3) for key, value in timing_totals.items()},
+        )
+
+    def _summarize_events(self, event_ids: list[str]) -> int:
+        if self._summarize_event is None:
+            return 0
+        summarized = 0
+        for event_id in event_ids:
+            try:
+                self._summarize_event(event_id)
+            except Exception as error:  # noqa: BLE001 - 总结失败不回滚已构建记忆
+                log.warning("流水线事件总结失败，保留占位内容: %s: %s", event_id, error)
                 continue
             summarized += 1
         return summarized

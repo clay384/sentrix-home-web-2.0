@@ -99,7 +99,7 @@ def test_sampler_walks_each_process_once_even_when_device_stats_are_collected(mo
 
     from photobench.application.run_execution.gpu_sampler import GpuSampler
 
-    provider = jetson.LocalJetsonLlamaCppTelemetryProvider("http://127.0.0.1:8100")
+    provider = jetson.LocalJetsonLlamaCppTelemetryProvider("http://127.0.0.1:8100", telemetry_services={})
     monkeypatch.setattr(provider, "_pid", lambda: 42)
     monkeypatch.setattr(provider, "_metrics", lambda: {})
     monkeypatch.setattr(provider, "_llama_args", lambda pid: {})

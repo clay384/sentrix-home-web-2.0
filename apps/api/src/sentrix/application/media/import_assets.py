@@ -81,11 +81,13 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from sentrix.application.media.extract_video_scenes import VideoSceneExtraction
 from sentrix.domain.identity.ports import FaceEnroller, PreparedFaces
 from sentrix.domain.media.models import Asset, AssetStatus, MediaType, Observation
 from sentrix.domain.media.ports import (
@@ -117,6 +119,9 @@ class ImportRequest:
     file_name: str
     content_type: str | None
     content: bytes
+    # ``True`` 只完成资产落盘/登记，把关键帧与记忆构建留给显式流水线阶段。
+    # 默认 False，保证既有单张导入与 ``POST /imports`` 的外部行为不变。
+    defer_processing: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +161,8 @@ class ImportResult:
     # 本次导入的音频有没有真的走过 ffprobe（S8c T521）。与 ``video_probed`` 同一条
     # 理由：「音频收下了但什么都没发生」必须在响应上看得见。音频以外一律 False。
     audio_probed: bool = False
+    # 应用层内部的细分耗时；旧响应不读取它，新流水线端点会汇总后显式返回。
+    timings: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +218,8 @@ class PreparedImage:
     visual: PreparedVisual | None = None
     semantics: ObservationSemantics | None = None
     faces: PreparedFaces | None = None
+    # 模型准备的 worker 墙钟。批量并发时这些数可重叠，因此汇总键会明确标成 worker 秒。
+    inference_seconds: float = 0.0
 
 
 def _new_id(prefix: str) -> str:
@@ -256,7 +265,7 @@ class ImportAssets:
         # 抽帧链（S8b T511–T513）。入参是源片 id，返回**建起来的场景数**。
         # 不传就退化成「只入库、不建场景」——正是 S8a 的行为，测试与不需要视频
         # 场景的调用方都不必构造它。
-        video_scene_extractor: Callable[[str], int] | None = None,
+        video_scene_extractor: Callable[[str], VideoSceneExtraction | int] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._assets = assets
@@ -318,8 +327,9 @@ class ImportAssets:
                 media_type=existing.media_type,
                 status=existing.status,
                 deduplicated=True,
-                indexed=self._reindex_visual(existing),
-                placed=self._index_place(existing),
+                # 资产导入阶段不应偷偷执行向量/地点流水线。旧入口仍保留原有的幂等补建。
+                indexed=False if request.defer_processing else self._reindex_visual(existing),
+                placed=False if request.defer_processing else self._index_place(existing),
             )
 
         asset_id = _new_id("asset")
@@ -381,7 +391,7 @@ class ImportAssets:
             path=str(stored_path),
             mime_type=mime_type,
             size_bytes=len(request.content),
-            status=AssetStatus.PROCESSED,
+            status=AssetStatus.QUEUED if request.defer_processing else AssetStatus.PROCESSED,
             content_sha256=content_sha256,
             captured_at=captured_at or now,
             captured_location=gps,
@@ -411,8 +421,11 @@ class ImportAssets:
         ``prepared`` 是 ``prepare_image(staged.asset)`` 的结果，可以来自别的线程——
         它只带推理产物，不带任何需要先落库的 id。
         """
+        total_started = time.perf_counter()
         asset = staged.asset
+        commit_started = time.perf_counter()
         processed = self.commit_image(asset, prepared)
+        memory_commit_seconds = time.perf_counter() - commit_started
         # 场景抽取排在图片流水线**之后**：它自己会再建一批资产与观察（关键帧），
         # 先跑会把派生物的数混进「这次导入」的结果里。
         video_scenes = self._extract_video_scenes(asset)
@@ -444,8 +457,32 @@ class ImportAssets:
             faces=processed.faces,
             text_rows=processed.text_rows,
             video_probed=staged.video_probe is not None and staged.video_probe.metadata is not None,
-            video_scenes=video_scenes,
+            video_scenes=video_scenes.scene_count,
             audio_probed=staged.audio_probe is not None and staged.audio_probe.metadata is not None,
+            timings={
+                "source_memory_prepare": round(prepared.inference_seconds, 3),
+                "source_memory_commit": round(memory_commit_seconds, 3),
+                **{f"video_{key}": value for key, value in video_scenes.timings.items()},
+                "total": round(time.perf_counter() - total_started, 3),
+            },
+        )
+
+    def resume(self, asset: Asset) -> StagedImport:
+        """把已由“仅导入资产”阶段登记的源资产恢复成可处理账本。
+
+        这里只读取 stage 已保存的视频 probe，不重复 ffprobe/转码；因此显式流水线的
+        关键帧、记忆构建阶段不会把资产导入耗时再算一遍。
+        """
+        video_probe = (
+            self._video_repository.probe(asset.id)
+            if asset.media_type is MediaType.VIDEO and self._video_repository is not None
+            else None
+        )
+        return StagedImport(
+            asset=asset,
+            media_type=asset.media_type,
+            video_probe=video_probe,
+            video_started=self._clock() if video_probe is not None else None,
         )
 
     def prepare_image(self, asset: Asset) -> PreparedImage:
@@ -456,10 +493,17 @@ class ImportAssets:
         （``IndexAssetVisual`` / ``ObserveAsset`` / ``EnrollFaces``），这里只把没接线
         的协作者留成 ``None``——「协作者没接」与「算出来是空」必须分得开。
         """
-        return PreparedImage(
+        started = time.perf_counter()
+        prepared = PreparedImage(
             visual=self._visual_indexer.prepare(asset) if self._visual_indexer is not None else None,
             semantics=self._observer.prepare(asset) if self._observer is not None else None,
             faces=self._face_enroller.prepare(asset.path) if self._face_enroller is not None else None,
+        )
+        return PreparedImage(
+            visual=prepared.visual,
+            semantics=prepared.semantics,
+            faces=prepared.faces,
+            inference_seconds=round(time.perf_counter() - started, 3),
         )
 
     def commit_image(
@@ -534,7 +578,7 @@ class ImportAssets:
         """
         return self.commit_image(asset, self.prepare_image(asset), forced_event_id=forced_event_id)
 
-    def _extract_video_scenes(self, asset: Asset) -> int:
+    def _extract_video_scenes(self, asset: Asset) -> VideoSceneExtraction:
         """导入一个视频之后建场景（S8b T512），返回建起来的场景数。
 
         **不阻断导入**：与 ``_probe_video`` 同一条口径（探测/转码失败都只记下来）。
@@ -543,12 +587,18 @@ class ImportAssets:
         可选协作者同形。
         """
         if asset.media_type is not MediaType.VIDEO or self._video_scene_extractor is None:
-            return 0
+            return VideoSceneExtraction(reason="not_a_video")
         try:
-            return int(self._video_scene_extractor(asset.id))
+            result = self._video_scene_extractor(asset.id)
+            # 保留既有可插拔接口：历史/第三方协作者只返回场景数，新协作者才返回细分耗时。
+            return (
+                result
+                if isinstance(result, VideoSceneExtraction)
+                else VideoSceneExtraction(scene_count=int(result))
+            )
         except Exception as error:  # noqa: BLE001 —— 场景是增强，不该让整次导入 500
             log.warning("视频场景抽取失败 asset=%s: %s", asset.id, error)
-            return 0
+            return VideoSceneExtraction(reason=f"{type(error).__name__}: {error}")
 
     def _probe_video(self, asset_id: str, path: Path) -> VideoProbe:
         """一次视频探测：ffprobe 元数据 + 必要时转码预览。

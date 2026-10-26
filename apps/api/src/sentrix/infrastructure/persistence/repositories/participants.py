@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 
 from sentrix.domain.memories.events import (
     PARTICIPANT_ROLE_VISIBLE_SUBJECT,
+    EventEntityRecord,
     EventParticipantRecord,
 )
 from sentrix.infrastructure.persistence.database import Database
@@ -156,6 +157,24 @@ class SqliteEventParticipantRepository:
                 (event_id,),
             ).fetchall()
         return [_row_to_participant(row) for row in rows]
+
+    def list_event_entities(self, event_id: str) -> Sequence[EventEntityRecord]:
+        with self._database.connect() as connection:
+            rows = connection.execute(
+                "SELECT event_id, entity_id, relation, evidence_ids_json, confidence"
+                " FROM event_entities WHERE event_id = ? ORDER BY relation, entity_id",
+                (event_id,),
+            ).fetchall()
+        return [
+            EventEntityRecord(
+                event_id=str(row["event_id"]),
+                entity_id=str(row["entity_id"]),
+                relation=str(row["relation"] or ""),
+                evidence_ids=_evidence(row["evidence_ids_json"]),
+                confidence=float(row["confidence"] or 0.0),
+            )
+            for row in rows
+        ]
 
     def cooccurrence_event_count(self, left_person_id: str, right_person_id: str) -> int:
         """1.0 ``db.py:2517-2522`` 那条自连接的 ``SELECT DISTINCT``，逐字搬。"""

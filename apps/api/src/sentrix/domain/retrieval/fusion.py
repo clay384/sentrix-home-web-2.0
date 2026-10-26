@@ -5,7 +5,8 @@
 
 - ``RRF_K = 60``（Cormack 2009 的常数）
 - anchor 通道 +1.0
-- 通道权重 visual 2.5 / lexical 1.0 / text 0.5 / metadata 1.0 / entity 1.0 / adjacency 0.5
+- 冻结通道权重 visual 2.5 / lexical 1.0 / text 0.5 / metadata 1.0 / entity 1.0 /
+  adjacency 0.5；graph 的 0.5 是新能力的应用层覆盖，不改冻结基线常量。
 
 权重不是拍脑袋：R7 消融里 chinese-clip 视觉 r10=0.887、词法 0.373、文本 0.158，
 平权 RRF 会让弱通道把强通道稀释掉，混合反而低于纯视觉。改任何一个数字前先改基线。
@@ -13,7 +14,8 @@
 通道分三类：
 - **anchor**（metadata / entity）：确定性锚点，融合后加固定加成；
 - **semantic**（lexical / visual_ann / text_ann）：只按 RRF 名次融合；
-- **expander**（adjacency）：继承种子，不独立提升，默认关闭。
+- **expander**（adjacency / graph）：继承种子，不独立提升；graph 是新的可选派生通道，
+  adjacency 仍按冻结契约保留但不重新启用。
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ RRF_K = 60
 ANCHOR_BOOST = 1.0
 
 ANCHOR_CHANNELS = ("metadata", "entity")
-EXPANDER_CHANNELS = ("adjacency",)
+EXPANDER_CHANNELS = ("adjacency", "graph")
 
 DEFAULT_CHANNEL_WEIGHTS: Mapping[str, float] = {
     "visual_ann": 2.5,

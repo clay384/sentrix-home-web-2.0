@@ -101,6 +101,20 @@ export function App({ initialLoading = false }: AppProps) {
 
   const [selectedAlbum, setSelectedAlbum] = useState("album3-14");
   const [selectedQa, setSelectedQa] = useState("compact-10q");
+
+  // 相册切换后，QA 题集必须跟随当前 manifest。否则旧相册的默认题集会
+  // 被继续提交，例如把 album3 的 compact-10q 发给 human-daily-video-30-v12，
+  // 后端会正确拒绝为 unknown qa_set。只在当前选择无效时回退到该相册的第一套题集。
+  useEffect(() => {
+    const manifest = configApi.manifests.find((item) => item.album_id === selectedAlbum);
+    if (!manifest) {
+      if (configApi.manifests.length > 0) setSelectedAlbum(configApi.manifests[0]!.album_id);
+      return;
+    }
+    const qaSets = manifest.qa_sets || [];
+    if (qaSets.length > 0 && !qaSets.includes(selectedQa)) setSelectedQa(qaSets[0]!);
+  }, [configApi.manifests, selectedAlbum, selectedQa]);
+
   const reuseApi = useReuseMode({
     manifests: configApi.manifests,
     runs: runs.runs,
@@ -217,9 +231,12 @@ export function App({ initialLoading = false }: AppProps) {
       return;
     setSuiteRunning(true);
     try {
+      const selectedManifest = configApi.manifests.find((item) => item.album_id === selectedAlbum);
+      const qaSets = selectedManifest?.qa_sets || [];
+      const effectiveQa = qaSets.includes(selectedQa) ? selectedQa : (qaSets[0] || selectedQa);
       const result = await post<{ run_ids?: string[] }>("/runs", {
         album_id: selectedAlbum,
-        qa_set: reuseApi.runMode === "build" ? undefined : selectedQa,
+        qa_set: reuseApi.runMode === "build" ? undefined : effectiveQa,
         mode: reuseApi.runMode,
         existing_scope_id: reuseApi.runMode === "reuse" ? reuseApi.existingScopeId : undefined,
         models: [...selectedModels],

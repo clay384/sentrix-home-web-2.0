@@ -25,9 +25,10 @@
 from __future__ import annotations
 
 import hashlib
+import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -77,6 +78,9 @@ class VideoSceneExtraction:
     keyframe_count: int = 0
     reused: int = 0
     reason: str = ""
+    # 各阶段墙钟耗时（秒）。关键帧提取与关键帧记忆构建必须分开：前者是 ffmpeg I/O，
+    # 后者才会调用视觉/VLM/人脸/实体/事实流水线，把两者揉成一个数无法判断瓶颈。
+    timings: dict[str, float] = field(default_factory=dict)
 
 
 class ExtractVideoScenes:
@@ -105,36 +109,56 @@ class ExtractVideoScenes:
         self._clock = clock
 
     def execute(self, source_asset_id: str) -> VideoSceneExtraction:
+        total_started = time.perf_counter()
         asset = self._assets.get(source_asset_id)
         if asset is None or asset.media_type is not MediaType.VIDEO:
-            return VideoSceneExtraction(reason="not_a_video")
+            return VideoSceneExtraction(
+                reason="not_a_video", timings={"total": round(time.perf_counter() - total_started, 3)}
+            )
 
         probe = self._video_repository.probe(source_asset_id)
         duration = (probe.metadata.duration_sec if probe and probe.metadata else 0.0) or 0.0
+        planning_started = time.perf_counter()
         windows = (
             self._scene_planner(Path(asset.path), asset.id, duration)
             if self._scene_planner is not None
             else plan_scenes(duration)
         )
+        planning_seconds = time.perf_counter() - planning_started
         if not windows:
             # 探测没读到时长（ffprobe 失败 / 还没探测过）。**不猜时长**：编一个只会
             # 得到「场景数量看着对、时间全是假的」，而那是没人能看出来的错误。
-            return VideoSceneExtraction(reason="no_duration")
+            return VideoSceneExtraction(
+                reason="no_duration",
+                timings={
+                    "scene_planning": round(planning_seconds, 3),
+                    "total": round(time.perf_counter() - total_started, 3),
+                },
+            )
 
         place = self._places.get(source_asset_id)
         place_text = place.display() if place else UNKNOWN_PLACE
         existing = {item.source_frame_index for item in self._video_repository.list_derived(source_asset_id)}
 
         scene_count = keyframe_count = reused = 0
+        scene_write_seconds = 0.0
+        keyframe_extract_seconds = 0.0
+        keyframe_asset_write_seconds = 0.0
+        keyframe_memory_seconds = 0.0
         for window in windows:
+            scene_started = time.perf_counter()
             event = self._ensure_scene_event(asset, window, place_text)
+            scene_write_seconds += time.perf_counter() - scene_started
             scene_count += 1
             if window.index in existing:
                 reused += 1
                 continue
+            extract_started = time.perf_counter()
             frame = self._keyframes.extract(
                 Path(asset.path), asset.id, window.index, window.keyframe_timestamp_sec
             )
+            keyframe_extract_seconds += time.perf_counter() - extract_started
+            asset_write_started = time.perf_counter()
             derived = self._derived_asset(asset, frame, window)
             self._video_repository.add_derived(
                 parent_asset_id=asset.id,
@@ -144,10 +168,25 @@ class ExtractVideoScenes:
                 source_frame_index=window.index,
                 source_scene_index=window.index,
             )
+            keyframe_asset_write_seconds += time.perf_counter() - asset_write_started
+            memory_started = time.perf_counter()
             self._process_image(derived, event.id)
+            keyframe_memory_seconds += time.perf_counter() - memory_started
             keyframe_count += 1
 
-        return VideoSceneExtraction(scene_count=scene_count, keyframe_count=keyframe_count, reused=reused)
+        return VideoSceneExtraction(
+            scene_count=scene_count,
+            keyframe_count=keyframe_count,
+            reused=reused,
+            timings={
+                "scene_planning": round(planning_seconds, 3),
+                "scene_write": round(scene_write_seconds, 3),
+                "keyframe_extraction": round(keyframe_extract_seconds, 3),
+                "keyframe_asset_write": round(keyframe_asset_write_seconds, 3),
+                "keyframe_memory": round(keyframe_memory_seconds, 3),
+                "total": round(time.perf_counter() - total_started, 3),
+            },
+        )
 
     # ---- 内部 ----------------------------------------------------------------
 

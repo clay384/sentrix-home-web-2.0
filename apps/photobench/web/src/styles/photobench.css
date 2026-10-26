@@ -555,6 +555,11 @@ label,.field-label { display:block; min-width:0; color:var(--muted); font-size:1
 .mode-badge.mode-build { color: #047857; background: #ecfdf5; border: 1px solid #a7f3d0; }
 .mode-hint { max-width: 360px; }
 
+.graph-quality-panel h4 { margin: 18px 0 8px; }
+.graph-quality-metrics { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+.graph-quality-table-wrap { margin-top: 8px; }
+.graph-quality-table th, .graph-quality-table td { white-space: nowrap; }
+
 /* 两级时延组成：每个色块只显示短时延，完整语义通过悬浮提示和图例查看。 */
 .latency-composition { margin: 9px 0 11px; padding: 8px 9px; border: 1px solid #dfe3ef; border-radius: 7px; background: #fff; }
 .latency-composition-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:6px; color:var(--muted); font-size:10px; }

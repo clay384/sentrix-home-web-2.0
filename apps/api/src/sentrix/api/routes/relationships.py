@@ -35,6 +35,7 @@ from fastapi import APIRouter, Depends
 
 from sentrix.api.deps import get_container
 from sentrix.api.errors import InvalidRequestError, NotFoundError
+from sentrix.api.routes.media import refresh_memory_graph
 from sentrix.api.schemas.relationships import (
     RelationshipBatchRequest,
     RelationshipBatchResponse,
@@ -175,6 +176,7 @@ def create_relationship(
         confidence=float(payload.confidence or DEFAULT_CONFIDENCE),
         status=status,
     )
+    refresh_memory_graph(container, created.scope_id)
     return _payload(created)
 
 
@@ -203,6 +205,8 @@ def import_relationships(
             for item in payload.relationships or []
         ],
     )
+    if payload.scope_id:
+        refresh_memory_graph(container, payload.scope_id)
     return RelationshipBatchResponse(
         requested=outcome.requested,
         imported=outcome.imported,
@@ -233,6 +237,7 @@ def confirm_relationship(
     confirmed = container.relationship_repository.confirm(relationship_id)
     if confirmed is None:
         raise NotFoundError("relationship not found")
+    refresh_memory_graph(container, confirmed.scope_id)
     return _payload(confirmed)
 
 
@@ -245,4 +250,5 @@ def retract_relationship(
     retracted = container.relationship_repository.retract(relationship_id)
     if retracted is None:
         raise NotFoundError("relationship not found")
+    refresh_memory_graph(container, retracted.scope_id)
     return _payload(retracted)

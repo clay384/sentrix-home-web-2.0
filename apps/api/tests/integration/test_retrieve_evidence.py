@@ -21,6 +21,7 @@ from sentrix.application.retrieval.retrieve_evidence import (
     EvidenceRequest,
     RetrieveEvidence,
 )
+from sentrix.application.retrieval.retrieve_graph import GraphSearchResult
 from sentrix.application.retrieval.retrieve_lexical import RetrieveLexical
 from sentrix.application.retrieval.retrieve_metadata import RetrieveMetadata
 from sentrix.application.retrieval.retrieve_text_ann import RetrieveTextAnn
@@ -35,6 +36,7 @@ from sentrix.domain.places.models import (
     PlaceSource,
 )
 from sentrix.domain.retrieval import scheme
+from sentrix.domain.retrieval.models import CandidateHit
 from sentrix.domain.retrieval.ports import VectorRecord
 from sentrix.infrastructure.persistence.database import Database
 from sentrix.infrastructure.persistence.repositories.asset_places import SqliteAssetPlaceRepository
@@ -174,7 +176,7 @@ class ScriptedTextEmbedder:
         return [1.0, 0.0, 0.0]
 
 
-def build(library) -> RetrieveEvidence:
+def build(library, *, graph=None) -> RetrieveEvidence:
     def recognize_place(asset_id: str) -> bool:
         """「这张图本来就该有地点」= asset 上有 GPS（与 ``routes/search.py`` 同一判据）。"""
         asset = library["assets"].get(asset_id)
@@ -191,6 +193,7 @@ def build(library) -> RetrieveEvidence:
             recognize_place=recognize_place,
         ),
         text=RetrieveTextAnn(embedder=ScriptedTextEmbedder(), vectors=library["vectors"]),
+        graph=graph,
     )
 
 
@@ -336,6 +339,38 @@ def test_the_visual_channel_still_reports_its_backend_health(library):
     assert result.degraded is True
     assert result.degraded_reason == "no_index_configured"
     assert result.authoritative_vectors == 3
+
+
+class _RecordingGraph:
+    def __init__(self) -> None:
+        self.seeds: tuple[str, ...] = ()
+
+    def execute(self, *, seed_asset_ids, scope_id, limit, question=""):
+        self.seeds = tuple(seed_asset_ids)
+        return GraphSearchResult(
+            hits=(
+                CandidateHit(
+                    asset_id="asset_graph",
+                    channel="graph",
+                    rank=1,
+                    raw_score=0.8,
+                    score_kind="graph_path",
+                ),
+            )
+        )
+
+
+def test_graph_expansion_uses_primary_head_and_reaches_the_final_hybrid_result(library):
+    graph = _RecordingGraph()
+    use_case = build(library, graph=graph)
+
+    result = use_case.execute(EvidenceRequest(text="海边", scope_id=SCOPE, limit=2))
+
+    assert graph.seeds == ("asset_b", "asset_c")
+    assert [hit.asset_id for hit in result.hits] == ["asset_b", "asset_graph"]
+    assert result.graph_asset_ids == ("asset_graph",)
+    assert result.primary_asset_ids == ("asset_b", "asset_c")
+    assert result.fused_asset_ids == ("asset_b", "asset_graph")
 
 
 # ---- 通道轨迹（T125：S6 的验收条件）------------------------------------------------

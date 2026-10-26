@@ -36,6 +36,7 @@ from typing import Any
 
 from sentrix.application.assistant.query_memory_facts import QueryMemoryFacts
 from sentrix.application.retrieval.retrieve_evidence import EvidenceRequest, RetrieveEvidence
+from sentrix.application.retrieval.retrieve_graph import graph_direction, graph_intent
 from sentrix.domain.assistant.evidence_ledger import EvidenceType
 from sentrix.domain.assistant.models import Attachment
 from sentrix.domain.assistant.ports import PersonDirectory, ResultSetRepository
@@ -271,6 +272,18 @@ class AssistantToolbox:
             evidence_classes={hit.asset_id: hit.evidence_class for hit in result.hits},
         )
         self._result_sets.add(result_set)
+        channel_trace = [
+            {
+                "channel": trace.channel,
+                "status": trace.status,
+                "candidate_count": trace.candidate_count,
+                "latency_ms": trace.latency_ms,
+                "backend": trace.backend,
+                "reason": trace.reason,
+            }
+            for trace in result.channel_trace
+        ]
+        graph_trace = next((trace for trace in channel_trace if trace["channel"] == "graph"), None)
         return self._page_outcome(
             result_set,
             page_no=1,
@@ -279,6 +292,16 @@ class AssistantToolbox:
                 "degraded": result.degraded,
                 "degraded_reason": result.degraded_reason,
                 "authoritative_vectors": result.authoritative_vectors,
+                # 图评测只读这份内部遥测；不要放进 model_visible，避免模型把
+                # 「图前/图后」候选数量当作答案事实。
+                "retrieval_channels": channel_trace,
+                "graph_routed": graph_trace is not None,
+                # degraded 只表示图通道被尝试但不可用；只有 ok 才能说图实际参与了检索。
+                "graph_enabled": graph_trace is not None and graph_trace["status"] == "ok",
+                "graph_candidate_asset_ids": list(result.graph_asset_ids),
+                "graph_primary_asset_ids": list(result.primary_asset_ids),
+                "graph_fused_asset_ids": list(result.fused_asset_ids),
+                "graph_policy": {"intent": graph_intent(query), "direction": graph_direction(query)},
             },
         )
 

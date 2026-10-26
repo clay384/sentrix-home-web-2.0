@@ -45,6 +45,7 @@ make pb-dev         # PhotoBench 8772
 
 ```bash
 SENTRIX_DEPLOYMENT_PROFILE=mac ./scripts/deploy/start_legacy_mac.sh
+./scripts/deploy/start_photobench_mac.sh  # PhotoBench 8772；保留 Mac legacy 重启环境
 ```
 
 详见 [`docs/runbooks/mac-mini-legacy.md`](docs/runbooks/mac-mini-legacy.md)。
@@ -99,6 +100,8 @@ docs/refactor/     重构计划、裁决、能力登记、偏离记录
 docs/runbooks/     部署与运维手册
 scripts/           开发、部署、维护脚本
 ```
+
+记忆构建沿用 2.0 原有资产/观察/事件/实体/事实/向量流水线，不引入旧版记忆生成器。可插拔的 `BuildMemoryGraph` 从这些标准端口构建事件、上下文、同视频关键帧时序、对象/关系枢纽、互选视觉近邻和 `rules_vlm` 因果边；`RetrieveGraph` 按问题类型有界拓展，原回答提示词和生成器不变。图效果的参考边从节点来源字段重建，不能把构图边自身当真值；详见 `docs/refactor/hpq-causal-deviations.md`。当前观察没有 bbox，因果规则仍使用 hpq 的 label-only 回退。
 
 ---
 

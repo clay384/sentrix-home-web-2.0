@@ -69,6 +69,71 @@ def test_import_batch_reports_each_file_once_across_reruns(client: TestClient, t
     assert again.json()["deduplicated"] == 1
 
 
+def test_asset_import_and_pipeline_are_two_real_phases(client: TestClient, tmp_path: Path):
+    root = str(album(tmp_path, count=2))
+
+    staged = client.post("/api/v1/imports/assets", json={"directory": root, "scope_id": "album-split"})
+
+    assert staged.status_code == 201
+    staged_body = staged.json()
+    assert staged_body["imported"] == 2
+    assert len(staged_body["asset_ids"]) == 2
+    assert staged_body["timings"]["asset_import"] >= 0
+    listed = client.get("/api/v1/assets", params={"scope_id": "album-split"}).json()["items"]
+    assert {item["status"] for item in listed} == {"queued"}
+    assert client.get("/api/v1/timeline", params={"scope_id": "album-split"}).json()["total"] == 0
+
+    processed = client.post(
+        "/api/v1/pipeline/process",
+        json={"scope_id": "album-split", "asset_ids": staged_body["asset_ids"]},
+    )
+
+    assert processed.status_code == 200
+    body = processed.json()
+    assert body["processed"] == 2
+    assert body["failures"] == []
+    assert body["timings"]["source_memory_prepare"] >= 0
+    assert body["timings"]["source_memory_commit"] >= 0
+    assert body["timings"]["memory_graph"] >= 0
+    assert body["timings"]["total"] >= body["timings"]["memory_graph"]
+    assert body["memory_graph"]["node_count"] > 0
+    assert body["memory_graph"]["causal_status"] == "no_candidates"
+    assert body["memory_graph"]["causal_candidate_pairs"] == 0
+    assert body["memory_graph"]["keyframe_count"] == 0
+    assert body["memory_graph"]["keyframe_visual_status"] == "no_frames"
+    assert body["timings"]["causal_graph"] >= 0
+    listed = client.get("/api/v1/assets", params={"scope_id": "album-split"}).json()["items"]
+    assert {item["status"] for item in listed} == {"processed"}
+    assert client.get("/api/v1/timeline", params={"scope_id": "album-split"}).json()["total"] > 0
+
+
+def test_video_keyframes_and_their_memories_wait_for_pipeline(client: TestClient, tmp_path: Path):
+    root = tmp_path / "videos"
+    root.mkdir()
+    (root / "clip.mov").write_bytes(b"fake-mov-bytes")
+
+    staged = client.post("/api/v1/imports/assets", json={"directory": str(root), "scope_id": "video-split"})
+    assert staged.status_code == 201
+    asset_id = staged.json()["asset_ids"][0]
+    before = client.get(f"/api/v1/videos/{asset_id}").json()
+    assert before["video"]["metadata"]["duration_sec"] == 12.5
+    assert before["scenes"] == []
+    assert client.app.state.container.video_repository.list_derived(asset_id) == []  # type: ignore[attr-defined]
+
+    processed = client.post(
+        "/api/v1/pipeline/process",
+        json={"scope_id": "video-split", "asset_ids": [asset_id]},
+    )
+    assert processed.status_code == 200
+    body = processed.json()
+    assert body["processed"] == 1
+    assert body["video_scenes"] == 1
+    assert body["timings"]["video_keyframe_extraction"] >= 0
+    assert body["timings"]["video_keyframe_memory"] >= 0
+    assert len(client.get(f"/api/v1/videos/{asset_id}").json()["scenes"]) == 1
+    assert len(client.app.state.container.video_repository.list_derived(asset_id)) == 1  # type: ignore[attr-defined]
+
+
 def test_import_batch_rejects_a_missing_directory(client: TestClient, tmp_path: Path):
     response = client.post(
         "/api/v1/imports",

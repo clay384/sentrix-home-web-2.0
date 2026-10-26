@@ -75,9 +75,11 @@ describe("loadActiveRun 的并发关系（1.0 :2310-2332）", () => {
     expect(apiMock.mock.calls.map((call) => call[0])).toEqual([
       "/runs/r1/keyframe-analysis",
       "/runs/r1/memory-effectiveness",
+      "/runs/r1/graph-quality",
       "/runs/r1?include_history=false",
       "/runs/r1/keyframe-analysis",
       "/runs/r1/memory-effectiveness",
+      "/runs/r1/graph-quality",
     ]);
   });
 

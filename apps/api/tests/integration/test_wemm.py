@@ -266,6 +266,7 @@ def test_available_is_false_when_the_probe_fails():
     embedder, _ = build(refused)
 
     assert embedder.available is False
+    assert "侧车没起" in embedder.load_error
 
 
 def test_load_error_names_the_cause_while_available_answers_a_different_question():

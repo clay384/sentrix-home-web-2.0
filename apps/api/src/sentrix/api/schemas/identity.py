@@ -23,6 +23,7 @@ class FaceCropRef(BaseModel):
     bbox: list[float]
     detection_confidence: float
     quality: float
+    validity: str
     crop_url: str
 
 

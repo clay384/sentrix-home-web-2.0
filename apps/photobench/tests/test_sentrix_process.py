@@ -175,6 +175,53 @@ def test_restart_uses_frozen_model_and_embedding_even_after_global_config_change
     assert process.running_endpoint() == ""  # Same model does not imply the same embedding topology.
 
 
+def test_restart_passes_frozen_mac_profile_and_cpu_providers(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SENTRIX_DEPLOYMENT_PROFILE", "server")
+    monkeypatch.setenv("FACE_PROVIDERS", "CUDAExecutionProvider,CPUExecutionProvider")
+    connection = {
+        "model_base_url": ENDPOINT,
+        "embedding": {
+            "mode": "split_text_image",
+            "text_url": "http://127.0.0.1:8101",
+            "image_url": "http://127.0.0.1:8103",
+        },
+        "product_settings": {
+            "deployment_profile": "mac",
+            "agent_wall_time_s": 600.0,
+            "chat_timeout_s": 180.0,
+            "face_providers": "CPUExecutionProvider",
+            "retinaface_providers": "CPUExecutionProvider",
+        },
+    }
+    harness = _Harness()
+    process = SubprocessSentrixProcess(
+        api_url="http://127.0.0.1:8191",
+        start_command=["not-executed"],
+        cwd=tmp_path,
+        pid_file=tmp_path / "process.json",
+        log_path=tmp_path / "sentrix.log",
+        http=FakeHttpClient([{"status": "ok"}]),
+        runtime_snapshot=RunRuntimeSnapshot(json.dumps(connection)),
+        environment={"SENTRIX_TEXT_EMBEDDER_URL": "http://stale:8101"},
+        spawn=harness.spawn,
+        alive=harness.alive,
+        discover=harness.discover,
+        terminate=harness.terminate,
+        sleep=lambda _seconds: None,
+        clock=harness.clock,
+    )
+    assert process.restart(endpoint=ENDPOINT).ok
+    env = harness.spawned[0][1]
+    assert env["SENTRIX_DEPLOYMENT_PROFILE"] == "mac"
+    assert env["SENTRIX_EMBEDDING_SCHEME"] == "legacy"
+    assert env["SENTRIX_TEXT_EMBEDDER_URL"] == "http://127.0.0.1:8101"
+    assert env["SENTRIX_LEGACY_CLIP_URL"] == "http://127.0.0.1:8103"
+    assert env["FACE_PROVIDERS"] == "CPUExecutionProvider"
+    assert env["RETINAFACE_PROVIDERS"] == "CPUExecutionProvider"
+    assert env["SENTRIX_AGENT_WALL_TIME_S"] == "600.0"
+    assert env["SENTRIX_CHAT_TIMEOUT_S"] == "180.0"
+
+
 def test_the_recorded_process_reports_the_endpoint_it_was_started_with(tmp_path: Path):
     """pid 记录是「当前端点」的真相来源——第二个实例读得到，才能判「要不要重启」。
 

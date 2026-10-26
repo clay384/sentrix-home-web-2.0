@@ -270,6 +270,16 @@ describe("phaseSummary：部分阶段缺失时各走各的回退（1.0 :2153-218
     expect(phaseSummary("pipeline_processing", { total_seconds: 4 })).toBe("耗时 4s");
   });
 
+  it("显式流水线摘要显示关键帧、帧记忆与图构建耗时", () => {
+    expect(
+      phaseSummary("pipeline_processing", {
+        progress: { processed: 2, total: 2, failed: 0, skipped: 0 },
+        total_seconds: 20,
+        timings: { video_keyframe_extraction: 4, video_keyframe_memory: 12, memory_graph: 0.4 },
+      }),
+    ).toBe("2/2 资产完成 · 0 失败 · 0 跳过 · 阶段墙钟 20s · 关键帧 4s · 帧记忆 12s · 图构建 0.4s");
+  });
+
   it("qa_eval：有 progress 展开 Agent/Judge，无 progress 用 itemCount 兜底", () => {
     expect(
       phaseSummary(
@@ -292,6 +302,13 @@ describe("phaseSummary：部分阶段缺失时各走各的回退（1.0 :2153-218
     expect(phaseSummary("qa_eval", { progress: { in_flight: 1, judge_total: 10 } }, 0)).toBe(
       "Agent 0/? · Judge 已结束 ?/10 · -",
     );
+    expect(
+      phaseSummary(
+        "qa_eval",
+        { progress: { completed: 74, agent_completed: 74, agent_total: 74 }, judge_completed: 71, judge_total: 74 },
+        0,
+      ),
+    ).toBe("Agent 74/74 · Judge 已结束 71/74 · -");
     expect(phaseSummary("qa_eval", { total_seconds: 9 }, 7)).toBe("7 题 · 9s");
   });
 
@@ -359,6 +376,19 @@ describe("pipelineMetricRows：缺失阶段走不同回退（1.0 :2199-2232）",
 
   it("墙钟均值两者都缺 → 未记录", () => {
     expect(pipelineMetricRows({ pipeline_metrics: {} })[0][1]).toBe("未记录");
+  });
+
+  it("显式流水线把不同阶段耗时列成独立指标", () => {
+    const rows = pipelineMetricRows({
+      timings: { source_memory_prepare: 10, video_keyframe_extraction: 4, memory_graph: 0.4, causal_graph: 0.2 },
+      pipeline_metrics: {},
+    });
+    expect(rows.slice(0, 4)).toEqual([
+      ["源媒体模型准备", "10s", "并发 worker 累计耗时"],
+      ["关键帧提取", "4s", "ffmpeg 抽帧墙钟累计"],
+      ["记忆图构建", "0.4s", "结构化图节点与边重建"],
+      ["因果边判定", "0.2s", "规则信号筛选与文本模型因果判定；包含在记忆图构建耗时内"],
+    ]);
   });
 });
 

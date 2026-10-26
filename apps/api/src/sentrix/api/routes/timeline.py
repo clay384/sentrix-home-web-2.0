@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -14,20 +15,29 @@ from sentrix.api.deps import get_container
 from sentrix.api.routes.family import TRIGGER_INGEST, run_family_graph_for_scope
 from sentrix.api.routes.identity import _confirmed_person_events
 from sentrix.api.routes.insights import run_insights_for_scope
-from sentrix.api.routes.media import build_import_assets
+from sentrix.api.routes.media import build_import_assets, refresh_memory_graph
 from sentrix.api.schemas.family import FamilyRunResponse
 from sentrix.api.schemas.timeline import (
+    AssetImportBatchResponse,
     ImportBatchRequest,
     ImportBatchResponse,
     ImportFailure,
     ImportProgressResponse,
     InsightCounts,
+    MemoryGraphBuildResponse,
+    PipelineProcessRequest,
+    PipelineProcessResponse,
     TimelineDay,
     TimelineEvent,
     TimelinePhoto,
     TimelineResponse,
 )
-from sentrix.application.media.import_album import AlbumImportRequest, ImportAlbum
+from sentrix.application.media.import_album import (
+    AlbumImportRequest,
+    AlbumProcessRequest,
+    ImportAlbum,
+    ProcessAlbumPipeline,
+)
 from sentrix.application.media.track_import import TrackImport
 from sentrix.application.memories.read_timeline import (
     DEFAULT_LIMIT,
@@ -200,6 +210,7 @@ def _execute_import(
         tracker.update(stage="participant_refresh")
     observations = container.observation_repository.list_scope(request.scope_id, limit=100000)
     _confirmed_person_events(container).refresh_participants([item.id for item in observations])
+    refresh_memory_graph(container, request.scope_id)
     # **顺序照 1.0**：``pipeline.py:733-734`` 是先 family 后 person-insights。
     if tracker:
         tracker.update(stage="family_graph")
@@ -224,6 +235,104 @@ def _execute_import(
     if tracker:
         tracker.update(status="completed", stage="completed", current_file=None)
     return response
+
+
+@router.post("/imports/assets", status_code=201)
+def import_album_assets(
+    request: ImportBatchRequest,
+    container: Container = Depends(get_container),
+) -> AssetImportBatchResponse:
+    """仅导入媒体资产；重活统一留给 ``POST /pipeline/process``。
+
+    这是新增兼容接口，既有 ``POST /imports`` 仍保留完整同步链，避免破坏产品端调用方。
+    """
+    album = ImportAlbum(importer=build_import_assets(container, observe=True))
+    try:
+        result = album.stage_only(
+            AlbumImportRequest(scope_id=request.scope_id, directory=request.directory, limit=request.limit)
+        )
+    except NotADirectoryError:
+        raise HTTPException(status_code=400, detail="directory not found") from None
+    return AssetImportBatchResponse(
+        scope_id=result.scope_id,
+        directory=result.directory,
+        imported=result.imported,
+        deduplicated=result.deduplicated,
+        asset_ids=list(result.asset_ids),
+        timings=dict(result.timings),
+        failures=[ImportFailure(file_name=item.file_name, reason=item.reason) for item in result.failures],
+    )
+
+
+@router.post("/pipeline/process")
+def process_album_pipeline(
+    request: PipelineProcessRequest,
+    container: Container = Depends(get_container),
+) -> PipelineProcessResponse:
+    """同步执行关键帧、记忆构建和图构建，并返回逐阶段耗时。"""
+    total_started = time.perf_counter()
+    pipeline = ProcessAlbumPipeline(
+        importer=build_import_assets(container, observe=True),
+        assets=container.asset_repository,
+        summarize_event=_summarize_event(container).execute,
+        workers=container.settings.album_workers,
+    )
+    result = pipeline.execute(
+        AlbumProcessRequest(scope_id=request.scope_id, asset_ids=tuple(request.asset_ids))
+    )
+    timings = dict(result.timings)
+
+    participant_started = time.perf_counter()
+    observations = container.observation_repository.list_scope(request.scope_id, limit=100000)
+    _confirmed_person_events(container).refresh_participants([item.id for item in observations])
+    timings["participant_projection"] = round(time.perf_counter() - participant_started, 3)
+
+    graph_started = time.perf_counter()
+    graph = refresh_memory_graph(container, request.scope_id)
+    timings["memory_graph"] = round(time.perf_counter() - graph_started, 3)
+    timings["causal_graph"] = graph.causal_seconds if graph is not None else 0.0
+
+    family_started = time.perf_counter()
+    family_graph = _maybe_run_family_graph(container, request.scope_id)
+    timings["family_graph"] = round(time.perf_counter() - family_started, 3)
+
+    insights_started = time.perf_counter()
+    insights = _maybe_run_insights(container, request.scope_id, result.processed)
+    timings["person_insights"] = round(time.perf_counter() - insights_started, 3)
+    timings["total"] = round(time.perf_counter() - total_started, 3)
+
+    return PipelineProcessResponse(
+        scope_id=result.scope_id,
+        processed=result.processed,
+        skipped=result.skipped,
+        events=result.events,
+        lexical_terms=result.lexical_terms,
+        video_scenes=result.video_scenes,
+        summarized=result.summarized,
+        timings=timings,
+        failures=[ImportFailure(file_name=item.file_name, reason=item.reason) for item in result.failures],
+        memory_graph=(
+            MemoryGraphBuildResponse(
+                scope_id=graph.scope_id,
+                node_count=graph.node_count,
+                edge_count=graph.edge_count,
+                causal_candidate_pairs=graph.causal_candidate_pairs,
+                causal_edges=graph.causal_edges,
+                causal_status=graph.causal_status,
+                causal_seconds=graph.causal_seconds,
+                keyframe_count=graph.keyframe_count,
+                keyframe_temporal_edges=graph.keyframe_temporal_edges,
+                keyframe_object_edges=graph.keyframe_object_edges,
+                keyframe_relation_edges=graph.keyframe_relation_edges,
+                keyframe_visual_edges=graph.keyframe_visual_edges,
+                keyframe_visual_status=graph.keyframe_visual_status,
+            )
+            if graph is not None
+            else None
+        ),
+        insights=insights,
+        family_graph=family_graph,
+    )
 
 
 def _watermark(stats: Mapping[str, object]) -> int:

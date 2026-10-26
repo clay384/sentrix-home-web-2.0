@@ -10,12 +10,16 @@ dependencies = [
     "python-multipart>=0.0.12,<1",
     "pillow>=11,<12",
     "pillow-heif>=0.18,<1",
+    "numpy>=1.26,<3",
     # 视觉记忆是**进程内**推理（设计 §2.2：模型适配属于 apps/api，进程生命周期
     # 不归 2.0 管的是 8100/8101 那些服务）。chinese-clip 的权重是
     # ~/.cache/clip/clip_cn_vit-l-14.pt，约 1.6GB，随 cn-clip 之外单独下载。
     "torch>=2.5,<3",
     "torchvision>=0.20,<1",
     "cn-clip>=1.6,<2",
+    # 本地 Mac legacy 部署的 BGE-M3 sidecar 使用 transformers 加载 CPU 权重；API
+    # 进程本身仍只通过 HTTP 访问它，不会因此在启动时载入文本模型。
+    "transformers>=4.48,<5",
     # 嵌入式 Qdrant 做派生索引；权威始终是 SQLite 的 memory_vectors。
     "qdrant-client>=1.12,<2",
     # 地点解析（设计 §3.3）：PyGeoCN 提供国内省/市/区县的**面**（内置 16MB 天地图边界

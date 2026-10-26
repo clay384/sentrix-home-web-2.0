@@ -41,6 +41,7 @@ from datetime import datetime
 
 from sentrix.application.retrieval.evaluate_conditions import EvaluateConditions
 from sentrix.application.retrieval.retrieve_entity import RetrieveEntity
+from sentrix.application.retrieval.retrieve_graph import GRAPH_CHANNEL, RetrieveGraph
 from sentrix.application.retrieval.retrieve_lexical import RetrieveLexical
 from sentrix.application.retrieval.retrieve_metadata import RetrieveMetadata
 from sentrix.application.retrieval.retrieve_text_ann import (
@@ -56,7 +57,7 @@ from sentrix.application.retrieval.retrieve_visual import (
 from sentrix.domain.media.models import MediaType
 from sentrix.domain.retrieval.conditions import Condition
 from sentrix.domain.retrieval.fusion import DEFAULT_CHANNEL_WEIGHTS, fuse
-from sentrix.domain.retrieval.models import CandidateHit, ChannelTrace
+from sentrix.domain.retrieval.models import CandidateHit, ChannelTrace, FusedCandidate
 
 log = logging.getLogger("sentrix.retrieval.evidence")
 
@@ -75,6 +76,7 @@ TEXT_CHANNEL = "text_ann"
 # （``retrieve_visual.py`` 的 ``OVERSAMPLE_FACTOR = 4``）：**融合前不裁到交付上限**，
 # 融合之后才按 limit 交付。
 RECALL_OVERSAMPLE_FACTOR = 4
+GRAPH_CHANNEL_WEIGHT = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +146,11 @@ class EvidenceResult:
     # 每个通道这一次的轨迹。1.0 ``EvidencePacket.channel_trace``——**§8 给 S6 的
     # 验收条件就是这一格**。顺序与融合的通道顺序一致（它有意义，见 ``execute``）。
     channel_trace: Sequence[ChannelTrace] = field(default_factory=tuple)
+    # PhotoBench 的图记忆评测需要知道「图加入前」和「最终交付」两份候选头。
+    # 这几格是内部遥测，不进入模型可见结果；助手工具会把它们写进 run trace。
+    primary_asset_ids: Sequence[str] = field(default_factory=tuple)
+    graph_asset_ids: Sequence[str] = field(default_factory=tuple)
+    fused_asset_ids: Sequence[str] = field(default_factory=tuple)
 
 
 def _visual_candidates_health(
@@ -198,7 +205,7 @@ def _text_candidates(result: TextSearchResult) -> tuple[CandidateHit, ...]:
 
 
 class RetrieveEvidence:
-    """四条 primary 通道（metadata / entity / lexical / visual_ann）→ 一次加权 RRF。"""
+    """五条 primary 通道 → 加权 RRF，再接可选的 graph 拓展通道。"""
 
     def __init__(
         self,
@@ -209,6 +216,7 @@ class RetrieveEvidence:
         entity: RetrieveEntity,
         text: RetrieveTextAnn,
         conditions: EvaluateConditions | None = None,
+        graph: RetrieveGraph | None = None,
     ) -> None:
         self._visual = visual
         self._lexical = lexical
@@ -216,6 +224,7 @@ class RetrieveEvidence:
         self._entity = entity
         self._text = text
         self._conditions = conditions
+        self._graph = graph
 
     def execute(self, request: EvidenceRequest) -> EvidenceResult:
         text = request.text.strip()
@@ -223,6 +232,8 @@ class RetrieveEvidence:
             return EvidenceResult()
         limit = max(1, request.limit)
         recall_limit = limit * RECALL_OVERSAMPLE_FACTOR
+        channel_weights = {**DEFAULT_CHANNEL_WEIGHTS, GRAPH_CHANNEL: GRAPH_CHANNEL_WEIGHT}
+        primary_weights = {name: weight for name, weight in channel_weights.items() if name != GRAPH_CHANNEL}
 
         # **每个通道都先记一条 trace，再谈命中**——1.0 ``evidence_retrieval.py:203-230``。
         # 通道抛异常时 ``channel_hits[name] = []`` 而 trace 照样留一条带 ``reason`` 的：
@@ -336,7 +347,48 @@ class RetrieveEvidence:
                 ),
             ),
         }
-        fused = fuse(channel_hits, channel_weights=DEFAULT_CHANNEL_WEIGHTS)
+        # 先固定 primary 基线，再把它的头部交给图做种子。不能把所有过取候选都
+        # 送进图：那会让一个低置信度的尾部命中扩大遍历面，也会令图效果基线失去
+        # 「图加入前实际交付头部」的含义。
+        primary_fused = fuse(channel_hits, channel_weights=primary_weights)
+
+        # 图是由 primary 结果提供种子的 expander，不参与前面的并行召回。
+        # 这样即使图尚未构建，原有五路检索仍然完整返回；图本身的降级会单独出现在
+        # channel_trace，而不是伪装成「没有相关结果」。
+        if self._graph is not None:
+            graph_started = time.monotonic()
+            try:
+                graph_result = self._graph.execute(
+                    seed_asset_ids=[candidate.asset_id for candidate in primary_fused[:limit]],
+                    scope_id=request.scope_id,
+                    limit=max(recall_limit, limit * 2),
+                    question=text,
+                )
+                channel_hits[GRAPH_CHANNEL] = graph_result.hits
+                traces.append(
+                    ChannelTrace(
+                        channel=GRAPH_CHANNEL,
+                        status="degraded" if graph_result.degraded else "ok",
+                        candidate_count=len(graph_result.hits),
+                        latency_ms=round((time.monotonic() - graph_started) * 1000, 1),
+                        backend=graph_result.backend,
+                        reason=graph_result.reason if graph_result.degraded else "",
+                    )
+                )
+            except Exception as error:  # noqa: BLE001 - 图是可降级的派生通道
+                log.warning("图记忆拓展抛异常，本次按空结果继续: %s", error)
+                channel_hits[GRAPH_CHANNEL] = ()
+                traces.append(
+                    ChannelTrace(
+                        channel=GRAPH_CHANNEL,
+                        status="error",
+                        candidate_count=0,
+                        latency_ms=round((time.monotonic() - graph_started) * 1000, 1),
+                        reason=str(error),
+                    )
+                )
+
+        fused = fuse(channel_hits, channel_weights=channel_weights)
 
         # **条件判定排在融合之后、交付之前。** 1.0 ``evidence_retrieval.py:325``
         # 的 ``_evaluate_fused`` 就是这个位置。放在前面（比如放在通道里）会变成
@@ -351,7 +403,47 @@ class RetrieveEvidence:
             )
             kept = set(outcome.kept)
             fused = [candidate for candidate in fused if candidate.asset_id in kept]
+            primary_fused = [candidate for candidate in primary_fused if candidate.asset_id in kept]
             excluded_count = outcome.excluded_count
+
+        # graph 是 expander，不应像第六条独立 primary 通道一样凭 RRF 分数把结果
+        # 全部压在尾部（primary 的 RRF 分数天然大一个数量级，旧实现因此在正常
+        # limit 下几乎永远看不到图扩展）。保留 primary 的排序作为基线，并为图扩展
+        # 预留一个小而确定的尾部窗口；窗口内按 graph 的 0.5 应用层权重与路径排名
+        # 选择，未命中时再由 primary 补位。这样既不改冻结 DEFAULT_CHANNEL_WEIGHTS，
+        # 也不会让图候选反向改变 primary 排名。
+        if channel_hits.get(GRAPH_CHANNEL):
+            primary_ids = {candidate.asset_id for candidate in primary_fused}
+            graph_candidates = [
+                candidate
+                for candidate in fused
+                if GRAPH_CHANNEL in candidate.channels and candidate.asset_id not in primary_ids
+            ]
+            graph_candidates.sort(
+                key=lambda candidate: (
+                    candidate.channels.get(GRAPH_CHANNEL, 10**9),
+                    -candidate.score,
+                    candidate.asset_id,
+                )
+            )
+            graph_slots = min(len(graph_candidates), max(1, min(4, limit // 4 or 1)))
+            selected: list[FusedCandidate] = [
+                *primary_fused[: max(0, limit - graph_slots)],
+                *graph_candidates[:graph_slots],
+            ]
+            selected_ids = {candidate.asset_id for candidate in selected}
+            if len(selected) < limit:
+                selected.extend(
+                    candidate for candidate in primary_fused if candidate.asset_id not in selected_ids
+                )
+                selected = selected[:limit]
+            fused = selected
+        else:
+            fused = primary_fused[:limit]
+
+        graph_asset_ids = tuple(candidate.asset_id for candidate in channel_hits.get(GRAPH_CHANNEL, ()))
+        primary_asset_ids = tuple(candidate.asset_id for candidate in primary_fused[:limit])
+        fused_asset_ids = tuple(candidate.asset_id for candidate in fused[:limit])
 
         return EvidenceResult(
             hits=tuple(
@@ -370,4 +462,7 @@ class RetrieveEvidence:
             authoritative_vectors=visual_box[0].authoritative_vectors if visual_box else 0,
             excluded_count=excluded_count,
             channel_trace=tuple(traces),
+            primary_asset_ids=primary_asset_ids,
+            graph_asset_ids=graph_asset_ids,
+            fused_asset_ids=fused_asset_ids,
         )

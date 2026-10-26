@@ -151,7 +151,7 @@ export function PhaseList({ activeRun }: PhaseListProps) {
                   {errors.length > 20 ? <p>仅展示前 20 条，完整记录已保存在 run.json。</p> : null}
                 </details>
               ) : null}
-              {phaseDef.key === "pipeline_processing" && phase?.progress ? (
+              {(phaseDef.key === "photo_import" || phaseDef.key === "pipeline_processing") && phase?.progress ? (
                 <div className="phase-bar">
                   <div className="phase-bar-fill" style={{ width: `${phasePercent(phase)}%` }} />
                 </div>

@@ -23,6 +23,7 @@ from sentrix import __version__
 from sentrix.api.errors import domain_error_handler
 from sentrix.api.routes import (
     assistant,
+    diagnostics,
     facts,
     family,
     health,
@@ -150,6 +151,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     v1.include_router(media.router)
     v1.include_router(search.router)
     v1.include_router(assistant.router)
+    v1.include_router(diagnostics.router)
     v1.include_router(timeline.router)
     # 视频端点（S8a）。与 timeline 分开：视频那四条有自己的响应形状与血缘读法。
     v1.include_router(videos.router)

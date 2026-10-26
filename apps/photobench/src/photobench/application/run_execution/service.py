@@ -22,11 +22,11 @@
 ``scope_attach``          删。它是 reuse 模式的入口，而 reuse 依赖写侧路由（S9b-3）。
 ``identity_seed``         逐个 ``POST /people/seed``（1.0 的 ``seed-batch`` 在 2.0 不存在）
                           + ``POST /relationships/batch``。
-``photo_import``          按媒体目录逐个 ``POST /api/v1/imports``。**2.0 收的是服务端
-                          目录**，不是上传的字节——这是本切片最大的一条形状变化。
-``pipeline_processing``   轮询 ``GET /api/v1/assets``。2.0 的导入是**同步**的，所以这里
-                          通常一两次就收敛；保留轮询是因为它是 1.0 的契约，
-                          而且它是「导入真的落库了」的独立证据。
+``photo_import``          按媒体目录逐个 ``POST /api/v1/imports/assets``，只做资产落盘、
+                          元数据探测与 queued 登记；**目录是主 API 所在机器的路径**。
+``pipeline_processing``   同步 ``POST /api/v1/pipeline/process`` 执行关键帧、记忆构建与
+                          图构建；请求进行时旁路轮询 ``GET /assets`` 展示真实状态进度。
+                          不支持新能力的第三方客户端仍走旧 `/imports` + 轮询兼容路径。
 ``qa_eval``               每题一个会话：``POST /assistant/conversations`` 建会话，
                           逐条消息 ``POST .../turns`` 再轮询到终态。**Agent 池与 Judge
                           池是两个池**（1.0 ``:3103``）：Agent 一完成就立刻排进 Judge 池。
@@ -106,6 +106,25 @@ PIPELINE_FAILED_STATUSES = frozenset({"failed"})
 
 #: 2.0 的 ``TurnStatus``（``domain/assistant/models.py:40``）里非终态的两种。
 TURN_PENDING_STATUSES = frozenset({"pending", "running"})
+#: 单次轮询请求的超时不能与整条回合等待上限混为一谈。Mac 上做视频视觉取证时，
+#: Sentrix 的轮询端点偶尔会被同一进程里的重计算拖到 30 秒以上；原先沿用
+#: ``SentrixClient.get_turn`` 的 30 秒默认值，会把一个随后已经落库的回合误记成
+#: ``agent_error``。这里给轮询一个独立的网络预算，整条回合仍由 ``RunRequest.turn_timeout``
+#: 控制。
+TURN_POLL_HTTP_TIMEOUT_SECONDS = 60
+#: 连接级短暂错误不应让已经在服务端运行的回合丢失。重试有上限且受同一个回合
+#: deadline 约束；非瞬态错误（例如 404）仍然立即冒出。
+TURN_POLL_RETRY_BACKOFF_SECONDS = (0.5, 1.0, 2.0, 4.0)
+TRANSIENT_TURN_POLL_ERROR_MARKERS = (
+    "timed out",
+    "timeout",
+    "bad file descriptor",
+    "connection reset",
+    "connection aborted",
+    "server disconnected",
+    "broken pipe",
+    "temporarily unavailable",
+)
 
 #: 模型装载的参数。1.0 是写死的局部量（``:2557`` / ``:2568``），抽成模块常量只为
 #: 让用例能 monkeypatch——**在用例里真睡 5 秒 + 30 秒退避是不可接受的**，而那两段
@@ -118,6 +137,11 @@ MODEL_READY_TIMEOUT_SECONDS = 600
 
 #: 管道轮询的间隔与停滞阈值（1.0 ``:2661`` 的 ``PHOTOBENCH_PIPELINE_STALL_TIMEOUT_SECONDS``）。
 PIPELINE_POLL_SECONDS = 3.0
+#: 整册导入本身是一个同步长请求；评测端把它放到一个线程里后，用资产列表做轻量
+#: 旁路采样。间隔不能太小——导入线程已经在占用 API 的线程池，进度只需接近实时即可。
+IMPORT_PROGRESS_POLL_SECONDS = max(
+    0.5, float(os.environ.get("PHOTOBENCH_IMPORT_PROGRESS_POLL_SECONDS", "1.0"))
+)
 DEFAULT_STALL_TIMEOUT_SECONDS = 1200
 
 #: 1.0 ``:213`` 的 ``LIVE_TELEMETRY_TAIL_POINTS``：run.json 里的实时曲线只留尾部
@@ -183,6 +207,8 @@ class RunRequest:
     sentrix_url: str
     manager_url: str = ""
     model_base_url: str = ""
+    #: ``__current__`` 是 UI 的选择占位符；保存真实端点模型名，供列表和报告展示。
+    endpoint_model: str = ""
     run_id: str = ""
     #: ``full`` 或 ``reuse``。``reuse`` 时 ``scope_id`` 必须是**已存在**的空间，
     #: 且三个导入相位会被跳过（1.0 的 ``scope_attach`` 那条路）。
@@ -343,7 +369,17 @@ class RunExecution:
             except Exception as exc:  # noqa: BLE001
                 state.set("cancel_vllm_stop_error", str(exc)[:300])
 
-    def execute(self, request: RunRequest) -> dict[str, Any]:
+    def prepare(self, request: RunRequest) -> RunState:
+        """创建并持久化 ``pending`` 状态，供后台线程开始前的读侧使用。
+
+        ``POST /runs`` 返回的是后台任务句柄。此前 ``execute`` 只在后台线程里创建
+        ``RunState``，所以请求返回与第一份 ``run.json`` 之间有一个竞态窗口：前端
+        立刻轮询时看不到这条 run，随后停止轮询；用户再次点击又会创建重复任务。
+        把元数据初始化提前到编排器返回响应前，既让列表/详情有稳定的读取对象，也
+        让 ``cancel`` 能在真正的阶段开始前拿到取消信号。
+        """
+        if self._state is not None:
+            return self._state
         run_id = request.run_id or f"run_{uuid.uuid4().hex[:12]}"
         album_id = request.album_id
         scope_id = request.scope_id or self._default_scope_id(album_id, request.model_profile)
@@ -381,7 +417,7 @@ class RunExecution:
             }
             self._state = RunState(initial, run_id=run_id, writer=self.writer)
             self._state.persist()
-            return self._state.data
+            return self._state
         state = RunState(
             initial,
             run_id=run_id,
@@ -396,6 +432,17 @@ class RunExecution:
         self._judge = None if request.mode == "build" else self._build_judge(request, state)
         state.start_persist_writer()
         state.persist()
+        return state
+
+    def execute(self, request: RunRequest) -> dict[str, Any]:
+        state = self.prepare(request)
+        # ``prepare`` may have already persisted a terminal initialization
+        # failure.  There is no phase to execute in that case; continuing would
+        # turn a dataset error into a misleading identity/QA failure (and could
+        # make a failed run appear completed).
+        if state.get("finished_at") and state.get("status") in {"failed", "cancelled"}:
+            return state.data
+        run_id = str(state.get("run_id") or request.run_id)
         sampler = GpuSampler(
             self.telemetry,
             on_sample=self._sample_writer(state),
@@ -575,6 +622,7 @@ class RunExecution:
             "album_name": manifest.get("album_name"),
             "model_profile": request.model_profile,
             "model_name": None,
+            "endpoint_model": request.endpoint_model or None,
             "model_identity": {"status": "pending"},
             "snapshot_source": request.snapshot_source,
             "execution_budgets": (
@@ -1135,11 +1183,11 @@ class RunExecution:
     # ---- photo_import -------------------------------------------------------
 
     def _phase_photo_import(self, state: RunState, request: RunRequest) -> None:
-        """1.0 ``:2733`` 的 2.0 版：**按目录整册导入**。
+        """1.0 ``:2733`` 的 2.0 版：**按目录只导入资产**。
 
         1.0 把 manifest 列的每个文件按 8 个一块上传到 ``POST /api/import``，再调
-        ``/api/ingest-batches/{id}/complete`` 收尾。2.0 两者都没有：``POST /api/v1/imports``
-        收一个**服务端目录**、**同步**跑完整条链，收尾是请求的一部分。
+        ``/api/ingest-batches/{id}/complete`` 收尾。新版 2.0 用 ``/imports/assets`` 收一个
+        **服务端目录**，只落资产；完整处理由下一相位的 ``/pipeline/process`` 执行。
 
         于是「哪些文件被导了」的权威从 manifest 变成了目录内容——这是 2.0 端点形状
         决定的（``ImportAlbum.execute`` 用 ``root.iterdir()`` 非递归扫后缀
@@ -1153,6 +1201,7 @@ class RunExecution:
         album_id = str(state.get("album_id"))
         manifest = self.albums.manifest(album_id)
         directories = import_directories(manifest)
+        total_media = len(album_media_entries(manifest))
         accepted = 0
         deduplicated = 0
         events = 0
@@ -1160,6 +1209,16 @@ class RunExecution:
         failures: list[dict[str, Any]] = []
         timings_total: dict[str, float] = {}
         per_directory: list[dict[str, Any]] = []
+        pipeline_asset_ids: list[str] = []
+        processed = 0
+        state.record_phase("photo_import", "total_media", total_media)
+        state.record_phase("photo_import", "processed_count", 0)
+        state.record_phase(
+            "photo_import",
+            "progress",
+            {"processed": 0, "total": total_media, "failed": 0, "skipped": 0},
+        )
+        self._persist(str(state.get("run_id")), state)
         scanned_count: int | None = 0
         for relative in directories:
             # 逐个目录检查取消（1.0 ``:2843``）：一个 7200 秒超时的导入正在跑时，
@@ -1180,37 +1239,68 @@ class RunExecution:
             state.persist()
             absolute, entry_count = self.albums.import_target(album_id, relative)
             limit = min(1000, max(1, entry_count))
+            explicit_pipeline = bool(getattr(self.client, "supports_explicit_pipeline", False))
+            if explicit_pipeline:
+                if getattr(self.client, "supports_live_import_progress", False):
+                    result, directory_processed = self._import_album_with_progress(
+                        state,
+                        scope_id=scope_id,
+                        directory=absolute,
+                        limit=limit,
+                        timeout=request.import_timeout,
+                        total_media=total_media,
+                        processed_before=processed,
+                    )
+                else:
+                    result = self.client.import_assets(
+                        scope_id=scope_id, directory=absolute, limit=limit, timeout=request.import_timeout
+                    )
+                    directory_processed = (
+                        int(result.get("imported") or 0)
+                        + int(result.get("deduplicated") or 0)
+                        + len(result.get("failures") or [])
+                    )
+                for asset_id in result.get("asset_ids") or []:
+                    value = str(asset_id or "").strip()
+                    if value and value not in pipeline_asset_ids:
+                        pipeline_asset_ids.append(value)
+            else:
 
-            def save_progress(observed: dict[str, Any]) -> None:
-                with state.lock:
-                    progress = dict(state.mutate("phases")["photo_import"].get("progress") or {})
-                    progress.update(observed)
-                    state.record_phase("photo_import", "progress", progress)
-                state.persist()
+                def save_progress(observed: dict[str, Any]) -> None:
+                    with state.lock:
+                        progress = dict(state.mutate("phases")["photo_import"].get("progress") or {})
+                        progress.update(observed)
+                        state.record_phase("photo_import", "progress", progress)
+                    state.persist()
 
-            result = import_with_progress(
-                self.client,
-                observe=save_progress,
-                scope_id=scope_id,
-                directory=absolute,
-                limit=limit,
-                timeout=request.import_timeout,
-            )
-            # 同步导入把「落库 + VLM 观察 + 归属 + 总结」都装在一个请求里；
-            # 分项耗时由后端回传，这里累加后单独记进相位，别让 64 分钟全叫「导入」。
+                result = import_with_progress(
+                    self.client,
+                    observe=save_progress,
+                    scope_id=scope_id,
+                    directory=absolute,
+                    limit=limit,
+                    timeout=request.import_timeout,
+                )
+                directory_processed = (
+                    int(result.get("imported") or 0)
+                    + int(result.get("deduplicated") or 0)
+                    + len(result.get("failures") or [])
+                )
+                raw_counts = [result.get("imported"), result.get("deduplicated")]
+                raw_failures = result.get("failures")
+                valid_counts = [
+                    value
+                    for value in raw_counts
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                ]
+                if scanned_count is not None and len(valid_counts) == 2 and isinstance(raw_failures, list):
+                    scanned_count += sum(valid_counts) + len(raw_failures)
+                else:
+                    scanned_count = None
+            # 新接口这里只返回资产导入耗时；兼容旧客户端时仍可能带 prepare/finish，
+            # 所以统一累加任意后端 timing 键，历史 run 也能继续展示。
             for key, value in (result.get("timings") or {}).items():
                 timings_total[key] = timings_total.get(key, 0.0) + float(value or 0)
-            raw_counts = [result.get("imported"), result.get("deduplicated")]
-            raw_failures = result.get("failures")
-            valid_counts = [
-                value
-                for value in raw_counts
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 0
-            ]
-            if scanned_count is not None and len(valid_counts) == 2 and isinstance(raw_failures, list):
-                scanned_count += sum(valid_counts) + len(raw_failures)
-            else:
-                scanned_count = None
             accepted += int(result.get("imported") or 0)
             deduplicated += int(result.get("deduplicated") or 0)
             events += int(result.get("events") or 0)
@@ -1241,31 +1331,41 @@ class RunExecution:
                     "progress": directory_progress,
                 }
             )
+            processed += directory_processed
             state.record_phase("photo_import", "accepted_count", accepted)
+            state.record_phase("photo_import", "processed_count", processed)
             state.record_phase(
                 "photo_import",
                 "progress",
                 {
                     **dict(state.mutate("phases")["photo_import"].get("progress") or {}),
+                    "processed": processed,
+                    "total": total_media,
+                    "failed": len(failures),
+                    "skipped": 0,
                     "directories_done": len(per_directory),
                     "directories_total": len(directories),
                     "request_status": "returned",
                 },
             )
             self._persist(str(state.get("run_id")), state)
-        total_media = len(album_media_entries(manifest))
         state.set("import_accepted_count", accepted)
+        if getattr(self.client, "supports_explicit_pipeline", False):
+            state.set("pipeline_asset_ids", pipeline_asset_ids)
         phase_result = {
             "total_seconds": round(time.perf_counter() - started, 1),
-            # **处理时间单独列出来**。`photo_import` 的 total 是整册墙钟，读起来像
-            # 「复制文件花了 64 分钟」；实际大头是 VLM 观察（prepare）与事件归属（finish）。
-            "pipeline_seconds": round(
-                timings_total.get("prepare", 0.0) + timings_total.get("finish", 0.0), 1
+            # 显式两阶段链下这里恒为 0：关键帧/记忆/图构建全部记到下一相位。
+            "pipeline_seconds": (
+                0.0
+                if getattr(self.client, "supports_explicit_pipeline", False)
+                else round(timings_total.get("prepare", 0.0) + timings_total.get("finish", 0.0), 1)
             ),
+            "asset_ids": pipeline_asset_ids,
             "timings": {key: round(value, 1) for key, value in timings_total.items()},
             "total_photos": len(manifest.get("photos") or []),
             "total_videos": len(manifest.get("videos") or []),
-            "total_media": total_media,  # manifest expectation retained for compatibility
+            "total_media": total_media,
+            "processed_count": processed,
             "scanned_count": scanned_count,  # actual product directory scans, including the limit
             "accepted_count": accepted,
             "deduplicated_count": deduplicated,
@@ -1281,13 +1381,86 @@ class RunExecution:
         else:
             state.phase_done("photo_import", phase_result)
 
+    def _import_album_with_progress(
+        self,
+        state: RunState,
+        *,
+        scope_id: str,
+        directory: str,
+        limit: int,
+        timeout: int,
+        total_media: int,
+        processed_before: int,
+    ) -> tuple[dict[str, Any], int]:
+        """执行同步资产导入，同时从资产列表旁路采样实时数量。
+
+        显式两阶段客户端调用 ``/imports/assets``；兼容客户端仍调用旧 ``/imports``。
+        两者都是同步请求，因此放进单 worker，评测端并行查询同一 scope 已落库的资产数，
+        让页面在请求返回前也能看到真实进度。
+        """
+        baseline = 0
+        try:
+            baseline = len(self.client.list_assets(scope_id=scope_id, limit=1000, timeout=60))
+        except Exception:  # noqa: BLE001 - 旁路进度失败不能影响导入主链
+            baseline = 0
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sentrix-import"
+        ) as pool:
+            import_call = (
+                self.client.import_assets
+                if getattr(self.client, "supports_explicit_pipeline", False)
+                else self.client.import_album
+            )
+            future = pool.submit(
+                import_call,
+                scope_id=scope_id,
+                directory=directory,
+                limit=limit,
+                timeout=timeout,
+            )
+            while not future.done():
+                try:
+                    visible = self.client.list_assets(scope_id=scope_id, limit=1000, timeout=60)
+                    current = max(0, len(visible) - baseline)
+                    processed = min(total_media, processed_before + current)
+                    state.record_phase("photo_import", "processed_count", processed)
+                    state.record_phase(
+                        "photo_import",
+                        "progress",
+                        {"processed": processed, "total": total_media, "failed": 0, "skipped": 0},
+                    )
+                    self._persist(str(state.get("run_id")), state)
+                except Exception:  # noqa: BLE001 - 进度旁路失败不应杀掉导入请求
+                    pass
+                self.sleep(IMPORT_PROGRESS_POLL_SECONDS)
+            result = future.result()
+
+        directory_processed = int(result.get("imported") or 0) + int(result.get("deduplicated") or 0)
+        directory_processed += len(result.get("failures") or [])
+        final_processed = min(total_media, processed_before + directory_processed)
+        state.record_phase("photo_import", "processed_count", final_processed)
+        state.record_phase(
+            "photo_import",
+            "progress",
+            {
+                "processed": final_processed,
+                "total": total_media,
+                "failed": len(result.get("failures") or []),
+                "skipped": 0,
+            },
+        )
+        self._persist(str(state.get("run_id")), state)
+        return result, directory_processed
+
     # ---- pipeline_processing ------------------------------------------------
 
     def _phase_processing(self, state: RunState, request: RunRequest) -> None:
-        """1.0 ``:2894`` 的 2.0 版：轮询资产状态直到没有待处理项。
+        """流水线处理；新客户端执行真实流水线，旧客户端保留状态轮询兼容路径。
 
-        1.0 同时看两处：``GET /api/assets`` 的状态计数与 ``GET /api/ingest-batches/{id}``
-        的批次状态。**2.0 没有批次**——导入是同步的，请求返回时流水线已经走完
+        以下正文描述的是旧客户端兼容路径。1.0 同时看两处：``GET /api/assets`` 的状态计数
+        与 ``GET /api/ingest-batches/{id}`` 的批次状态。**2.0 没有批次**——导入是同步的，
+        请求返回时流水线已经走完
         （``api/routes/timeline.py`` 的 docstring 明说）。所以这里只剩资产那一半，
         判据也只剩一条：连续两次采样都是零待处理。
 
@@ -1295,6 +1468,10 @@ class RunExecution:
         批次翻转落地（上传与流水线重叠）。2.0 里这个窗口更小，但**判据去掉它就会
         在状态行恰好还没写的瞬间收工**，而那正是这段代码唯一要防的事。
         """
+        if getattr(self.client, "supports_explicit_pipeline", False):
+            self._phase_processing_explicit(state, request)
+            return
+
         started = time.perf_counter()
         scope_id = str(state.get("scope_id"))
         stall_timeout = self._stall_timeout()
@@ -1420,6 +1597,167 @@ class RunExecution:
                 }
             ]
         if error_details or terminal_error or not assets:
+            state.phase_partial("pipeline_processing", phase_result)
+        else:
+            state.phase_done("pipeline_processing", phase_result)
+
+    def _phase_processing_explicit(self, state: RunState, request: RunRequest) -> None:
+        """调用主产品的真实流水线，同时旁路轮询源资产状态用于实时进度。"""
+        started = time.perf_counter()
+        scope_id = str(state.get("scope_id"))
+        asset_ids = [str(value) for value in (state.get("pipeline_asset_ids") or []) if value]
+        target_ids = set(asset_ids)
+        poll_count = 0
+        assets: list[dict[str, Any]] = []
+        state.record_phase(
+            "pipeline_processing",
+            "progress",
+            {"total": len(asset_ids), "processed": 0, "pending": len(asset_ids), "failed": 0},
+        )
+        self._persist(str(state.get("run_id")), state)
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sentrix-pipeline"
+        ) as pool:
+            future = pool.submit(
+                self.client.process_pipeline,
+                scope_id=scope_id,
+                asset_ids=asset_ids,
+                timeout=request.import_timeout,
+            )
+            while not future.done():
+                poll_count += 1
+                try:
+                    visible = self.client.list_assets(scope_id=scope_id, limit=1000, timeout=60)
+                    assets = [item for item in visible if str(item.get("id") or "") in target_ids]
+                    processed = [item for item in assets if item.get("status") == "processed"]
+                    pending = [item for item in assets if item.get("status") in PIPELINE_PENDING_STATUSES]
+                    failed = [item for item in assets if item.get("status") in PIPELINE_FAILED_STATUSES]
+                    status_counts: dict[str, int] = {}
+                    for asset in assets:
+                        status = str(asset.get("status") or "unknown")
+                        status_counts[status] = status_counts.get(status, 0) + 1
+                    state.record_phase(
+                        "pipeline_processing",
+                        "progress",
+                        {
+                            "total": len(asset_ids),
+                            "processed": len(processed),
+                            "pending": len(pending),
+                            "failed": len(failed),
+                            "poll_count": poll_count,
+                            "status_counts": status_counts,
+                        },
+                    )
+                    self._persist(str(state.get("run_id")), state)
+                except Exception:  # noqa: BLE001 - 进度旁路失败不影响流水线主请求
+                    pass
+                self._cancel_wait(PIPELINE_POLL_SECONDS)
+            result = future.result()
+
+        try:
+            visible = self.client.list_assets(scope_id=scope_id, limit=1000, timeout=60)
+            assets = [item for item in visible if str(item.get("id") or "") in target_ids]
+            poll_count += 1
+        except Exception:  # noqa: BLE001 - 最终状态可由主响应兜底
+            assets = []
+
+        response_failures = [item for item in (result.get("failures") or []) if isinstance(item, dict)]
+        error_details = [
+            {
+                "sample_id": item.get("file_name") or "unknown",
+                "status": "failed",
+                "error_type": "pipeline_error",
+                "reason": str(item.get("reason") or "资产流水线处理失败"),
+            }
+            for item in response_failures
+        ]
+        timings = {
+            str(key): round(float(value or 0.0), 3) for key, value in (result.get("timings") or {}).items()
+        }
+        processed_count = int(result.get("processed") or 0)
+        skipped_count = int(result.get("skipped") or 0)
+        failed_count = len(response_failures)
+        if asset_ids and result.get("memory_graph") is None:
+            error_details.append(
+                {
+                    "sample_id": "memory_graph",
+                    "status": "failed",
+                    "error_type": "graph_build_error",
+                    "reason": "记忆图构建未完成；源记忆已保留，请检查 API 日志后重试图投影",
+                }
+            )
+        graph_result = result.get("memory_graph")
+        if isinstance(graph_result, dict) and graph_result.get("causal_status") == "degraded":
+            error_details.append(
+                {
+                    "sample_id": "causal_graph",
+                    "status": "failed",
+                    "error_type": "causal_inference_error",
+                    "reason": "部分因果帧对判定失败；已保存其他图边，请检查 API 日志",
+                }
+            )
+        if isinstance(graph_result, dict) and graph_result.get("keyframe_visual_status") in {
+            "degraded",
+            "partial_vectors",
+            "vectors_unavailable",
+        }:
+            error_details.append(
+                {
+                    "sample_id": "visual_graph",
+                    "status": "failed",
+                    "error_type": "visual_graph_degraded",
+                    "reason": "关键帧视觉近邻边不完整；其他记忆图边已保存，请检查视觉向量索引",
+                }
+            )
+        final_processed = len([item for item in assets if item.get("status") == "processed"])
+        phase_result = {
+            "total_seconds": round(float(timings.get("total") or time.perf_counter() - started), 3),
+            "poll_iterations": poll_count,
+            "processed_photo_count": final_processed or processed_count + skipped_count,
+            "processed_asset_count": processed_count,
+            "failed_asset_count": failed_count,
+            "skipped_asset_count": skipped_count,
+            "event_count": int(result.get("events") or 0),
+            "video_scene_count": int(result.get("video_scenes") or 0),
+            "summarized_count": int(result.get("summarized") or 0),
+            "timings": timings,
+            "keyframe_extraction_seconds": timings.get("video_keyframe_extraction", 0.0),
+            "keyframe_memory_seconds": timings.get("video_keyframe_memory", 0.0),
+            "source_memory_prepare_worker_seconds": timings.get("source_memory_prepare", 0.0),
+            "source_memory_commit_seconds": timings.get("source_memory_commit", 0.0),
+            "graph_build_seconds": timings.get("memory_graph", 0.0),
+            "causal_graph_seconds": timings.get("causal_graph", 0.0),
+            "memory_graph": result.get("memory_graph"),
+            "error": (
+                f"{failed_count} 个资产流水线处理失败"
+                if failed_count
+                else "记忆图构建未完成"
+                if graph_result is None
+                else "因果边判定部分失败"
+                if error_details
+                else None
+            ),
+            "error_details": error_details,
+            "progress": {
+                "total": len(asset_ids),
+                "processed": final_processed or processed_count + skipped_count,
+                "pending": 0,
+                "failed": failed_count,
+                "skipped": skipped_count,
+            },
+        }
+        if not asset_ids:
+            phase_result["error"] = "资产导入阶段没有返回可处理的 asset_ids"
+            phase_result["error_details"] = [
+                {
+                    "sample_id": "media_batch",
+                    "status": "skipped",
+                    "error_type": "empty_import",
+                    "reason": "没有源资产进入流水线",
+                }
+            ]
+        if error_details or not asset_ids:
             state.phase_partial("pipeline_processing", phase_result)
         else:
             state.phase_done("pipeline_processing", phase_result)
@@ -2067,15 +2405,38 @@ class RunExecution:
         「模型答错/被 guard 拦下」与「网络断了」压成同一个 ``execution_status``。
         """
         deadline = time.monotonic() + request.turn_timeout
-        polled = self.client.get_turn(turn_id=turn_id)
-        while str(polled.get("status") or "") in TURN_PENDING_STATUSES:
+        retry_index = 0
+        while True:
+            try:
+                polled = self.client.get_turn(
+                    turn_id=turn_id,
+                    timeout=TURN_POLL_HTTP_TIMEOUT_SECONDS,
+                )
+                # 一次成功的轮询说明连接已经恢复，后续瞬态错误从最短退避重新开始。
+                retry_index = 0
+            except Exception as exc:  # noqa: BLE001 — 只吞连接级瞬态错误
+                error_text = f"{type(exc).__name__}: {exc}".lower()
+                transient = any(marker in error_text for marker in TRANSIENT_TURN_POLL_ERROR_MARKERS)
+                if not transient:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"assistant turn {turn_id} polling did not recover within {request.turn_timeout}s"
+                    ) from exc
+                backoff = TURN_POLL_RETRY_BACKOFF_SECONDS[
+                    min(retry_index, len(TURN_POLL_RETRY_BACKOFF_SECONDS) - 1)
+                ]
+                retry_index += 1
+                self._cancel_wait(min(backoff, max(0.0, deadline - time.monotonic())))
+                continue
+
+            if str(polled.get("status") or "") not in TURN_PENDING_STATUSES:
+                return polled
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"assistant turn {turn_id} did not complete within {request.turn_timeout}s"
                 )
             self._cancel_wait(0.5)
-            polled = self.client.get_turn(turn_id=turn_id)
-        return polled
 
 
 def _parse_sse_line(line: str) -> dict[str, Any] | None:

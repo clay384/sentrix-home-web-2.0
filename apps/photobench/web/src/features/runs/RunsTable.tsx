@@ -21,8 +21,8 @@ import { modeBadgeClass, modeLabel } from "../../lib/qaBrowser.ts";
 /** 1.0 `App.vue:2253-2262`。 */
 function runProgressLabel(run: Run): string {
   if (run.mode === "build") return "—";
-  if (run.qa_count === null) return "题目数未记录";
   const phase = run.phases?.qa_eval;
+  if (run.qa_count === null) return "题目数未记录";
   if (phase?.progress || phase?.judge_total != null) {
     return judgeProgressLabel(phase);
   }

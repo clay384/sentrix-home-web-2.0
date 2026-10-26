@@ -976,7 +976,9 @@ class RunTurn:
         log.warning("模型调用失败: %s", error)
         session.state.finish(TerminationReason.MODEL_ERROR)
         detail = str(error) if isinstance(error, ModelServiceError) else ""
-        return self._stop(session, TerminationReason.MODEL_ERROR, detail=detail)
+        # 服务端已明确报错时，不能再用一次无工具请求把规划 JSON 当成最终答案。
+        # 已经产出的真实回答仍由 _stop 的 last_answer 分支原样保留。
+        return self._stop(session, TerminationReason.MODEL_ERROR, detail=detail, retry_final=False)
 
     def _finish_with_final_answer(
         self, session: _Session, messages: Sequence[ChatMessage], call: ToolCall
@@ -1469,7 +1471,9 @@ class RunTurn:
         messages.append(ChatMessage(ChatRole.USER, record.question))
         return messages
 
-    def _stop(self, session: _Session, reason: TerminationReason, *, detail: str = "") -> str:
+    def _stop(
+        self, session: _Session, reason: TerminationReason, *, detail: str = "", retry_final: bool = True
+    ) -> str:
         """收尾。``detail`` 只由**模型服务这一侧**的失败传入——见 ``_converse`` 的 except。
 
         **模型说过话就用模型的话。** ``emergency.fallback_answer`` 拼出来的是**固定文案**
@@ -1491,9 +1495,9 @@ class RunTurn:
         if reason is not TerminationReason.GUARD_BLOCKED and session.last_answer:
             return session.last_answer
         # 模型到这一步**一个字都没产出过**（端点从头就不通、或输出一直是空）。
-        # 再给它一次不占预算的机会，让它自己把话说出来。硬拦除外——再问一次只会
-        # 换回一段同样不能出街的话。
-        if reason is not TerminationReason.GUARD_BLOCKED:
+        # 非服务故障时再给它一次不占预算的机会。硬拦或已确认模型服务故障时
+        # 不再追问：前者可能换回同样不能出街的话，后者会把规划文本误当答案。
+        if reason is not TerminationReason.GUARD_BLOCKED and retry_final:
             forced = self._force_final_once(session)
             if forced:
                 return forced
