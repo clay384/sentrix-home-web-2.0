@@ -1372,12 +1372,15 @@ class RunTurn:
             if binding is not None:
                 if binding.verdict is BindingVerdict.SATISFIES:
                     return True
-                if binding.verdict is BindingVerdict.PARTIAL:
-                    # 覆盖不全但方向一致：允许带缺口回答，不再为它花一次 L3。
+                if binding.verdict in {
+                    BindingVerdict.PARTIAL,
+                    BindingVerdict.SCOPE_MISMATCH,
+                }:
+                    # 覆盖不全 / scope 缺失：L3 也补不出工具没有的 scope 信息，
+                    # 只会空转。记为 gap 并放行；矛盾/不支持才交给 L3。
                     return True
                 if binding.verdict in {
                     BindingVerdict.UNSUPPORTED,
-                    BindingVerdict.SCOPE_MISMATCH,
                     BindingVerdict.CONFLICT,
                     BindingVerdict.UNKNOWN,
                 }:
