@@ -404,7 +404,9 @@ def normalize_payload(payload: Mapping[str, Any], *, scope_id: str, default_goal
     for index, item in enumerate(raw_requirements if isinstance(raw_requirements, list) else []):
         if isinstance(item, str):
             evidence_type = _TYPE_ALIASES.get(item.lower(), "photo_set")
-            fingerprint = (evidence_type, "", item)
+            # 旧形状（字符串需求）没有 value_type，仍按 evidence_type 去重：
+            # ["photo", "image"] 是同一个意思，不应变成两条。
+            fingerprint = (evidence_type, "__legacy__", "")
             if fingerprint in seen:
                 continue
             seen.add(fingerprint)

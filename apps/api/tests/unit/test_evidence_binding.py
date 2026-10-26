@@ -7,8 +7,8 @@ from sentrix.domain.assistant.evidence_binding import (
     facts_from_state,
 )
 from sentrix.domain.assistant.evidence_ledger import EvidenceRequirement, EvidenceType, RequirementValueType
-from sentrix.domain.assistant.task_state import TaskState, ToolCallRecord
 from sentrix.domain.assistant.profile import DEFAULT_PROFILE
+from sentrix.domain.assistant.task_state import TaskState, ToolCallRecord
 
 
 def requirement(
@@ -26,12 +26,11 @@ def requirement(
     )
 
 
-def retrieval_fact(**kwargs) -> Fact:
+def retrieval_fact(*, value: tuple[str, ...] = ("asset_1", "asset_2")) -> Fact:
     return Fact(
         fact_type="retrieval_media_set",
         value_type=RequirementValueType.MEDIA_SET,
-        value=("asset_1", "asset_2"),
-        **kwargs,
+        value=value,
     )
 
 
@@ -77,9 +76,7 @@ def test_conflicting_counts_in_the_same_scope_are_a_conflict():
 def test_counts_with_different_scopes_are_not_conflicts():
     first = Fact("asset_count", RequirementValueType.COUNT, 3, scope={"time": "2017"}, provenance="a")
     second = Fact("asset_count", RequirementValueType.COUNT, 5, scope={"time": "2018"}, provenance="b")
-    binding = bind_requirement(
-        requirement(RequirementValueType.COUNT), [first, second]
-    )
+    binding = bind_requirement(requirement(RequirementValueType.COUNT), [first, second])
     assert binding.verdict is BindingVerdict.SATISFIES
 
 

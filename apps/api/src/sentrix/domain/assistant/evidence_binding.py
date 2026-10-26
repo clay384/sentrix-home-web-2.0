@@ -360,11 +360,7 @@ def bind_requirement(requirement: EvidenceRequirement, facts: Sequence[Fact]) ->
         )
     typed = [fact for fact in facts if fact.value_type is requirement.value_type]
     if requirement.value_type is RequirementValueType.MEDIA_SET:
-        typed = [
-            fact
-            for fact in typed
-            if isinstance(fact.value, (list, tuple, set)) and len(fact.value) > 0
-        ]
+        typed = [fact for fact in typed if isinstance(fact.value, (list, tuple, set)) and len(fact.value) > 0]
     if not typed:
         return RequirementBinding(
             requirement.id,
@@ -422,9 +418,7 @@ def bind_requirement(requirement: EvidenceRequirement, facts: Sequence[Fact]) ->
             tuple(fact.provenance for fact in typed),
             requirement.value_type.value,
         )
-    if any(fact.coverage < 1.0 for fact in compatible) and all(
-        fact.coverage < 1.0 for fact in compatible
-    ):
+    if any(fact.coverage < 1.0 for fact in compatible) and all(fact.coverage < 1.0 for fact in compatible):
         return RequirementBinding(
             requirement.id,
             BindingVerdict.PARTIAL,

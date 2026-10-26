@@ -118,7 +118,18 @@ def test_delivered_photo_is_declared_by_default_for_real_album_questions():
 def test_the_prompt_declares_the_value_type_contract():
     prompt = build_prompt()
 
-    for value_type in ("place", "time", "duration", "amount", "count", "person", "media_set", "description", "boolean", "value"):
+    for value_type in (
+        "place",
+        "time",
+        "duration",
+        "amount",
+        "count",
+        "person",
+        "media_set",
+        "description",
+        "boolean",
+        "value",
+    ):
         assert value_type in prompt
     assert "scope" in prompt
     assert "required" in prompt
@@ -292,9 +303,10 @@ def test_a_missing_scope_is_not_a_mismatch():
     ),
 )
 def test_invalid_structured_requirement_is_rejected(kwargs: dict, expected: str):
-    assert parse_declaration(
-        declaration("photo_set", **kwargs), scope_id=SCOPE, question="问题"
-    ) == (None, expected)
+    assert parse_declaration(declaration("photo_set", **kwargs), scope_id=SCOPE, question="问题") == (
+        None,
+        expected,
+    )
 
 
 def test_structured_fields_are_preserved_on_the_requirement():

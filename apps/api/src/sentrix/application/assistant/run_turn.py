@@ -326,6 +326,7 @@ def _turn_trace(session: _Session, planned: PlannerResult | None) -> Mapping[str
             "max_tool_calls": state.profile.max_tool_calls,
         },
         "delivered": [item.asset_id for item in session.delivered.items],
+        "answer_coverage": session.best_coverage,
         "retrieved_candidates": list(state.retrieved_candidates),
         # **模型这一步看到什么、回答什么。** 只有 ``include_debug`` 时非空；
         # 按发生顺序排列（planner → agent → judge），每条都带当时的 messages 与
@@ -515,6 +516,9 @@ class _Session:
     # 被换成「这一轮检索到 N 张候选照片。（本轮因「模型步数用尽」提前结束。）」，
     # 而**每一道都有一版模型写好、只是没人保存**的答案。
     last_answer: str = ""
+    #: 覆盖率最高的一版答案。守卫打回之后模型可能写得更差，收尾不能拿更差那版。
+    best_answer: str = ""
+    best_coverage: float = -1.0
     # 连续几轮「一条有用的结果都没拿到」。见 ``_converse`` 的护栏。
     stalled_rounds: int = 0
     # **正文工具调用的纠正只给一次。** 再犯说明模型这一轮压不住这个格式，
@@ -1106,9 +1110,7 @@ class RunTurn:
         （工具没这个能力，逼模型只会得到编造），``satisfies`` 关闭需求，``partial`` 允许
         带缺口回答。绑定事件进轨迹，8772 能看到每条需求为什么没被满足。
         """
-        session.bindings = bind_requirements(
-            session.ledger.requirements, facts_from_state(session.state)
-        )
+        session.bindings = bind_requirements(session.ledger.requirements, facts_from_state(session.state))
         if not session.bindings:
             return
         self._publish(
@@ -1121,6 +1123,33 @@ class RunTurn:
                 payload={"bindings": binding_payload(session.bindings)},
             ),
         )
+
+    @staticmethod
+    def _answer_coverage(session: _Session) -> float:
+        """答案的**证据覆盖率**：required 需求里 satisfied 的比例。
+
+        没有需求时给 1.0——普通闲聊不该因为「没证据」被扣分。
+        """
+        required = [item for item in session.ledger.requirements if item.required]
+        if not required:
+            return 1.0
+        satisfied = {
+            binding.requirement_id
+            for binding in session.bindings
+            if binding.verdict is BindingVerdict.SATISFIES
+        }
+        return len(satisfied & {item.id for item in required}) / len(required)
+
+    def _remember_answer(self, session: _Session, answer: str) -> None:
+        """只保留覆盖率更高的答案。等覆盖率时保留最新的（模型通常在后一轮修正表达）。"""
+        text = (answer or "").strip()
+        if not text:
+            return
+        coverage = self._answer_coverage(session)
+        if coverage >= session.best_coverage:
+            session.best_answer = text
+            session.best_coverage = coverage
+        session.last_answer = text
 
     @staticmethod
     def _binding_gap(session: _Session) -> bool:
@@ -1171,6 +1200,7 @@ class RunTurn:
         )
         if verdict.passed:
             self._refresh_bindings(session)
+            self._remember_answer(session, answer)
             if self._review_with_verification(session, messages, answer):
                 # 与门禁拦下同一条路：调用方把 pending_reminder 加回对话后继续循环。
                 return None
@@ -1276,8 +1306,7 @@ class RunTurn:
             for item in session.ledger.open_requirements()
             if item.evidence_type not in attempted
             and bindings.get(item.id) is not None
-            and bindings[item.id].verdict
-            not in {BindingVerdict.UNSUPPORTED, BindingVerdict.PARTIAL}
+            and bindings[item.id].verdict not in {BindingVerdict.UNSUPPORTED, BindingVerdict.PARTIAL}
         ]
 
         # 1.0 要求 ``available`` 非空：一个工具都给不出去时，提醒「请用工具」是空话。
@@ -1287,9 +1316,7 @@ class RunTurn:
             tools_exhausted=not state.can_call_tool(),
         )
         if unattempted and available and state.block_guard_code("required_evidence_missing"):
-            self._reminder_event(
-                session, "required_evidence_missing", [item.id for item in unattempted]
-            )
+            self._reminder_event(session, "required_evidence_missing", [item.id for item in unattempted])
             return UNATTEMPTED_NUDGE_TEMPLATE.format(
                 pending="、".join(f"{item.id}:{item.evidence_type.value}" for item in unattempted),
                 available="、".join(spec.name for spec in available),
@@ -1367,9 +1394,7 @@ class RunTurn:
                     return True
             return False
         if claim.value_type is RequirementValueType.PLACE:
-            return any(
-                fact.scope.get("place") and fact.scope["place"] in claim.text for fact in typed
-            )
+            return any(fact.scope.get("place") and fact.scope["place"] in claim.text for fact in typed)
         return True
 
     def _review_with_verification(
@@ -1674,8 +1699,8 @@ class RunTurn:
         #
         # 这条界线正是两层的分工：**L2（忠实性）判的是「说没说谎」，打回之后模型没改好
         # 就放行原话——它至多不准确；L1 硬拦判的是「能不能说」，那版答案不能出街。**
-        if reason is not TerminationReason.GUARD_BLOCKED and session.last_answer:
-            return session.last_answer
+        if reason is not TerminationReason.GUARD_BLOCKED and (session.best_answer or session.last_answer):
+            return session.best_answer or session.last_answer
         # 模型到这一步**一个字都没产出过**（端点从头就不通、或输出一直是空）。
         # 非服务故障时再给它一次不占预算的机会。硬拦或已确认模型服务故障时
         # 不再追问：前者可能换回同样不能出街的话，后者会把规划文本误当答案。

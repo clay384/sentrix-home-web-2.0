@@ -41,13 +41,8 @@ class ClaimVerifier:
         include_debug: bool = False,
         step_id: str = "claim_verifier",
     ) -> ClaimReview:
-        raw_messages = build_claim_messages(
-            query=query, claim=claim, facts=facts, requirement=requirement
-        )
-        messages = [
-            ChatMessage(ChatRole(str(item["role"])), str(item["content"]))
-            for item in raw_messages
-        ]
+        raw_messages = build_claim_messages(query=query, claim=claim, facts=facts, requirement=requirement)
+        messages = [ChatMessage(ChatRole(str(item["role"])), str(item["content"])) for item in raw_messages]
         started = time.perf_counter()
         debug_call: dict[str, Any] | None = None
         if include_debug:

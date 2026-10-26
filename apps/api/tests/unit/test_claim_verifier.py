@@ -16,8 +16,7 @@ from sentrix.domain.assistant.models import ChatMessage, ModelReply
 
 def test_high_risk_claims_extract_amount_time_count_and_place():
     claims = high_risk_claims(
-        "婚宴一共花了 3000 元。那天是 2017 年 10 月。一共拍了 12 张照片。"
-        "婚礼在河北省石家庄市举办。"
+        "婚宴一共花了 3000 元。那天是 2017 年 10 月。一共拍了 12 张照片。婚礼在河北省石家庄市举办。"
     )
 
     assert [claim.value_type for claim in claims] == [
@@ -33,9 +32,7 @@ def test_a_plain_sentence_has_no_claims():
 
 
 def test_parse_claim_review_reads_the_first_json_object():
-    verdict, reason = parse_claim_review(
-        '{"verdict":"contradicted","reason":"工具是 5，回答写 3"} trailing'
-    )
+    verdict, reason = parse_claim_review('{"verdict":"contradicted","reason":"工具是 5，回答写 3"} trailing')
     assert verdict is ClaimVerdict.CONTRADICTED
     assert reason == "工具是 5，回答写 3"
 

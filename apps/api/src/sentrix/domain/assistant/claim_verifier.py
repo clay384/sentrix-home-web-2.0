@@ -52,9 +52,7 @@ _TIME = re.compile(
     r"春天|夏天|秋天|冬天|春季|夏季|秋季|冬季)"
 )
 _COUNT = re.compile(r"\d+\s*(?:张|个|人|次|位|名|条|段|场)")
-_PLACE = re.compile(
-    r"(?:在|去|到|位于)\s*([一-鿿]{2,12}?(?:市|县|区|镇|村|街|路|山|湖|机场|酒店|景区|公园))"
-)
+_PLACE = re.compile(r"(?:在|去|到|位于)\s*([一-鿿]{2,12}?(?:市|县|区|镇|村|街|路|山|湖|机场|酒店|景区|公园))")
 _SENTENCE = re.compile(r"[^。！？!?；;\n]+[。！？!?；;]?")
 
 
@@ -115,11 +113,7 @@ def build_claim_messages(
         "unsupported：facts 没有该信息或没有能支撑它的值；ambiguous：信息不足以判断。\n"
         "数字/日期表达等价不算冲突（三个人 = 3 人，2024-03-02 = 2024年3月2日）。"
     )
-    relevant = [
-        _fact_payload(fact)
-        for fact in facts
-        if fact.value_type is claim.value_type
-    ][:12]
+    relevant = [_fact_payload(fact) for fact in facts if fact.value_type is claim.value_type][:12]
     requirement_payload = (
         {
             "id": requirement.id,

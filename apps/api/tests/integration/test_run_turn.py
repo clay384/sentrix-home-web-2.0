@@ -57,13 +57,16 @@ class ScriptedModel:
         *,
         planner: object = None,
         judge: object = None,
+        claim: object = None,
     ) -> None:
         self._replies = list(replies)
         self._planner = planner_reply("photo_set", "delivered_photo") if planner is None else planner
         self._judge = judge_reply() if judge is None else judge
+        self._claim = claim
         self.calls: list[Sequence[ChatMessage]] = []
         self.planner_calls: list[Sequence[ChatMessage]] = []
         self.judge_calls: list[Sequence[ChatMessage]] = []
+        self.claim_calls: list[Sequence[ChatMessage]] = []
         # 主循环每一次拿到的那份工具名单（JIT 剪枝之后每次都可能不同）。
         self.tool_sets: list[list[str]] = []
 
@@ -73,6 +76,15 @@ class ScriptedModel:
         # （额度用尽时 ``select_tools`` 返回空集，见 §3.4 的 C/B′）——那时这条假件会把
         # 主循环当成评审，测出来的东西与跑的东西不是一回事。
         system = messages[0].content if messages else ""
+        if CLAIM_MARKER in system:
+            self.claim_calls.append(list(messages))
+            if isinstance(self._claim, Exception):
+                raise self._claim
+            if isinstance(self._claim, PlannerScript):
+                return ModelReply(content=self._claim.next(), finish_reason="stop")
+            if self._claim is None:
+                return ModelReply(content='{"verdict":"ambiguous"}', finish_reason="stop")
+            return self._claim  # type: ignore[return-value]
         if JUDGE_MARKER in system:
             self.judge_calls.append(list(messages))
             if isinstance(self._judge, Exception):
@@ -121,7 +133,14 @@ class StubToolbox:
         self.calls.append((name, dict(arguments)))
         return self._stubbed(name)
 
-    def deliver(self, result_set_id: str, handles: Sequence[str], *, scope_id: str) -> ToolOutcome:
+    def deliver(
+        self,
+        result_set_id: str,
+        handles: Sequence[str],
+        *,
+        scope_id: str,
+        fallback_result_set_ids: Sequence[str] = (),
+    ) -> ToolOutcome:
         # **交付走的是 ``deliver`` 而不是 ``execute``**——它是终止动作 ``final_answer``
         # 上的一个字段，不是一次工具调用。假件必须收这个形参，理由与 ``execute`` 那段
         # 相同：少一个就是运行时 ``TypeError``，而它会被吞成 ``model_error``，
@@ -167,6 +186,7 @@ def final_call(answer: str, *handles: str, call_id: str = "c_final") -> ModelRep
 
 JUDGE_MARKER = "事实一致性评审"
 PLANNER_MARKER = "你正在规划家庭记忆任务"
+CLAIM_MARKER = "事实一致性检查器"
 
 
 def judge_reply(*problems: tuple[str, str], faithful: bool | None = None) -> ModelReply:
@@ -189,7 +209,11 @@ class PlannerScript:
         return self._replies.pop(0) if len(self._replies) > 1 else self._replies[0]
 
 
-def planner_reply(*evidence_types: str, goal: str = "看海边的照片") -> ModelReply:
+def planner_reply(
+    *evidence_types: str,
+    goal: str = "看海边的照片",
+    value_type: str = "media_set",
+) -> ModelReply:
     """规划那次模型调用的回复。
 
     规划与主循环共用同一个模型端口（1.0 也是同一个 ``chat_fn``），测试里靠 ``tools`` 区分：
@@ -205,7 +229,7 @@ def planner_reply(*evidence_types: str, goal: str = "看海边的照片") -> Mod
                     "evidence_type": item,
                     "description": f"需要 {item}",
                     "predicate": "check",
-                    "value_type": "media_set",
+                    "value_type": value_type,
                     "scope": {},
                     "required": True,
                 }
@@ -217,7 +241,13 @@ def planner_reply(*evidence_types: str, goal: str = "看海边的照片") -> Mod
 
 
 SEARCH_OK = ToolOutcome(
-    observation={"result_set_id": "rs_1", "query": "海边", "total": 2, "has_more": False},
+    observation={
+        "result_set_id": "rs_1",
+        "query": "海边",
+        "total": 2,
+        "has_more": False,
+        "asset_ids": ["asset_1", "asset_2"],
+    },
     model_visible={
         "result_set_id": "rs_1",
         "query": "海边",
@@ -233,7 +263,12 @@ SEARCH_OK = ToolOutcome(
 
 #: 第二页预览。压缩测试用它证明**最新的一份六图集**被保留、更老的检索轮被丢掉。
 PAGE_OK = ToolOutcome(
-    observation={"result_set_id": "rs_1", "page": 2, "has_more": False},
+    observation={
+        "result_set_id": "rs_1",
+        "page": 2,
+        "has_more": False,
+        "asset_ids": [f"asset_{index}" for index in range(1, 9)],
+    },
     model_visible={
         "result_set_id": "rs_1",
         "page": 2,
@@ -256,7 +291,13 @@ DELIVER_OK = ToolOutcome(
 )
 
 SEARCH_EMPTY = ToolOutcome(
-    observation={"result_set_id": "rs_2", "query": "海边", "total": 0, "has_more": False},
+    observation={
+        "result_set_id": "rs_2",
+        "query": "海边",
+        "total": 0,
+        "has_more": False,
+        "asset_ids": [],
+    },
     model_visible={"result_set_id": "rs_2", "query": "海边", "page": 1, "preview": [], "has_more": False},
 )
 
@@ -609,26 +650,27 @@ def reminder_count(model: ScriptedModel, needle: str) -> int:
     )
 
 
-def test_a_declared_but_unused_structured_fact_earns_one_reminder(env):
-    """声明了 ``structured_fact`` 却一次都没查过精确统计 → 提醒一次（①）。
+def test_an_unsupported_structured_fact_does_not_earn_a_reminder(env):
+    """工具没有金额能力时**不提醒**——提醒只会把模型逼向编造。
 
-    模型在这个形态下最容易拿 ``search_memories`` 的候选数当答案报出去——1.0
-    ``runtime.py:116`` 就是为这条才把 ``total`` 从模型可见的观察里剥掉的。
+    旧实现只按 ``structured_fact`` 这个 evidence_type 判断「没查过」，于是「婚宴花了
+    多少钱」也会被提醒去查 ``query_memory_facts``，而该工具根本没有金额字段；实测
+    这一条制造了 9 道「362/95 张照片」式的跑偏。
     """
     _conversations, _turns, conversation, _db = env
     model = ScriptedModel(
         [
             tool_call("search_memories", "c1", query="海边"),
-            final_call("一共有 12 张海边的照片。", "photo_1"),
+            final_call("婚宴一共花了 3000 元。", "photo_1"),
         ],
-        planner=planner_reply("photo_set", "structured_fact"),
+        planner=planner_reply("photo_set", "structured_fact", value_type="amount"),
     )
     run_turn = build(env, model, StubToolbox({"search_memories": SEARCH_OK}))
     turn_id = start(run_turn, conversation)
 
     run_turn.run(turn_id)
 
-    assert reminder_count(model, "该问题声明了全量结构化统计需求") == 1
+    assert reminder_count(model, "该问题声明了全量结构化统计需求") == 0
 
 
 def test_an_unattempted_requirement_earns_one_reminder(env):
@@ -705,6 +747,29 @@ def test_the_reminder_lets_the_model_insist(env):
 
     assert result.answer == "海边有两张，但照片里的字读不到。"
     assert result.status is TurnStatus.PARTIAL
+
+
+def test_l3_verifies_an_unbound_count_and_allows_a_corrected_answer(env, monkeypatch):
+    """高风险、未绑定的数字由 L3 核验；模型改对后放行，且每回合只核验一次。"""
+    monkeypatch.setenv("SENTRIX_CLAIM_VERIFIER", "1")
+    _conversations, _turns, conversation, _db = env
+    model = ScriptedModel(
+        [
+            tool_call("search_memories", "c1", query="海边"),
+            final_call("一共有 12 张海边的照片。", "photo_1"),
+            final_call("一共有 2 张海边的照片。", "photo_1"),
+        ],
+        planner=planner_reply("photo_set", "structured_fact", value_type="count"),
+        claim=PlannerScript(['{"verdict":"contradicted","reason":"工具 total=2"}']),
+    )
+    run_turn = build(env, model, StubToolbox({"search_memories": SEARCH_OK}))
+    turn_id = start(run_turn, conversation)
+
+    result = run_turn.run(turn_id)
+
+    assert "2 张" in result.answer
+    assert len(model.claim_calls) == 1
+    assert result.termination_reason is TerminationReason.ANSWERED_WITH_GAP
 
 
 # ---- 需求的收尾记账：分清「没去取」与「取了没取到」 --------------------------
