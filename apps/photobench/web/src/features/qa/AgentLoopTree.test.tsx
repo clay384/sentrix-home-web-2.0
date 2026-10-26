@@ -49,3 +49,38 @@ describe("AgentLoopTree · 调用体展开 / 折叠", () => {
     expect(details!.open).toBe(false);
   });
 });
+
+describe("AgentLoopTree · 每一步的模型完整输入 / 原始输出", () => {
+  it("按 step_id 取到 debug_calls，展开调用体就能看到 prompt 与原始回复", () => {
+    render(
+      <AgentLoopTree
+        detail={{
+          ...DETAIL,
+          runtime_turns: [
+            {
+              index: 0,
+              trace_bundle: {
+                debug_calls: [
+                  {
+                    step_id: "s1",
+                    call_type: "agent",
+                    status: "complete",
+                    messages: [{ role: "system", content: "系统提示词-唯一标记" }],
+                    tools: [{ type: "function", function: { name: "search_memories" } }],
+                    response: { content: "模型原始回答-唯一标记", thought: "思考-唯一标记" },
+                  },
+                ],
+              },
+            },
+          ],
+        }}
+        modelLabel="qwen"
+      />,
+    );
+
+    expect(screen.getByText("模型输入 / 原始输出")).not.toBeNull();
+    expect(screen.getByText("系统提示词-唯一标记")).not.toBeNull();
+    expect(screen.getByText("模型原始回答-唯一标记")).not.toBeNull();
+    expect(screen.getByText("思考-唯一标记")).not.toBeNull();
+  });
+});

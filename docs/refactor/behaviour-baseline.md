@@ -699,6 +699,19 @@ S9b-2 把 1.0 `BenchmarkRun`（`benchmark_orchestrator.py:1895`）的六个相�
 | 交付集的媒体类型 | `AttachmentSummary` 只有 `handle` / `asset_id` / `file_name`，**没有 media_type**——类型由 `assets` 表回查 |
 | `agent_turn_events` 表 | 存在的，但**唯一读取者**是轮询与 SSE 两个端点，没有别的指标端点 |
 
+> **2026-10-26 收回「模型输入输出不可得」（仅评测侧显式开启）。**
+> 1.0 的 `include_debug` 会把每次模型调用的完整 `prompt` / `raw_full` 放进
+> `runtime_turns[*].debug_trace`；2.0 此前没有任何等价物。现在
+> `POST /assistant/conversations/{id}/turns` 接受 `include_debug: true`（默认 `false`），
+> 打开后终态载荷的 `trace.debug_calls` 按发生顺序带 planner / Agent / judge 每次调用
+> 的 **实际 `messages`、实际 `tools`、原始 `content` / `thought` / `tool_calls`**。
+> 产品对话不打开这个开关，所以 `agent_turns.trace_json` 的体积不随日常使用增长。
+> PhotoBench 的 QA 主链固定打开它，并原样落进 `run.json` 的
+> `runtime_turns[*].trace_bundle.debug_calls`；8772 的「全流程完整轨迹」与 Agent Loop
+> 调用树都从这里取数。旧 run 没有这一格，界面明确显示「未记录」，不做推断。
+> 验证：`apps/api/tests/integration/test_run_turn.py::test_include_debug_records_planner_agent_and_judge_with_exact_messages`、
+> `apps/photobench/web/src/features/qa/DebugTracePanel.test.tsx`。
+
 ### 参数与常量
 
 | 项 | 值 | 出处 |

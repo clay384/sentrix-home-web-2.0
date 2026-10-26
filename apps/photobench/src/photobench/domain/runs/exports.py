@@ -70,6 +70,29 @@ def parse_min_score(raw: str) -> int | None:
     return int(raw) if raw in {"1", "2"} else None
 
 
+def _turn_debug_calls(turn: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """2.0 回合的完整模型调用轨迹（``trace_bundle.debug_calls``）。
+
+    老 run 没有这一格，返回空表；调用方随后回退到 1.0 的 ``debug_trace`` 形状。
+    """
+    bundle = turn.get("trace_bundle")
+    calls = bundle.get("debug_calls") if isinstance(bundle, Mapping) else None
+    if not isinstance(calls, list):
+        return []
+    return [call for call in calls if isinstance(call, Mapping)]
+
+
+def _call_prompt(call: Mapping[str, Any]) -> Any:
+    return call.get("messages")
+
+
+def _call_raw(call: Mapping[str, Any]) -> str:
+    response = call.get("response")
+    if not isinstance(response, Mapping):
+        return ""
+    return str(response.get("content") or "")
+
+
 def export_traces(
     state: Mapping[str, Any],
     *,
@@ -86,8 +109,28 @@ def export_traces(
         if min_score is not None and (item_score is None or item_score < min_score):
             continue
         planner = None
-        model_steps: list[Mapping[str, Any]] = []
+        debug_final: Mapping[str, Any] | None = None
+        legacy_final: Mapping[str, Any] | None = None
         for turn in item.get("runtime_turns") or []:
+            debug_calls = _turn_debug_calls(turn)
+            if debug_calls:
+                plan_calls = [call for call in debug_calls if call.get("call_type") == "planner"]
+                if plan_calls:
+                    accepted = next(
+                        (call for call in reversed(plan_calls) if _call_raw(call).strip()),
+                        plan_calls[-1],
+                    )
+                    planner = {
+                        "type": "planner",
+                        "step_id": accepted.get("step_id"),
+                        "prompt": _call_prompt(accepted),
+                        "raw_full": _call_raw(accepted),
+                    }
+                agent_calls = [call for call in debug_calls if call.get("call_type") == "agent"]
+                if agent_calls:
+                    debug_final = agent_calls[-1]
+                continue
+            # 老 run：没有 debug_calls，只能读 1.0 形状的 debug_trace。
             for step in turn.get("debug_trace") or []:
                 if not isinstance(step, Mapping):
                     continue
@@ -98,14 +141,19 @@ def export_traces(
                         "raw_full": step.get("raw_full") or step.get("raw"),
                     }
                 elif step.get("type") == "model":
-                    model_steps.append(step)
+                    legacy_final = step
         final_trace = None
-        if model_steps:
-            last = model_steps[-1]
+        if debug_final is not None:
             final_trace = {
-                "step_id": last.get("step_id"),
-                "prompt": last.get("prompt"),
-                "raw_full": last.get("raw_full") or last.get("raw"),
+                "step_id": debug_final.get("step_id"),
+                "prompt": _call_prompt(debug_final),
+                "raw_full": _call_raw(debug_final),
+            }
+        elif legacy_final is not None:
+            final_trace = {
+                "step_id": legacy_final.get("step_id"),
+                "prompt": legacy_final.get("prompt"),
+                "raw_full": legacy_final.get("raw_full") or legacy_final.get("raw"),
             }
         items_out.append(
             {
@@ -153,16 +201,21 @@ def export_sft(
         qa_id = item.get("qa_id")
         turns_out: list[dict[str, Any]] = []
         for turn in item.get("runtime_turns") or []:
+            debug_calls = _turn_debug_calls(turn)
             steps_out: list[dict[str, Any]] = []
-            for step in turn.get("debug_trace") or []:
-                if not isinstance(step, Mapping):
-                    continue
-                copy = dict(step)
-                if isinstance(copy.get("arguments"), str):
-                    copy["arguments"] = _parse(copy["arguments"])
-                if isinstance(copy.get("observation"), str):
-                    copy["observation"] = _parse(copy["observation"])
-                steps_out.append(copy)
+            if debug_calls:
+                # 2.0 的完整轨迹：每条都是一次模型调用，自带 messages / tools / response。
+                steps_out = [dict(call) for call in debug_calls]
+            else:
+                for step in turn.get("debug_trace") or []:
+                    if not isinstance(step, Mapping):
+                        continue
+                    copy = dict(step)
+                    if isinstance(copy.get("arguments"), str):
+                        copy["arguments"] = _parse(copy["arguments"])
+                    if isinstance(copy.get("observation"), str):
+                        copy["observation"] = _parse(copy["observation"])
+                    steps_out.append(copy)
             turns_out.append(
                 {
                     "turn": turn.get("index"),
@@ -175,6 +228,23 @@ def export_sft(
                 }
             )
             # SFT prompt→response 样本（1.0 的「兼容旧格式」，完整轨迹见 items）。
+            if debug_calls:
+                for call in debug_calls:
+                    prompt = _call_prompt(call)
+                    response = _call_raw(call)
+                    if not prompt or not response.strip():
+                        continue
+                    messages = list(prompt) if isinstance(prompt, list) else []
+                    messages.append({"role": "assistant", "content": response})
+                    samples.append(
+                        {
+                            "qa_id": qa_id,
+                            "turn": turn.get("index"),
+                            "step": call.get("step_id") or call.get("call_type", "complete"),
+                            "messages": messages,
+                        }
+                    )
+                continue
             for step in turn.get("debug_trace") or []:
                 if not isinstance(step, Mapping) or step.get("type") != "model":
                     continue

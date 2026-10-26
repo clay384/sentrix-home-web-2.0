@@ -368,3 +368,30 @@ def test_history_goes_into_the_system_message_not_a_second_one():
     assert "历史对话背景：\nuser: 妈妈是谁" in first.content
     assert second.role.value == "user"
     assert all(message.role.value != "system" for message in model.calls[0][1:])
+
+
+def test_include_debug_records_every_planner_attempt():
+    """重试的每一次都要留：只留最后一次就看不到模型第一次错在哪。"""
+    model = ScriptedPlannerModel(["我不会规划。", declaration("photo_set")])
+
+    result = GoalPlanner(model).declare(
+        "给我看看海边的照片", scope_id=SCOPE, include_debug=True
+    )
+
+    assert result.ok
+    assert len(result.debug_calls) == 2
+    first, second = result.debug_calls
+    assert first["call_type"] == "planner"
+    assert first["response"]["content"] == "我不会规划。"
+    assert first["messages"][0]["role"] == "system"
+    assert second["messages"][-1]["role"] == "user"
+    assert "我不会规划。" in second["messages"][-2]["content"]
+    assert second["tools"] == []
+
+
+def test_planner_debug_is_off_by_default():
+    model = ScriptedPlannerModel([declaration("photo_set")])
+
+    result = GoalPlanner(model).declare("给我看看海边的照片", scope_id=SCOPE)
+
+    assert result.debug_calls == ()

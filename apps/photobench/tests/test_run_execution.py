@@ -815,6 +815,8 @@ def test_a_multi_turn_question_reuses_one_conversation():
     assert len(conversations) == 1
     assert [turn["conversation_id"] for turn in turns] == ["conv_1", "conv_1"]
     assert [turn["message"] for turn in turns] == ["第一轮", "第二轮"]
+    # 评测每轮都显式要求完整模型轨迹（8772 的「模型看到什么」数据源）。
+    assert all(turn["include_debug"] is True for turn in turns)
     item = state["items"][0]
     assert item["question"] == "第二轮"
     assert item["conversation_context_mode"] == "shared_conversation_id"

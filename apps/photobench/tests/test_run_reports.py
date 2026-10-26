@@ -616,3 +616,80 @@ def test_export_sft_retrieval_block_carries_every_documented_field():
     assert set(retrieval) == set(exports._RETRIEVAL_FIELDS)
     assert retrieval["retrieval_f1"] == 0.5
     assert retrieval["gt_media"] is None
+
+
+def _debug_calls_item() -> dict:
+    """2.0 的完整轨迹：``trace_bundle.debug_calls``，一条模型调用一条。"""
+    return {
+        "qa_id": "q1",
+        "question": "这是谁",
+        "judge": {"score": 2},
+        "runtime_turns": [
+            {
+                "index": 0,
+                "message": "这是谁",
+                "trace_bundle": {
+                    "debug_calls": [
+                        {
+                            "step_id": "planner_1",
+                            "call_type": "planner",
+                            "messages": [{"role": "user", "content": "planner"}],
+                            "tools": [],
+                            "response": {"content": "P"},
+                        },
+                        {
+                            "step_id": "step_1",
+                            "call_type": "agent",
+                            "messages": [{"role": "user", "content": "a"}],
+                            "tools": [],
+                            "response": {"content": "A1"},
+                        },
+                        {
+                            "step_id": "step_2",
+                            "call_type": "agent",
+                            "messages": [{"role": "user", "content": "b"}],
+                            "tools": [],
+                            "response": {"content": "A2"},
+                        },
+                        {
+                            "step_id": "step_8",
+                            "call_type": "faithfulness_judge",
+                            "messages": [{"role": "user", "content": "judge"}],
+                            "tools": [],
+                            "response": {"content": "J"},
+                        },
+                    ]
+                },
+            }
+        ],
+    }
+
+
+def test_export_traces_prefers_the_2_0_debug_calls():
+    """2.0 的 debug_calls 有完整 messages/response；导出必须用它，而不是空的 debug_trace。"""
+    out = exports.export_traces(_state(items=[_debug_calls_item()]))
+    assert out[0]["planner"] == {
+        "type": "planner",
+        "step_id": "planner_1",
+        "prompt": [{"role": "user", "content": "planner"}],
+        "raw_full": "P",
+    }
+    assert out[0]["final_trace"] == {
+        "step_id": "step_2",
+        "prompt": [{"role": "user", "content": "b"}],
+        "raw_full": "A2",
+    }
+
+
+def test_export_sft_keeps_every_2_0_debug_call_and_builds_samples():
+    out = exports.export_sft(_state(items=[_debug_calls_item()]))
+    steps = out["items"][0]["turns"][0]["steps"]
+    assert [step["call_type"] for step in steps] == [
+        "planner",
+        "agent",
+        "agent",
+        "faithfulness_judge",
+    ]
+    assert out["count"] == 4
+    assert out["samples"][0]["messages"][-1] == {"role": "assistant", "content": "P"}
+    assert out["samples"][-1]["step"] == "step_8"

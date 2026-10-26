@@ -1633,3 +1633,86 @@ def test_the_fallback_text_is_never_used_when_the_model_said_anything(env):
 
     assert "这一轮检索到" not in result.answer
     assert "提前结束" not in result.answer
+
+
+# ---- 完整模型轨迹（include_debug） -----------------------------------------
+
+
+def test_include_debug_persists_the_switch_before_the_turn_runs(env):
+    _conversations, turns, conversation, _db = env
+    run_turn = build(
+        env,
+        ScriptedModel([final("给你。")]),
+        StubToolbox({"search_memories": SEARCH_OK}),
+    )
+
+    turn_id = run_turn.start(
+        TurnRequest(conversation_id=conversation.id, question=QUESTION, include_debug=True)
+    ).id
+
+    assert turns.get(turn_id).trace == {"include_debug": True}
+
+
+def test_include_debug_records_planner_agent_and_judge_with_exact_messages(env):
+    """每一步的模型输入 / 原始输出都要在：planner、主 Agent、L2 评审。"""
+    _conversations, turns, conversation, _db = env
+    model = ScriptedModel(
+        [
+            tool_call("search_memories", "c1", query="海边"),
+            final_call("这是你要的两张海边照片。", "photo_1", "photo_2"),
+        ]
+    )
+    toolbox = StubToolbox({"search_memories": SEARCH_OK, FINAL_ANSWER_TOOL: DELIVER_OK})
+    run_turn = build(env, model, toolbox)
+    turn_id = run_turn.start(
+        TurnRequest(conversation_id=conversation.id, question=QUESTION, include_debug=True)
+    ).id
+
+    run_turn.run(turn_id)
+
+    trace = turns.get(turn_id).trace
+    assert trace["include_debug"] is True
+    calls = trace["debug_calls"]
+    assert [call["seq"] for call in calls] == list(range(len(calls)))
+
+    planners = [call for call in calls if call["call_type"] == "planner"]
+    assert len(planners) == 1
+    assert planners[0]["messages"][1] == {"role": "user", "content": QUESTION}
+    assert planners[0]["tools"] == []
+    assert planners[0]["response"]["content"]
+
+    agents = [call for call in calls if call["call_type"] == "agent"]
+    assert len(agents) == 2
+    first, second = agents
+    assert first["step_id"] == "step_1"
+    assert first["messages"][0]["role"] == "system"
+    assert first["messages"][1] == {"role": "user", "content": QUESTION}
+    tool_names = [entry["function"]["name"] for entry in first["tools"]]
+    assert "search_memories" in tool_names
+    assert first["response"]["tool_calls"][0]["name"] == "search_memories"
+    assert json.loads(first["response"]["tool_calls"][0]["arguments"]) == {"query": "海边"}
+
+    assert second["step_id"] == "step_2"
+    tool_messages = [message for message in second["messages"] if message["role"] == "tool"]
+    assert tool_messages and "rs_1" in tool_messages[-1]["content"]
+    assert second["response"]["tool_calls"][-1]["name"] == FINAL_ANSWER_TOOL
+    assert "这是你要的两张海边照片。" in second["response"]["tool_calls"][-1]["arguments"]
+
+    judges = [call for call in calls if call["call_type"] == "faithfulness_judge"]
+    assert len(judges) == 1
+    assert judges[0]["messages"][0]["role"] == "system"
+    assert "事实一致性评审" in judges[0]["messages"][0]["content"]
+    assert judges[0]["response"]["content"]
+
+
+def test_debug_trace_is_off_by_default(env):
+    _conversations, turns, conversation, _db = env
+    model = ScriptedModel([tool_call("search_memories", "c1", query="海边"), final("给你。")])
+    run_turn = build(env, model, StubToolbox({"search_memories": SEARCH_OK}))
+    turn_id = start(run_turn, conversation)
+
+    run_turn.run(turn_id)
+
+    trace = turns.get(turn_id).trace
+    assert trace["include_debug"] is False
+    assert trace["debug_calls"] == []

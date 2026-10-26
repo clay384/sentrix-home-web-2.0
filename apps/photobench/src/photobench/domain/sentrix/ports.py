@@ -122,11 +122,22 @@ class SentrixClient(Protocol):
         """
         ...
 
-    def start_turn(self, *, conversation_id: str, message: str, timeout: int = 300) -> dict[str, Any]:
+    def start_turn(
+        self,
+        *,
+        conversation_id: str,
+        message: str,
+        include_debug: bool = False,
+        timeout: int = 300,
+    ) -> dict[str, Any]:
         """``POST /api/v1/assistant/conversations/{cid}/turns``，返回 ``{turn_id, status}``。
 
-        **不是同步返回答案**：状态码 202，执行在后台线程。scope **不在请求体里**
-        （``StartTurnRequest`` 只有 ``message``），它继承会话。
+        **不是同步返回答案**：状态码 202，执行在后台线程。scope **不在请求体里**，
+        它继承会话。
+
+        ``include_debug=True`` 让主 API 在终态载荷的 ``trace.debug_calls`` 里带上每次
+        模型调用**实际发送的 messages / tools 与原始回复**。评测侧打开它；其他调用方
+        不打开，产品对话就不会把那几十 KB 的提示词写进 ``agent_turns``。
         """
         ...
 

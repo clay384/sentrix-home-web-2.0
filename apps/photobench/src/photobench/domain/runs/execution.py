@@ -541,12 +541,12 @@ def agent2_trace_from(trace: Mapping[str, Any] | None, *, termination_reason: st
 
 
 def debug_steps_from(events: Sequence[Any]) -> list[dict[str, Any]]:
-    """``DebugTracePanel`` 要的逐步轨迹。
+    """``DebugTracePanel`` 要的逐步轨迹（2.0 的进度事件投影）。
 
-    **2.0 给不出 ``prompt`` / ``raw``**：助手从不把提示词与原始回复放上任何一条对外通道
-    （``behaviour-baseline.md`` 的「2.0 不再暴露的轨迹」一节登记过）。这一步给的是它
-    **确实有**的那几格——步骤类型、状态、工具入参、工具产出的规模。面板上 ``prompt``
-    那一格会是空的，**那是事实，不是缺页**。
+    这里**不复制**模型的完整输入输出：它们在回合的 ``trace_bundle.debug_calls`` 里，
+    一条调用一份。本函数只保留「这条事件对应哪次模型调用」的锚点
+    （``step_id`` / ``parent_step_id`` / ``call_id``），让前端按锚点去取，
+    避免同一份 prompt 在 run.json 里出现两次。
     """
     steps: list[dict[str, Any]] = []
     for event in events or []:
@@ -558,6 +558,9 @@ def debug_steps_from(events: Sequence[Any]) -> list[dict[str, Any]]:
             "status": str(event.get("status") or ""),
             "text": str(event.get("text") or ""),
         }
+        for key in ("step_id", "parent_step_id", "call_id"):
+            if payload.get(key) is not None:
+                step[key] = payload[key]
         if payload.get("tool"):
             step["tool"] = payload["tool"]
         if payload.get("arguments") is not None:

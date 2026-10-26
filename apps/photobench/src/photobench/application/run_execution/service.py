@@ -1857,8 +1857,14 @@ class RunExecution:
                     if turn_index < len(conversation) and isinstance(conversation[turn_index], dict)
                     else {}
                 )
+                # **评测必须打开完整轨迹。** 8772 的「模型这一步看到什么/回答什么」
+                # 只能由主 API 在回合终态载荷里带出来；不开这个开关，run.json 里
+                # 永远只有工具入参与摘要，和 1.0 的 debug_trace 对不上。
                 started_turn = self.client.start_turn(
-                    conversation_id=conversation_id, message=message, timeout=300
+                    conversation_id=conversation_id,
+                    message=message,
+                    include_debug=True,
+                    timeout=300,
                 )
                 turn_id = str(started_turn.get("turn_id") or "")
                 if not turn_id:

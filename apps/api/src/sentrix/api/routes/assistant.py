@@ -230,7 +230,13 @@ def start_turn(
     run_turn = _run_turn(container)
     # 回合的 scope 由会话决定，请求里没有这个字段可传。会话不存在时 ``start`` 抛
     # ``TurnNotFoundError``（带 404 的码），路由**只放行**——映射在 ``api/errors.py``。
-    record = run_turn.start(TurnRequest(conversation_id=conversation_id, question=payload.message))
+    record = run_turn.start(
+        TurnRequest(
+            conversation_id=conversation_id,
+            question=payload.message,
+            include_debug=payload.include_debug,
+        )
+    )
     manage.ensure_title(conversation_id, payload.message)
 
     broker = container.turn_event_broker

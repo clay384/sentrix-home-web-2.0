@@ -34,6 +34,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from sentrix.application.assistant.debug_trace import (
+    chat_messages_payload,
+    model_reply_payload,
+    tool_specs_payload,
+)
 from sentrix.application.assistant.goal_planner import (
     PLANNER_CALL_ERROR,
     GoalPlanner,
@@ -307,6 +312,11 @@ def _turn_trace(session: _Session, planned: PlannerResult | None) -> Mapping[str
         },
         "delivered": [item.asset_id for item in session.delivered.items],
         "retrieved_candidates": list(state.retrieved_candidates),
+        # **模型这一步看到什么、回答什么。** 只有 ``include_debug`` 时非空；
+        # 按发生顺序排列（planner → agent → judge），每条都带当时的 messages 与
+        # ``tools``，以及模型原始 content / thought / tool_calls。
+        "include_debug": session.include_debug,
+        "debug_calls": [dict(call) for call in session.debug_calls],
     }
 
 
@@ -442,6 +452,9 @@ class TurnRequest:
 
     conversation_id: str
     question: str
+    #: 只在评测/复盘时打开：把每次模型调用实际发送的 messages / tools / 原始回复
+    #: 收进 ``TurnRecord.trace["debug_calls"]``。默认关闭——产品对话不为它付体积。
+    include_debug: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,6 +507,17 @@ class _Session:
     # 每一次模型调用的指标。**不进进度事件**——``public_progress`` 同时是终端用户看的
     # 进度条，往里加事件就是给他每步多加一行噪音。它随收尾一起进 ``TurnRecord.trace``。
     model_calls: list[dict[str, Any]] = field(default_factory=list)
+    #: ``include_debug`` 打开时，每次调用的完整 messages / tools / 原始回复。
+    #: 与 ``model_calls`` 分开：前者是复盘用的输入输出，后者是评测指标；
+    #: 混在一起会把体积带进 ``model_call_metrics`` 这个逐题投影里。
+    include_debug: bool = False
+    debug_calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def add_debug_call(self, call: Mapping[str, Any]) -> None:
+        """按发生顺序编号后追加一次模型调用。``seq`` 只在回合内唯一。"""
+        item = dict(call)
+        item["seq"] = len(self.debug_calls)
+        self.debug_calls.append(item)
 
 
 class RunTurn:
@@ -541,6 +565,9 @@ class RunTurn:
             status=TurnStatus.PENDING,
             created_at=now,
             updated_at=now,
+            # 开关要跨 ``start`` / ``run`` 两个调用点，而它们之间只有这条落库的记录。
+            # 放进 trace（而不是进程内 dict）：重启后拿到的回合仍然知道自己要不要采。
+            trace={"include_debug": True} if request.include_debug else {},
         )
         self._turns.create(record)
         self._conversations.add_message(
@@ -573,6 +600,7 @@ class RunTurn:
             ),
             ledger=EvidenceLedger(scope_id=record.scope_id, requirements=[]),
             emit=emit,
+            include_debug=bool(record.trace.get("include_debug")),
         )
 
         # 政策拒答那条出口**不经过规划**，所以 ``planned`` 可能从头到尾没被赋值。
@@ -592,7 +620,15 @@ class RunTurn:
                 for message in self._conversations.history_for_prompt(record.conversation_id, HISTORY_LIMIT)
                 if message.turn_id != record.id
             )
-            planned = self._planner.declare(record.question, scope_id=record.scope_id, history=history)
+            planned = self._planner.declare(
+                record.question,
+                scope_id=record.scope_id,
+                history=history,
+                include_debug=session.include_debug,
+            )
+            # 规划发生在主循环之前，所以先把它按发生顺序放进同一条 debug 轨迹。
+            for call in planned.debug_calls:
+                session.add_debug_call(call)
             if not planned.ok:
                 # 1.0 ``runtime.py:1828``：规划不出来就以 planner_blocked 收场，不再往下走。
                 # 拿一条编出来的需求去检索，比诚实地说规划失败更糟。
@@ -615,7 +651,16 @@ class RunTurn:
                         ProgressStatus.COMPLETE,
                         "已确认需要哪些证据。",
                         kind="plan",
-                        payload={"requirements": list(session.ledger.as_payload())},
+                        payload={
+                            "requirements": list(session.ledger.as_payload()),
+                            # 让「规划」步骤能精确对上完整轨迹里的那一次调用；
+                            # 没开 include_debug 时为空。
+                            "call_id": (
+                                str(planned.debug_calls[-1].get("step_id") or "")
+                                if planned.debug_calls
+                                else ""
+                            ),
+                        },
                     ),
                 )
                 try:
@@ -688,12 +733,27 @@ class RunTurn:
         call_type: str = "agent",
     ) -> ModelReply:
         started = time.perf_counter()
+        step_id = _step_id(session.state)
         record: dict[str, Any] = {
-            "step_id": _step_id(session.state),
+            "step_id": step_id,
             "call_type": call_type,
             "attempt": len(session.model_calls) + 1,
             "status": "error",
         }
+        # **完整轨迹与指标分开两份。** 指标要逐题摊平进 ``model_call_metrics``；
+        # 把 messages/tools 也塞进去会让那个投影跟着膨胀。
+        debug_call: dict[str, Any] | None = None
+        if session.include_debug:
+            debug_call = {
+                "step_id": step_id,
+                "call_type": call_type,
+                "attempt": record["attempt"],
+                "started_at": datetime.now(UTC).isoformat(),
+                "status": "error",
+                "messages": chat_messages_payload(messages),
+                "tools": tool_specs_payload(specs),
+                "response": None,
+            }
         try:
             reply = self._model.complete(messages, specs)
             facts = list(reply.tool_argument_parse_facts)
@@ -713,13 +773,29 @@ class RunTurn:
                 tool_calls=[call.name for call in reply.tool_calls],
                 tool_argument_parse_facts=facts,
             )
+            if debug_call is not None:
+                debug_call.update(
+                    status="complete",
+                    prompt_tokens=reply.prompt_tokens,
+                    completion_tokens=reply.completion_tokens,
+                    finish_reason=reply.finish_reason,
+                    tool_calls=[call.name for call in reply.tool_calls],
+                    tool_argument_parse_facts=facts,
+                    response=model_reply_payload(reply),
+                )
             return reply
         except Exception as error:
             record.update(error_type=type(error).__name__, error=str(error))
+            if debug_call is not None:
+                debug_call.update(error_type=type(error).__name__, error=str(error))
             raise
         finally:
-            record["duration_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            duration_ms = round((time.perf_counter() - started) * 1000, 1)
+            record["duration_ms"] = duration_ms
             session.model_calls.append(record)
+            if debug_call is not None:
+                debug_call["duration_ms"] = duration_ms
+                session.add_debug_call(debug_call)
 
     def _converse(self, session: _Session, record: TurnRecord) -> str:
         state = session.state
@@ -1215,7 +1291,16 @@ class RunTurn:
             return False
         session.judged = True
         state.model_steps += 1
-        verdict = self._judge.review(query=state.question, answer=answer, transcript=messages)
+        judge_step_id = _step_id(state)
+        verdict = self._judge.review(
+            query=state.question,
+            answer=answer,
+            transcript=messages,
+            include_debug=session.include_debug,
+            step_id=judge_step_id,
+        )
+        if session.include_debug and verdict.debug_call is not None:
+            session.add_debug_call(verdict.debug_call)
         if verdict.faithful or not verdict.truth_problems:
             return False
         # 1.0 ``runtime.py:2786-2788``：判过不实就先把标记落下来。**标记在「判不实」那一刻
@@ -1231,7 +1316,8 @@ class RunTurn:
                 ProgressStatus.RUNNING,
                 verdict.reminder,
                 kind="judge",
-                payload={"code": "l2_unfaithful"},
+                # ``call_id`` 让 8772 的「评判步骤」能直接对上完整轨迹里的那一次调用。
+                payload={"code": "l2_unfaithful", "call_id": judge_step_id},
             ),
         )
         session.pending_reminder = verdict.reminder

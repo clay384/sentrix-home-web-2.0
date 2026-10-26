@@ -160,8 +160,21 @@ class FakeSentrixClient:
             "last_message_at": now_iso(),
         }
 
-    def start_turn(self, *, conversation_id: str, message: str, timeout: int = 300) -> dict[str, Any]:
-        self._record("start_turn", conversation_id=conversation_id, message=message, timeout=timeout)
+    def start_turn(
+        self,
+        *,
+        conversation_id: str,
+        message: str,
+        include_debug: bool = False,
+        timeout: int = 300,
+    ) -> dict[str, Any]:
+        self._record(
+            "start_turn",
+            conversation_id=conversation_id,
+            message=message,
+            include_debug=include_debug,
+            timeout=timeout,
+        )
         self._turn_seq += 1
         return {"turn_id": f"turn_{self._turn_seq}", "conversation_id": conversation_id, "status": "running"}
 

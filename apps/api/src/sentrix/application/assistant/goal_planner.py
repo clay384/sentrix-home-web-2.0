@@ -28,8 +28,13 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
+from sentrix.application.assistant.debug_trace import (
+    chat_messages_payload,
+    model_reply_payload,
+)
 from sentrix.domain.assistant.evidence_ledger import EvidenceRequirement
 from sentrix.domain.assistant.intent import (
     build_prompt,
@@ -64,6 +69,9 @@ class PlannerResult:
     raw: str = ""
     detail: str = ""
     model_calls: tuple[dict[str, Any], ...] = ()
+    #: 仅在 ``include_debug`` 时非空：每次尝试的完整 messages / 原始回复。
+    #: 与 ``model_calls`` 分开：后者是评测指标，前者是复盘用的完整输入输出。
+    debug_calls: tuple[dict[str, Any], ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -79,7 +87,14 @@ class GoalPlanner:
             else max(1, int(os.getenv("SENTRIX_PLANNER_MAX_ATTEMPTS", str(DEFAULT_MAX_ATTEMPTS))))
         )
 
-    def declare(self, question: str, *, scope_id: str, history: str = "") -> PlannerResult:
+    def declare(
+        self,
+        question: str,
+        *,
+        scope_id: str,
+        history: str = "",
+        include_debug: bool = False,
+    ) -> PlannerResult:
         # 历史折进 system 文本，不再插一条 system 消息——严格 chat template 要求 system
         # 必须在开头（1.0 ``goal_planner.py:115-117``，实测 24 题因此失败）。
         system = build_prompt() + history_prompt_suffix(history)
@@ -89,13 +104,28 @@ class GoalPlanner:
         last_raw = ""
         last_reason = "invalid_planner_action"
         calls: list[dict[str, Any]] = []
+        debug_calls: list[dict[str, Any]] = []
         for attempt in range(self.max_attempts):
             started = time.perf_counter()
+            step_id = f"planner_{attempt + 1}"
             call: dict[str, Any] = {
-                "step_id": f"planner_{attempt + 1}",
+                "step_id": step_id,
                 "call_type": "planner",
+                "attempt": attempt + 1,
                 "status": "error",
             }
+            debug_call: dict[str, Any] = {}
+            if include_debug:
+                debug_call = {
+                    "step_id": step_id,
+                    "call_type": "planner",
+                    "attempt": attempt + 1,
+                    "started_at": datetime.now(UTC).isoformat(),
+                    "status": "error",
+                    "messages": chat_messages_payload(messages),
+                    "tools": [],
+                    "response": None,
+                }
             try:
                 # 规划不带工具：它要的是一段 JSON 声明，不是一次工具往返。
                 reply = self._model.complete(messages, ())
@@ -105,24 +135,52 @@ class GoalPlanner:
                     completion_tokens=reply.completion_tokens,
                     finish_reason=reply.finish_reason,
                 )
+                if include_debug:
+                    debug_call.update(
+                        status="complete",
+                        prompt_tokens=reply.prompt_tokens,
+                        completion_tokens=reply.completion_tokens,
+                        finish_reason=reply.finish_reason,
+                        response=model_reply_payload(reply),
+                    )
             except Exception as error:
                 log.exception("planner call failed: scope=%s attempt=%s", scope_id, attempt + 1)
                 # 只有模型服务这一侧的失败才带说明：它的文案里已经写明了端点地址，直接
                 # 转述比在上层另拼一句更准。别的原因（2.0 自己拼错了请求）不往里塞，
                 # 免得把内部形状说给用户听。
                 call.update(error_type=type(error).__name__, error=str(error))
+                if include_debug:
+                    debug_call.update(error_type=type(error).__name__, error=str(error))
+                duration_ms = round((time.perf_counter() - started) * 1000, 1)
+                call["duration_ms"] = duration_ms
+                calls.append(call)
+                if include_debug:
+                    debug_call["duration_ms"] = duration_ms
+                    debug_calls.append(debug_call)
                 detail = str(error) if isinstance(error, ModelServiceError) else ""
                 return PlannerResult(
-                    fallback_reason=PLANNER_CALL_ERROR, detail=detail, model_calls=tuple([*calls, call])
+                    fallback_reason=PLANNER_CALL_ERROR,
+                    detail=detail,
+                    model_calls=tuple(calls),
+                    debug_calls=tuple(debug_calls),
                 )
-            finally:
-                call["duration_ms"] = round((time.perf_counter() - started) * 1000, 1)
-                calls.append(call)
+
+            duration_ms = round((time.perf_counter() - started) * 1000, 1)
+            call["duration_ms"] = duration_ms
+            calls.append(call)
+            if include_debug:
+                debug_call["duration_ms"] = duration_ms
+                debug_calls.append(debug_call)
 
             last_raw = reply.content
             requirements, reason = parse_declaration(last_raw or "", scope_id=scope_id, question=question)
             if requirements is not None:
-                return PlannerResult(requirements=requirements, raw=last_raw, model_calls=tuple(calls))
+                return PlannerResult(
+                    requirements=requirements,
+                    raw=last_raw,
+                    model_calls=tuple(calls),
+                    debug_calls=tuple(debug_calls),
+                )
             last_reason = reason
             if attempt + 1 >= self.max_attempts:
                 break
@@ -131,4 +189,9 @@ class GoalPlanner:
                 ChatMessage(ChatRole.ASSISTANT, str(last_raw or "")),
                 ChatMessage(ChatRole.USER, correction_hint(reason)),
             ]
-        return PlannerResult(fallback_reason=last_reason, raw=last_raw, model_calls=tuple(calls))
+        return PlannerResult(
+            fallback_reason=last_reason,
+            raw=last_raw,
+            model_calls=tuple(calls),
+            debug_calls=tuple(debug_calls),
+        )
