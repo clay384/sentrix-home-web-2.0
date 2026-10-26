@@ -255,10 +255,15 @@ def summarize_run(state: Mapping[str, Any], samples: Sequence[Mapping[str, Any]]
     raw_items = state.get("items")
     items = [row for row in raw_items if isinstance(row, Mapping)] if isinstance(raw_items, list) else []
     calls: list[Mapping[str, Any]] = []
+    runtime_turns: list[Mapping[str, Any]] = []
+    runtime_items = 0
     tools: list[Mapping[str, Any]] = []
     call_items = tool_items = 0
     agent_durations: list[float] = []
     for item in items:
+        if isinstance(item.get("runtime_turns"), list):
+            runtime_items += 1
+            runtime_turns.extend(turn for turn in item["runtime_turns"] if isinstance(turn, Mapping))
         duration = _number(_mapping(item.get("timing_breakdown")).get("agent_wall_ms"))
         if duration is not None:
             agent_durations.append(duration)
@@ -338,6 +343,22 @@ def summarize_run(state: Mapping[str, Any], samples: Sequence[Mapping[str, Any]]
             "item_outcomes": _item_outcomes(items, isinstance(raw_items, list)),
             "items_with_model_trace": call_items,
             "items_with_tool_trace": tool_items,
+            "runtime_turns": {
+                "items_with_trace": runtime_items,
+                "recorded": len(runtime_turns) if runtime_items else None,
+                "failed": sum(turn.get("status") in {"failed", "error", "timeout"} for turn in runtime_turns)
+                if runtime_items
+                else None,
+                "model_error_terminations": sum(
+                    turn.get("termination_reason") in {"model_error", "planner_call_error"}
+                    for turn in runtime_turns
+                )
+                if runtime_items
+                else None,
+                "status_not_recorded": sum(not turn.get("status") for turn in runtime_turns)
+                if runtime_items
+                else None,
+            },
             "model_samples": len(model_points),
             "progress_samples": len(progress_points),
         },
@@ -368,6 +389,15 @@ def summarize_run(state: Mapping[str, Any], samples: Sequence[Mapping[str, Any]]
         },
         "model": {
             "calls_recorded": len(calls) if call_items else None,
+            "call_outcomes": {
+                "completed": sum(call.get("status") in {"complete", "completed", "ok"} for call in calls)
+                if call_items
+                else None,
+                "errors": sum(call.get("status") in {"error", "failed", "timeout"} for call in calls)
+                if call_items
+                else None,
+                "status_not_recorded": sum(not call.get("status") for call in calls) if call_items else None,
+            },
             "call_wall_ms": _stats(_values(calls, "duration_ms", "total_ms")),
             "call_ttft_ms": _stats(_values(calls, "ttft_ms")),
             "endpoint": {

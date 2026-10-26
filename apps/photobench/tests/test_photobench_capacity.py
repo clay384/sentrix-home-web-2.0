@@ -222,7 +222,9 @@ def test_main_resume_observes_known_run_without_replaying_and_rejects_identity_c
     memory.write_text(json.dumps({"scope_id": "frozen-scope", "embedding": kw["embedding"]}))
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
+    (snapshot / "manifest.json").write_text('{"identity":"checked"}\n')
     output = tmp_path / "round"
+    run_overview, run_items = detail_fixture(64)
 
     def get(url, *_):
         if url.endswith("/config"):
@@ -234,7 +236,7 @@ def test_main_resume_observes_known_run_without_replaying_and_rejects_identity_c
         if "/qa-dataset?" in url:
             return json.dumps({"items": rows()})
         if "/runs/known" in url:
-            return json.dumps(state("completed"))
+            return detail_reader(run_overview, run_items)(url)
         raise AssertionError(url)
 
     monkeypatch.setattr(capacity, "get_text", get)
@@ -377,3 +379,204 @@ def test_active_snapshot_path_is_rejected_and_unavailable_is_explicit(tmp_path):
         capacity.validate_active_data_copy(data, record, data, tmp_path / "missing-proc")["status"]
         == "unavailable"
     )
+
+
+def test_restore_receipt_binds_raw_manifest_and_destination_without_reading_live_db(tmp_path):
+    source = tmp_path / "original"
+    data = tmp_path / "active"
+    frozen = tmp_path / "snapshot"
+    frozen.mkdir()
+    # No active data directory/DB exists: this contract must only read the receipt.
+    manifest = {
+        "schema_version": 2,
+        "source_root": str(source.resolve()),
+        "identity_sha256": "b" * 64,
+        "database": {"integrity_check": "ok"},
+    }
+    (frozen / "manifest.json").write_text(json.dumps(manifest, indent=4) + "\n")
+    manifest_sha = capacity.memory_snapshot.digest(frozen / "manifest.json")
+    receipt = {
+        "schema_version": 1,
+        "manifest_sha256": manifest_sha,
+        "identity_sha256": manifest["identity_sha256"],
+        "from_root": str(source.resolve()),
+        "to_root": str(data.resolve()),
+        "database": manifest["database"],
+        "relocated_assets": 344,
+        "post_restore_database_sha256": "c" * 64,
+        "sqlite_files": {"sentrix.db": {"sha256": "c" * 64}},
+    }
+    path = capacity.memory_snapshot.receipt_path_for(data)
+    path.write_text(json.dumps(receipt))
+    result = capacity.restore_evidence(data, None, frozen, manifest)
+    assert result["status"] == "verified"
+    assert result["sha256"] == capacity.memory_snapshot.digest(path)
+    assert result["receipt"]["manifest_sha256"] == manifest_sha
+    with pytest.raises(ValueError, match="destination"):
+        capacity.restore_evidence(tmp_path / "other", path, frozen, manifest)
+    (frozen / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="snapshot"):
+        capacity.restore_evidence(data, path, frozen, manifest)
+    with pytest.raises(ValueError, match="requires"):
+        capacity.restore_evidence(None, path, frozen, manifest)
+    path.unlink()
+    with pytest.raises(FileNotFoundError):
+        capacity.restore_evidence(data, None, frozen, manifest)
+
+
+def detail_fixture(count=8, error="", termination=""):
+    overview = state("completed")
+    overview.update(run_id="known", qa_count=count, item_count=count, read_revision="snapshot:fixed")
+    overview.pop("items")  # Both public run overview modes omit this field.
+    overview["phases"]["qa_eval"]["progress"].update(
+        total=count, agent_completed=count, judge_completed=count
+    )
+    items = [
+        {
+            "qa_id": str(i),
+            "_index": i,
+            "execution_status": "completed",
+            "judge_status": "completed",
+            "judge": {"score": 0},
+            "runtime_turns": [
+                {
+                    "status": "partial" if error else "complete",
+                    "termination_reason": termination,
+                    "trace_bundle": {
+                        "model_calls": [
+                            {"status": "error" if error else "complete", "error": error, "duration_ms": 100}
+                        ]
+                    },
+                }
+            ],
+            "model_call_metrics": [
+                {"status": "error" if error else "complete", "error": error, "duration_ms": 100}
+            ],
+            "tool_trace": [{"tool": "search_memories", "duration_ms": 50}],
+        }
+        for i in range(count)
+    ]
+    return overview, items
+
+
+def detail_reader(overview, items):
+    def read(url, *_):
+        if "/items/" in url:
+            index = int(url.rsplit("/", 1)[1])
+            return json.dumps({"index": index, "item": items[index]})
+        return json.dumps(overview)
+
+    return read
+
+
+def test_final_evidence_hydrates_real_overview_shape_with_bounded_parallel_reads(tmp_path, monkeypatch):
+    overview, items = detail_fixture()
+    active = peak = 0
+    first_four = threading.Event()
+    lock = threading.Lock()
+    reader = detail_reader(overview, items)
+
+    def read(url, *args):
+        nonlocal active, peak
+        if "/items/" not in url:
+            return reader(url, *args)
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if active == 4:
+                first_four.set()
+        try:
+            assert first_four.wait(2), "detail collection must actually run in parallel"
+            return reader(url, *args)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(capacity, "get_text", read)
+    report = capacity.final_evidence("http://safe", "known", tmp_path, rows(8))
+    assert peak == 4
+    assert report["coverage"]["items_observed"] == 8
+    assert report["model"]["calls_recorded"] == 8
+    assert report["model"]["call_outcomes"]["completed"] == 8
+    assert report["retrieval_tools"]["tool_wall_ms"]["search_memories"]["samples"] == 8
+    assert [item["qa_id"] for item in json.loads((tmp_path / "final-run.json").read_text())["items"]] == [
+        str(i) for i in range(8)
+    ]
+
+
+@pytest.mark.parametrize("corruption", ["index", "qa_id", "count", "missing_count", "revision"])
+def test_final_evidence_rejects_misaligned_or_changing_details(tmp_path, monkeypatch, corruption):
+    overview, items = detail_fixture()
+    reader = detail_reader(overview, items)
+    if corruption == "qa_id":
+        items[0]["qa_id"] = "not-source-id"
+    elif corruption == "count":
+        overview["item_count"] = 7
+    elif corruption == "missing_count":
+        overview.pop("item_count")
+
+    def read(url, *args):
+        result = json.loads(reader(url, *args))
+        if corruption == "index" and "/items/0" in url:
+            result["index"] = 2
+        if corruption == "revision" and "include_history=false" in url:
+            result["read_revision"] = "snapshot:changed"
+        return json.dumps(result)
+
+    monkeypatch.setattr(capacity, "get_text", read)
+    with pytest.raises(ValueError):
+        capacity.final_evidence("http://safe", "known", tmp_path, rows(8))
+    assert not (tmp_path / "final-run.json").exists()
+
+
+def test_model_resource_failure_is_detected_inside_turn_and_call_records(tmp_path, monkeypatch):
+    overview, items = detail_fixture(64, "CUDA out of memory", "model_error")
+    monkeypatch.setattr(capacity, "get_text", detail_reader(overview, items))
+    result = capacity.poll_run(**poll_kwargs(tmp_path), source_rows=rows(64))
+    assert not result["passed"]
+    assert result["failure"] == "resource_failure"
+    report = capacity.final_evidence("http://safe", "known", tmp_path, rows(64))
+    assert report["resource_failure"] is True
+    assert report["model"]["call_outcomes"]["errors"] == 64
+    assert report["coverage"]["runtime_turns"]["model_error_terminations"] == 64
+    # Nested fallback works even for historical items without flattened calls.
+    for item in items:
+        item.pop("model_call_metrics")
+    assert capacity.resource_failure({"items": items})
+
+
+def test_nonresource_model_errors_and_answer_text_are_not_resource_failures(tmp_path, monkeypatch):
+    overview, items = detail_fixture(64, "invalid function arguments", "model_error")
+    for item in items:
+        item.update(question="Explain timeout", answer="CUDA out of memory is an error message")
+    monkeypatch.setattr(capacity, "get_text", detail_reader(overview, items))
+    result = capacity.poll_run(**poll_kwargs(tmp_path), source_rows=rows(64))
+    assert result["passed"]
+    report = capacity.final_evidence("http://safe", "known", tmp_path, rows(64))
+    assert report["resource_failure"] is False
+    assert report["model"]["call_outcomes"]["errors"] == 64
+
+
+def test_running_resource_failure_stops_new_dispatch_via_one_cancel(tmp_path, monkeypatch):
+    overview, items = detail_fixture(64, "database is locked", "model_error")
+    overview["status"] = "running"
+    monkeypatch.setattr(capacity, "get_text", detail_reader(overview, items))
+    calls = []
+    monkeypatch.setattr(capacity, "post_once", lambda url, *args: calls.append(url) or {"state": "completed"})
+    result = capacity.poll_run(**poll_kwargs(tmp_path), source_rows=rows(64))
+    assert result["failure"] == "resource_failure"
+    assert len(calls) == 1
+    assert calls[0].endswith("/cancel")
+
+
+def test_absent_item_trace_keeps_error_count_unknown(tmp_path, monkeypatch):
+    overview, items = detail_fixture()
+    for item in items:
+        item.pop("runtime_turns")
+        item.pop("model_call_metrics")
+        item.pop("tool_trace")
+    monkeypatch.setattr(capacity, "get_text", detail_reader(overview, items))
+    report = capacity.final_evidence("http://safe", "known", tmp_path, rows(8))
+    assert report["model"]["calls_recorded"] is None
+    assert report["model"]["call_outcomes"]["errors"] is None
+    assert report["coverage"]["runtime_turns"]["recorded"] is None

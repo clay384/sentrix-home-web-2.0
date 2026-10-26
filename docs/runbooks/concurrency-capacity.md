@@ -144,3 +144,14 @@ token and completion timings, CPU/RAM samples, Judge backlog and HTTP 429s.
 Model-server readings must carry the remote host identity; client resources must
 not be labeled model memory. Distinguish end-to-end phase wall time from summed
 worker duration, since QA and Judge overlap.
+
+The run overview API omits `items` in both history modes. The capacity CLI fetches
+item detail endpoints with at most four simultaneous reads, validates indexes and
+QA identities against the fixed source, and checks the final revision/count before
+saving `final-run.json`. During polling it reads new or still-in-flight item details
+so structured model/turn resource errors stop further dispatch promptly. It never
+scans QA prose or answers for error keywords. Non-resource model errors remain
+separate counts from resource failures and answer-quality scores; missing traces
+produce unknown counts, not zero errors. Final evidence repeats the resource check.
+The selected Sentrix PID sample covers that API process only; embedding sidecars
+need their own PID evidence to describe full client CPU consumption.
