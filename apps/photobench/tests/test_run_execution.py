@@ -126,6 +126,7 @@ def _completed_turn(
             # 助手的**回合级事实**。形状由 ``run_turn._turn_trace`` 组装，这里照抄一份
             # 生产上真的会出现的——三个投影都读它。
             "trace": {
+                "include_debug": True,
                 "model_calls": [
                     {
                         "step_id": "step_1",
@@ -135,6 +136,33 @@ def _completed_turn(
                         "duration_ms": 400.0,
                         "tool_calls": ["search_memories"],
                         "finish_reason": "tool_calls",
+                    }
+                ],
+                # 评测侧 include_debug=true 时的完整模型输入/输出。
+                "debug_calls": [
+                    {
+                        "seq": 0,
+                        "step_id": "step_1",
+                        "call_type": "agent",
+                        "status": "complete",
+                        "messages": [
+                            {"role": "system", "content": "你是相册助手"},
+                            {"role": "user", "content": "看海边的照片"},
+                        ],
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {"name": "search_memories", "description": "检索"},
+                            }
+                        ],
+                        "response": {
+                            "content": "",
+                            "thought": "先检索",
+                            "tool_calls": [
+                                {"id": "c1", "name": "search_memories", "arguments": "{}"}
+                            ],
+                            "finish_reason": "tool_calls",
+                        },
                     }
                 ],
                 "planner": {"status": "ok", "fallback_reason": "", "goal": "看海边的照片"},
@@ -780,6 +808,12 @@ def test_the_turn_facts_are_projected_into_the_three_panels():
         "tool_result",
         "terminal",
     ]
+
+    # ⑤ 完整模型轨迹原样落进 ``trace_bundle``（8772 的两块面板都从这里取）。
+    debug_calls = item["runtime_turns"][0]["trace_bundle"]["debug_calls"]
+    assert debug_calls[0]["call_type"] == "agent"
+    assert debug_calls[0]["messages"][-1]["content"] == "看海边的照片"
+    assert debug_calls[0]["response"]["tool_calls"][0]["name"] == "search_memories"
 
     # ④ 稳定性卡只认 ``execution_trace`` 里 ``stage == "model"`` 的步骤——模型调用
     #    的事实本来就在手上，不补成那种步骤，那张卡恒显示「未记录」。
