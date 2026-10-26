@@ -533,9 +533,12 @@ def test_received_server_error_remains_retryable():
 
 
 @pytest.mark.parametrize("method", ["quality", "task", "evidence"])
-def test_cloud_finish_length_is_incomplete_even_with_valid_json_and_never_retries(method):
+@pytest.mark.parametrize(
+    "finish_reason,kind", [("length", "output_limit"), ("content_filter", "provider_rejected")]
+)
+def test_cloud_incomplete_finish_even_with_valid_json_never_retries(method, finish_reason, kind):
     raw = judge_reply('{"score":0,"reason":"内容错误","actual_action":"answer"}')
-    raw["choices"][0]["finish_reason"] = "length"
+    raw["choices"][0]["finish_reason"] = finish_reason
     http = FakeHttpClient([raw])
     runner = _runner(
         http, inline_images=lambda *_: [{"type": "image_url", "image_url": {"url": "data:test"}}]
@@ -548,7 +551,9 @@ def test_cloud_finish_length_is_incomplete_even_with_valid_json_and_never_retrie
         result = runner.judge_evidence("q", "answer", [{"file_name": "a"}], {})
     assert result["score"] is None
     assert result["judge_status"] == "failed"
-    assert result["operational_issue"]["kind"] == "output_limit"
+    assert result["operational_issue"]["kind"] == kind
+    assert result["reason"] == "judge_" + kind
+    assert result["operational_issue"]["evidence"]["value"] == finish_reason
     assert result["operational_issue"]["scope"] == "judge"
     assert result["raw_response"] == raw
     assert len(http.calls) == 1
@@ -570,9 +575,12 @@ def test_item_with_operational_failure_never_calls_cloud():
     assert http.calls == []
 
 
-def test_cloud_truncation_stops_later_judge_subrequests_and_preserves_raw_turn():
+@pytest.mark.parametrize(
+    "finish_reason,kind", [("length", "output_limit"), ("content_filter", "provider_rejected")]
+)
+def test_cloud_incomplete_finish_stops_later_subrequests_and_preserves_raw_turn(finish_reason, kind):
     raw = judge_reply('{"actual_action":"answer","reason":"足够"}')
-    raw["choices"][0]["finish_reason"] = "length"
+    raw["choices"][0]["finish_reason"] = finish_reason
     http = FakeHttpClient([raw])
     result = _runner(http).judge_item(
         {
@@ -587,6 +595,6 @@ def test_cloud_truncation_stops_later_judge_subrequests_and_preserves_raw_turn()
     assert result["execution_status"] == "completed"
     assert result["judge_status"] == "failed"
     assert result["judge"]["score"] is None
-    assert result["judge_issue"]["kind"] == "output_limit"
+    assert result["judge_issue"]["kind"] == kind
     assert result["runtime_turns"][0]["task_judge"]["raw_response"] == raw
     assert len(http.calls) == 1

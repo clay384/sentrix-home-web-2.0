@@ -57,6 +57,7 @@ class VectorIndexStatus:
     available: bool
     degraded: bool = False
     reason: str = ""
+    operational_issue: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +164,39 @@ class VectorIndexUnavailable(RuntimeError):
     这是**预期内**的失败，所以必须是一个调用方能按类型捕获的异常，而不是
     「返回 0 / 返回空列表」——后者在调用点看不出区别，1.0 的静默降级就是这么来的。
     """
+
+
+def retrieval_operational_issue(error: BaseException) -> dict[str, Any] | None:
+    """Classify only typed resource failures, without retaining SQL or exception text.
+
+    SQLite exposes stable numeric error codes on its exceptions. Checking the
+    standard exception's MRO keeps this domain helper independent of adapters and
+    accepts subclasses without treating a similarly worded application error as a lock.
+    """
+    code, failure = "", ""
+    sqlite_code = getattr(error, "sqlite_errorcode", None)
+    is_sqlite = any(
+        cls.__module__ == "sqlite3" and cls.__name__ == "OperationalError" for cls in type(error).__mro__
+    )
+    if is_sqlite and isinstance(sqlite_code, int) and (sqlite_code & 0xFF) in (5, 6):
+        code = "resource_error"
+        failure = "database_busy" if (sqlite_code & 0xFF) == 5 else "database_locked"
+    elif isinstance(error, MemoryError):
+        code, failure = "resource_error", "out_of_memory"
+    elif isinstance(error, TimeoutError):
+        code, failure = "time_limit", "retrieval_timeout"
+    elif isinstance(error, VectorIndexUnavailable):
+        code, failure = "resource_error", "vector_index_unavailable"
+    if not code:
+        return None
+    result: dict[str, Any] = {
+        "error_code": code,
+        "failure_code": failure,
+        "error_type": type(error).__name__,
+    }
+    if is_sqlite:
+        result["sqlite_errorcode"] = sqlite_code
+    return result
 
 
 class VectorIndex(Protocol):

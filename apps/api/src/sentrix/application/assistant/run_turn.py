@@ -306,6 +306,7 @@ def _turn_trace(session: _Session, planned: PlannerResult | None) -> Mapping[str
             for event in state.progress
             if event.kind == "guard"
         ],
+        "budget_events": [dict(event) for event in state.budget_events],
         "budget": {
             "model_steps": state.model_steps,
             "tool_round_trips": state.tool_round_trips,
@@ -313,6 +314,7 @@ def _turn_trace(session: _Session, planned: PlannerResult | None) -> Mapping[str
             "page_calls": state.page_calls,
             "inspection_calls": state.inspection_calls,
             "max_steps": state.profile.max_steps,
+            "strict_model_step_budget": state.profile.strict_model_step_budget,
             "max_tool_calls": state.profile.max_tool_calls,
             "max_search_calls": state.profile.max_search_calls,
             "max_page_calls": state.profile.max_page_calls,
@@ -645,6 +647,13 @@ class RunTurn:
         # 必须在最后一次 ``as_payload()`` 之前——它同时喂给落库与返回值。
         session.ledger.mark_unmet(attempted=_attempted_evidence_types(session.state))
 
+        if session.state.wall_remaining() <= 0:
+            session.state.record_budget_limit(
+                "time_limit",
+                budget_name="wall_time_s",
+                used=session.state.profile.wall_time_s - session.state.wall_remaining(),
+                limit=session.state.profile.wall_time_s,
+            )
         reason = session.state.termination_reason or session.state.finish(TerminationReason.MODEL_ERROR)
         status = _status_for(reason)
         self._publish(
@@ -779,6 +788,21 @@ class RunTurn:
             # 「这一转不该再调工具了」，而 ``select_tools`` 对它的处置是**一个工具都不发**：
             # 模型于是别无选择，只能说话。实测 ``step_budget_exhausted`` 的 123 道里
             # 102 道判 0，根子就是模型到最后几步仍然只在撞墙、从没被逼着开口。
+            if not state.can_call_tool():
+                if not state.has_final_reserve():
+                    state.record_budget_limit(
+                        "time_limit",
+                        budget_name="final_reserve_s",
+                        used=state.profile.wall_time_s - state.wall_remaining(),
+                        limit=state.profile.wall_time_s - state.profile.final_reserve_s,
+                    )
+                elif state.profile.max_tool_calls is not None:
+                    state.record_budget_limit(
+                        "tool_budget_exhausted",
+                        budget_name="max_tool_calls",
+                        used=state.tool_round_trips,
+                        limit=state.profile.max_tool_calls,
+                    )
             specs = select_tools(
                 session.ledger,
                 has_result_set=state.current_result_set_id is not None,
@@ -810,6 +834,16 @@ class RunTurn:
                             payload={"code": "prompt_too_long"},
                         ),
                     )
+                    if state.profile.strict_model_step_budget:
+                        if not state.can_step():
+                            reason = (
+                                TerminationReason.TIMEOUT
+                                if state.wall_remaining() <= 0
+                                else TerminationReason.STEP_BUDGET_EXHAUSTED
+                            )
+                            state.finish(reason)
+                            return self._stop(session, reason)
+                        state.model_steps += 1
                     try:
                         reply = self._complete_recorded(session, messages, specs)
                         break
@@ -1287,8 +1321,17 @@ class RunTurn:
         # 步了，提醒只会换来一次『预算用尽』的收尾」），L2 这条路当时没跟上。
         #
         # 写成 ``return state.can_step()``：走到这里已经确定判了不实，唯一还剩的问题就是
-        # **还能不能重答**——不能就落回收尾路径。
-        return state.can_step()
+        # **还能不能重答**——不能就落回收尾路径，但不能把预算阻止重答隐藏成质量失败。
+        can_rewrite = state.can_step()
+        if not can_rewrite:
+            timed_out = state.wall_remaining() <= 0
+            state.record_budget_limit(
+                "time_limit" if timed_out else "step_budget_exhausted",
+                budget_name="wall_time_s" if timed_out else "max_steps",
+                used=(state.profile.wall_time_s - state.wall_remaining()) if timed_out else state.model_steps,
+                limit=state.profile.wall_time_s if timed_out else state.profile.max_steps,
+            )
+        return can_rewrite
 
     def _run_tool(self, session: _Session, call: ToolCall) -> tuple[str, tuple[Attachment, ...], bool, bool]:
         """执行一次工具调用，返回 ``(发回模型的 JSON, 本次交付, 检索是否为空, 有没有拿到东西)``。
@@ -1300,6 +1343,31 @@ class RunTurn:
         decision = self._policy.decide(call, state)
 
         if decision.action is ToolAction.DENY:
+            budget_codes = {
+                "tool_budget_exhausted": (
+                    "max_tool_calls",
+                    state.tool_round_trips,
+                    state.profile.max_tool_calls,
+                ),
+                "search_call_limit": ("max_search_calls", state.search_calls, state.profile.max_search_calls),
+                "page_call_limit": ("max_page_calls", state.page_calls, state.profile.max_page_calls),
+                "inspection_budget_exhausted": (
+                    "max_inspections",
+                    state.inspection_calls,
+                    state.profile.max_inspections,
+                ),
+            }
+            if decision.code == "tool_budget_exhausted" and not state.has_final_reserve():
+                state.record_budget_limit(
+                    "time_limit",
+                    budget_name="final_reserve_s",
+                    used=state.profile.wall_time_s - state.wall_remaining(),
+                    limit=state.profile.wall_time_s - state.profile.final_reserve_s,
+                )
+            elif decision.code in budget_codes:
+                name, used, limit = budget_codes[decision.code]
+                if limit is not None:
+                    state.record_budget_limit(decision.code, budget_name=name, used=used, limit=limit)
             state.record(
                 ToolCallRecord(
                     call_id=call.call_id,
@@ -1466,14 +1534,31 @@ class RunTurn:
 
         1.0 ``runtime.py:1590-1623``（定义）与 ``:2379-2387``（步数耗尽处调用）。
 
-        **它不计 ``model_steps``**（那正是它的用处：预算已经用完了），只受墙钟的
-        ``final_reserve`` 约束——一个跑飞的生成不该拖过收尾预算。
+        Legacy 保持历史额外收尾；native 的 recovery 也计入同一份模型步预算，
+        不能在 30 步之外再偷偷派发。Planner 独立记录，主循环、L2 和 recovery 共用预算。
+        两种模式都检查墙钟的 ``final_reserve``。
 
         **只在 ``last_answer`` 为空时才走这里**：模型已经说过话的时候再问一次，是把
         一轮注定要收尾的对话又拖长一次，而用户等的是那句已经写好的答案。
         """
         if not session.state.has_final_reserve():
+            session.state.record_budget_limit(
+                "time_limit",
+                budget_name="final_reserve_s",
+                used=session.state.profile.wall_time_s - session.state.wall_remaining(),
+                limit=session.state.profile.wall_time_s - session.state.profile.final_reserve_s,
+            )
             return ""
+        if session.state.profile.strict_model_step_budget:
+            if not session.state.can_step():
+                session.state.record_budget_limit(
+                    "step_budget_exhausted",
+                    budget_name="max_steps",
+                    used=session.state.model_steps,
+                    limit=session.state.profile.max_steps,
+                )
+                return ""
+            session.state.model_steps += 1
         # **不带任何工具**：这一问的目的就是让模型把话说出来，不是让它再查一轮
         # （``specs`` 传空元组，模型没有可调的东西）。也不重放历史——走到这里说明
         # 前面已经塌了，把塌掉的过程再喂一遍只会让它重蹈覆辙。

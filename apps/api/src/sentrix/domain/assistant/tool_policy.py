@@ -127,7 +127,11 @@ class ToolPolicy:
                 ),
             )
 
-        if call.name == "search_memories" and state.search_calls >= state.profile.max_search_calls:
+        if (
+            call.name == "search_memories"
+            and state.profile.max_search_calls is not None
+            and state.search_calls >= state.profile.max_search_calls
+        ):
             return ToolDecision(
                 action=ToolAction.DENY,
                 code="search_call_limit",
@@ -140,7 +144,11 @@ class ToolPolicy:
         # 翻页额度。**排在工具总预算之前**，与 ``search_memories`` 那条同一个位置与理由：
         # 命中总预算时回的是「别再调工具了」，而这里要说的是「这一份候选你已经看完了」——
         # 两句话让模型做的下一件事不一样。
-        if call.name == "get_result_page" and state.page_calls >= state.profile.max_page_calls:
+        if (
+            call.name == "get_result_page"
+            and state.profile.max_page_calls is not None
+            and state.page_calls >= state.profile.max_page_calls
+        ):
             return ToolDecision(
                 action=ToolAction.DENY,
                 code="page_call_limit",

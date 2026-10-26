@@ -803,3 +803,58 @@ def test_full_terminal_evidence_disqualifies_generic_judge_failure(tmp_path, mon
     capacity.apply_final_evidence(result, report)
     assert result["passed"] is False and result["failure"] == "judge_failed"
     assert result["attribution"] is report
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    ["database_busy", "database_locked", "out_of_memory", "vector_index_unavailable", "retrieval_timeout"],
+)
+def test_retrieval_resource_failure_cannot_pass_or_continue_dispatch(tmp_path, monkeypatch, failure_code):
+    from photobench.domain.runs.operational import exclude_operational_quality
+
+    kind = "time_limit" if failure_code == "retrieval_timeout" else "resource_error"
+    current = state()
+    item = exclude_operational_quality(
+        {
+            "execution_status": "completed",
+            "judge": {"score": 0},
+            "judge_status": "completed",
+            "runtime_turns": [
+                {
+                    "trace_bundle": {
+                        "tool_calls": [
+                            {
+                                "observation": {
+                                    "retrieval_channels": [
+                                        {
+                                            "channel": "visual_ann",
+                                            "status": "error",
+                                            "operational_issue": {
+                                                "error_code": kind,
+                                                "failure_code": failure_code,
+                                            },
+                                        }
+                                    ],
+                                }
+                            }
+                        ]
+                    }
+                }
+            ],
+        }
+    )
+    assert item["evaluation_status"] == "not_evaluable"
+    assert item["judge"]["score"] is None and item["judge_status"] == "skipped"
+    assert item["operational_issue"]["evidence"]["failure_code"] == failure_code
+    current["items"] = [item]
+    assert capacity.run_problem(current, 64, 2, 4) == "resource_failure"
+
+    overview, items = detail_fixture(64)
+    overview["status"] = "running"
+    items[0].update(item)
+    monkeypatch.setattr(capacity, "get_text", detail_reader(overview, items))
+    calls = []
+    monkeypatch.setattr(capacity, "post_once", lambda url, *args: calls.append(url) or {"state": "completed"})
+    result = capacity.poll_run(**poll_kwargs(tmp_path), source_rows=rows(64))
+    assert result["failure"] == "resource_failure" and not result["passed"]
+    assert len(calls) == 1 and calls[0].endswith("/cancel")

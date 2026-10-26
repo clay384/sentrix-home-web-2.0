@@ -58,13 +58,45 @@ class Settings(BaseSettings):
                     object.__setattr__(self, key, value)
         return self
 
+    @field_validator(
+        "agent_max_tool_calls",
+        "agent_max_search_calls",
+        "agent_max_page_calls",
+        "agent_max_inspections",
+        mode="before",
+    )
+    @classmethod
+    def nullable_agent_tool_limit(cls, value: Any) -> Any:
+        # Environment variables are strings; only the explicit JSON spelling disables a cap.
+        return None if value == "null" else value
+
     @model_validator(mode="after")
     def validate_agent_limits(self) -> Settings:
-        if self.agent_max_tool_calls > self.agent_max_steps - 2:
-            raise ValueError("agent tool budget must reserve two model steps for answer and review")
+        limits = (
+            self.agent_max_tool_calls,
+            self.agent_max_search_calls,
+            self.agent_max_page_calls,
+            self.agent_max_inspections,
+        )
+        if not self.vlm_native_output_budget:
+            if any(value is None for value in limits):
+                raise ValueError("null tool limits require native output budget mode")
+            if self.agent_max_tool_calls is not None and self.agent_max_tool_calls > self.agent_max_steps - 2:
+                raise ValueError("agent tool budget must reserve two model steps for answer and review")
         for key in ("agent_max_search_calls", "agent_max_page_calls", "agent_max_inspections"):
-            if getattr(self, key) > self.agent_max_tool_calls:
+            value = getattr(self, key)
+            if (
+                value is not None
+                and self.agent_max_tool_calls is not None
+                and value > self.agent_max_tool_calls
+            ):
                 raise ValueError(f"{key} cannot exceed agent_max_tool_calls")
+        return self
+
+    @model_validator(mode="after")
+    def validate_json_stream_evidence(self) -> Settings:
+        if self.vlm_json_private_content and not self.vlm_json_streaming:
+            raise ValueError("private VLM JSON content requires streaming")
         return self
 
     def runtime_configuration(self) -> dict[str, Any]:
@@ -86,6 +118,8 @@ class Settings(BaseSettings):
                 "vlm_context_tokens",
                 "vlm_generation_profile",
                 "vlm_native_output_budget",
+                "vlm_json_streaming",
+                "vlm_json_private_content",
                 "agent_max_steps",
                 "agent_max_tool_calls",
                 "agent_max_search_calls",
@@ -131,13 +165,16 @@ class Settings(BaseSettings):
     agent_wall_time_s: float = Field(default=180.0, gt=0)
     # Explicit execution limits are deployment facts, not answer-quality verdicts.
     agent_max_steps: int = Field(default=8, ge=3)
-    agent_max_tool_calls: int = Field(default=6, ge=0)
-    agent_max_search_calls: int = Field(default=1, ge=0)
-    agent_max_page_calls: int = Field(default=2, ge=0)
-    agent_max_inspections: int = Field(default=3, ge=0)
+    agent_max_tool_calls: int | None = Field(default=6, ge=0)
+    agent_max_search_calls: int | None = Field(default=1, ge=0)
+    agent_max_page_calls: int | None = Field(default=2, ge=0)
+    agent_max_inspections: int | None = Field(default=3, ge=0)
     vlm_generation_profile: Literal["legacy", "qwen35_nonthinking"] = "legacy"
     # vLLM computes remaining context using its actual tokenizer and chat template.
     vlm_native_output_budget: bool = False
+    # Transport/diagnostic deployment facts; they do not change model sampling.
+    vlm_json_streaming: bool = False
+    vlm_json_private_content: bool = False
 
     # **模型名不在这里。** 8100 上跑 llama.cpp 还是 vLLM、名字叫什么，由部署方决定，而且
     # 会在 2.0 运行期间被换掉——2026-09-24 实测：8100 从 llama.cpp 换成 vLLM，2.0 配的
@@ -188,6 +225,12 @@ class Settings(BaseSettings):
         if self.embedding_scheme not in EMBEDDING_SCHEMES:
             available = ", ".join(sorted(EMBEDDING_SCHEMES))
             raise ValueError(f"SENTRIX_EMBEDDING_SCHEME={self.embedding_scheme!r} 未知；可选：{available}")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def vlm_json_evidence_dir(self) -> Path:
+        """Status and optional private content share the configured data lifecycle."""
+        return self.data_dir / "diagnostics" / "vlm-json"
 
     @computed_field  # type: ignore[prop-decorator]
     @property

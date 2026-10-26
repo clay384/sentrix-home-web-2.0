@@ -717,3 +717,38 @@ def test_refreshed_model_transport_error_retains_native_policy(server: str, monk
     assert error.value.request_policy["max_model_len"] == 262144
     assert error.value.request_policy["max_output_tokens"] is None
     assert error.value.request_policy["request_outcome_unknown"] is True
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"choices": []},
+        {"choices": [{"message": None}]},
+        {"choices": [{"message": {"content": ""}, "finish_reason": "content_filter"}]},
+    ],
+)
+def test_invalid_provider_protocol_or_filter_is_not_an_answer(server, body):
+    _Handler.response = body
+    with pytest.raises(ModelServiceError) as raised:
+        chat_model(server).complete(messages(), ())
+    assert raised.value.error_code == "provider_rejected"
+    assert raised.value.http_status == 200
+    assert len(_Handler.received) == 1
+
+
+def test_discovery_failure_keeps_native_policy_and_never_posts(server, monkeypatch):
+    import httpx
+
+    def timeout(*args, **kwargs):
+        raise httpx.ReadTimeout("fixture")
+
+    monkeypatch.setattr(httpx, "get", timeout)
+    model = OpenAIChatModel(server, ServedModel(server, native_output_budget=True), context_tokens=262144)
+    with pytest.raises(ModelServiceError) as raised:
+        model.complete(messages(), ())
+    assert raised.value.error_code == "time_limit"
+    assert raised.value.request_policy["request_outcome_unknown"] is False
+    assert raised.value.request_policy["max_output_tokens"] is None
+    assert raised.value.request_policy["max_model_len"] == 262144
+    assert _Handler.received == []

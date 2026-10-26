@@ -620,6 +620,39 @@ def test_explicit_pipeline_reports_causal_judge_degradation():
     assert phase["error_details"][0]["error_type"] == "causal_inference_error"
 
 
+@pytest.mark.parametrize("failures", [0, 2, None])
+def test_explicit_pipeline_preserves_insight_evidence_and_reports_known_failures(failures):
+    insights = (
+        {"ranked": 3, "core": 2, "selections": 8, "moments": 5, "moment_failures": failures, "portraits": 2}
+        if failures is not None
+        else None
+    )
+    client = FakeSentrixClient(
+        explicit_pipeline=True,
+        assets=_assets(),
+        turns={"turn_1": [_completed_turn()]},
+        import_result={"imported": 2, "asset_ids": ["asset_a", "asset_b"], "failures": []},
+        pipeline_result={
+            "processed": 2,
+            "failures": [],
+            "memory_graph": {"node_count": 10, "edge_count": 12},
+            **({"insights": insights} if insights is not None else {}),
+        },
+    )
+    execution, _client, _writer, _lifecycle, _albums = _execution(client=client)
+
+    state = execution.execute(_request())
+
+    phase = state["phases"]["pipeline_processing"]
+    assert phase["insights"] == insights
+    assert phase["status"] == ("partial" if failures else "done")
+    if failures:
+        assert phase["error"] == "人物瞬间处理不完整"
+        assert phase["error_details"][0]["error_type"] == "person_insights_incomplete"
+    else:
+        assert not phase["error_details"]
+
+
 class _TickingTime:
     """每次 ``monotonic()`` 前进一秒：让 1200 秒的停滞阈值在一个用例里跑得完。"""
 

@@ -19,11 +19,15 @@ _CODES = {
     "step_budget_limit": "step_limit",
     "step_budget_exhausted": "step_limit",
     "tool_budget_exhausted": "step_limit",
+    "search_call_limit": "step_limit",
+    "page_call_limit": "step_limit",
+    "inspection_budget_exhausted": "step_limit",
     "time_limit": "time_limit",
     "timeout": "time_limit",
     "request_timeout": "time_limit",
     "provider_rejected": "provider_rejected",
     "provider_unavailable": "provider_rejected",
+    "provider_response_invalid": "provider_rejected",
     "resource_error": "resource_error",
     "out_of_memory": "resource_error",
     "cuda_error": "resource_error",
@@ -51,6 +55,8 @@ _POLICY_KEYS = frozenset(
         "agent_wall_time_s",
         "output_budget",
         "request_timeout_s",
+        "request_phase",
+        "strict_model_step_budget",
         "request_outcome_unknown",
         "max_tool_calls",
         "max_search_calls",
@@ -95,8 +101,11 @@ def _issue(
         "prompt_tokens",
         "completion_tokens",
         "request_outcome_unknown",
+        "budget_name",
+        "used",
+        "limit",
     ):
-        if isinstance(record.get(key), (str, int)):
+        if isinstance(record.get(key), (str, int, float)):
             evidence[key] = record[key]
     policy = record.get("request_policy")
     if isinstance(policy, Mapping):
@@ -111,7 +120,7 @@ def _issue(
         evidence["budget"] = {
             key: value
             for key, value in budget.items()
-            if key in _POLICY_KEYS and isinstance(value, (int, float))
+            if key in _POLICY_KEYS and isinstance(value, (int, float, type(None)))
         }
     return {"version": 1, "kind": kind, "evidence": evidence}
 
@@ -135,8 +144,23 @@ def operational_issue(item: Mapping[str, Any]) -> dict[str, Any] | None:
         if issue:
             return issue
         bundle = turn.get("trace_bundle")
+        events = bundle.get("budget_events") if isinstance(bundle, Mapping) else []
+        for event_index, event in enumerate(events or []):
+            if isinstance(event, Mapping) and (issue := _issue(event, "budget_event", index, event_index)):
+                return issue
         tool_calls = bundle.get("tool_calls") if isinstance(bundle, Mapping) else []
         for tool_index, tool in enumerate(tool_calls or []):
+            if isinstance(tool, Mapping):
+                code = tool.get("failure_reason")
+                if code in (
+                    "tool_budget_exhausted",
+                    "search_call_limit",
+                    "page_call_limit",
+                    "inspection_budget_exhausted",
+                ):
+                    issue = _issue({"error_code": code, "failure_code": code}, "tool_call", index, tool_index)
+                    if issue:
+                        return issue
             observation = tool.get("observation") if isinstance(tool, Mapping) else None
             explicit = observation.get("operational_issue") if isinstance(observation, Mapping) else None
             if isinstance(explicit, Mapping):
@@ -179,13 +203,20 @@ def incomplete_judge_issue(judge: Mapping[str, Any]) -> dict[str, Any] | None:
         isinstance(choices, list)
         and choices
         and isinstance(choices[0], Mapping)
-        and choices[0].get("finish_reason") == "length"
+        and choices[0].get("finish_reason") in ("length", "content_filter")
     ):
+        finish_reason = choices[0]["finish_reason"]
+        kind = "output_limit" if finish_reason == "length" else "provider_rejected"
         return {
             "version": 1,
             "scope": "judge",
-            "kind": "output_limit",
-            "evidence": {"source": "judge_response", "field": "finish_reason", "value": "length"},
+            "kind": kind,
+            "evidence": {
+                "source": "judge_response",
+                "field": "finish_reason",
+                "value": finish_reason,
+                "error_code": kind,
+            },
         }
     return None
 
@@ -214,7 +245,7 @@ def exclude_operational_quality(item: Mapping[str, Any]) -> dict[str, Any]:
         if not (isinstance(previous, dict) and previous.get("operational_issue")):
             result["judge"] = {
                 "score": None,
-                "reason": "judge_output_limit",
+                "reason": "judge_" + str(judge_issue["kind"]),
                 "judge_status": "failed",
                 "operational_issue": judge_issue,
                 "excluded_observation": previous,

@@ -207,11 +207,14 @@ def test_tool_argument_error_and_plain_tool_error_text_are_not_operational_evide
     assert operational_issue(item) is None
 
 
-def test_historical_cloud_truncation_with_valid_zero_is_incomplete_without_replay():
+@pytest.mark.parametrize(
+    "finish_reason,kind", [("length", "output_limit"), ("content_filter", "provider_rejected")]
+)
+def test_historical_cloud_incomplete_with_valid_zero_is_not_replayed(finish_reason, kind):
     from photobench.application.run_execution.service import RunExecution
     from photobench.domain.runs.analysis import judge_projection
 
-    raw = {"choices": [{"finish_reason": "length", "message": {"content": '{"score":0}'}}]}
+    raw = {"choices": [{"finish_reason": finish_reason, "message": {"content": '{"score":0}'}}]}
     original = {
         "execution_status": "completed",
         "judge_status": "completed",
@@ -222,6 +225,8 @@ def test_historical_cloud_truncation_with_valid_zero_is_incomplete_without_repla
     assert result["judge_status"] == "failed"
     assert result["judge"]["score"] is None
     assert result["judge_issue"]["scope"] == "judge"
+    assert result["judge_issue"]["kind"] == kind
+    assert result["judge"]["reason"] == "judge_" + kind
     assert original["judge"]["score"] == 0
     assert judge_projection(original["judge"])["score"] is None
     summary = effective_summary({"items": [original]})
@@ -326,3 +331,88 @@ def test_no_hits_or_legacy_untyped_degradation_does_not_invent_fault_cause(statu
     }
     assert operational_issue(item) is None
     assert exclude_operational_quality(item) == item
+
+
+@pytest.mark.parametrize(
+    "code", ["tool_budget_exhausted", "search_call_limit", "page_call_limit", "inspection_budget_exhausted"]
+)
+def test_historical_tool_budget_denial_excludes_later_final_answer(code):
+    item = {
+        "execution_status": "completed",
+        "termination_reason": "answered_with_gap",
+        "judge": {"score": 0},
+        "runtime_turns": [
+            {
+                "trace_bundle": {
+                    "tool_calls": [
+                        {
+                            "tool": "inspect_photo",
+                            "status": "denied",
+                            "failure_reason": code,
+                            "observation": {},
+                        }
+                    ]
+                }
+            }
+        ],
+    }
+    result = exclude_operational_quality(item)
+    assert result["operational_issue"]["kind"] == "step_limit"
+    assert result["operational_issue"]["evidence"]["failure_code"] == code
+    assert result["judge"]["score"] is None
+    assert result["evaluation_status"] == "not_evaluable"
+
+
+@pytest.mark.parametrize("code,kind", [("tool_budget_exhausted", "step_limit"), ("time_limit", "time_limit")])
+def test_budget_gate_event_excludes_answer_without_a_denied_tool(code, kind):
+    item = {
+        "execution_status": "completed",
+        "termination_reason": "answered",
+        "judge": {"score": 2},
+        "runtime_turns": [
+            {
+                "trace_bundle": {
+                    "budget_events": [
+                        {"error_code": code, "budget_name": "fixture", "used": 30, "limit": 28}
+                    ],
+                    "budget": {"max_steps": 30, "max_tool_calls": None},
+                }
+            }
+        ],
+    }
+    result = exclude_operational_quality(item)
+    assert result["operational_issue"]["kind"] == kind
+    assert result["operational_issue"]["evidence"]["budget_name"] == "fixture"
+    assert result["operational_issue"]["evidence"]["used"] == 30
+    assert result["judge"]["score"] is None
+
+
+def test_invalid_provider_stream_keeps_unknown_and_is_not_graded():
+    item = {
+        "execution_status": "completed",
+        "judge_status": "pending",
+        "runtime_turns": [
+            {
+                "trace_bundle": {
+                    "tool_calls": [
+                        {
+                            "tool": "inspect_photo",
+                            "status": "error",
+                            "observation": {
+                                "operational_issue": {
+                                    "error_code": "provider_response_invalid",
+                                    "request_policy": {"request_outcome_unknown": True},
+                                }
+                            },
+                        }
+                    ]
+                }
+            }
+        ],
+    }
+    result = exclude_operational_quality(item)
+    assert result["operational_issue"]["kind"] == "provider_rejected"
+    assert result["operational_issue"]["evidence"]["error_code"] == "provider_response_invalid"
+    assert result["execution_status"] == "outcome_unknown"
+    assert result["judge_status"] == "skipped"
+    assert result["judge"]["score"] is None

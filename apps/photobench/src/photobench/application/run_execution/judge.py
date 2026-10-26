@@ -75,23 +75,28 @@ InlineImages = Callable[
 
 def _truncated_judge_response(raw: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any] | None:
     choices = raw.get("choices") or []
-    if not choices or not isinstance(choices[0], Mapping) or choices[0].get("finish_reason") != "length":
+    if not choices or not isinstance(choices[0], Mapping):
         return None
-    # A complete-looking JSON body is still incomplete when the provider reports length.
+    finish_reason = choices[0].get("finish_reason")
+    if finish_reason not in ("length", "content_filter"):
+        return None
+    kind = "output_limit" if finish_reason == "length" else "provider_rejected"
+    # Complete-looking JSON cannot turn an explicitly truncated/filtered response into a score.
     return {
         "score": None,
         "correct": None,
         "actual_action": None,
         "judge_status": "failed",
-        "reason": "judge_output_limit",
+        "reason": "judge_" + kind,
         "operational_issue": {
             "version": 1,
             "scope": "judge",
-            "kind": "output_limit",
+            "kind": kind,
             "evidence": {
                 "source": "judge_response",
                 "field": "finish_reason",
-                "value": "length",
+                "value": finish_reason,
+                "error_code": kind,
                 "max_tokens": payload.get("max_tokens"),
             },
         },

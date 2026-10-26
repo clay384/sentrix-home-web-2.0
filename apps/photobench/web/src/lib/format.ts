@@ -240,7 +240,7 @@ export function judgeRoundState(item: unknown, task: unknown): string {
 
 export function operationalReason(kind: unknown): string {
   const labels: Record<string, string> = {
-    output_limit: "输出预算", context_limit: "上下文预算", step_limit: "轮次预算",
+    output_limit: "输出预算", context_limit: "上下文预算", step_limit: "轮次或工具次数限制",
     time_limit: "时间预算", provider_rejected: "供应商拒绝或不可用", resource_error: "资源异常",
   };
   return typeof kind === "string" ? labels[kind] || "运行限制" : "运行限制";

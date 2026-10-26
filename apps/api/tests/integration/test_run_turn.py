@@ -1679,3 +1679,211 @@ def test_faithfulness_fail_open_keeps_operational_evidence(env):
     assert reviews[0]["http_status"] == 429
     assert reviews[0]["error_code"] == "provider_rejected"
     assert reviews[0]["request_policy"]["max_model_len"] == 262144
+
+
+def native_runner(env, model, toolbox, **overrides):
+    from dataclasses import replace
+
+    from sentrix.domain.assistant.profile import DEFAULT_PROFILE
+
+    conversations, turns, _, _ = env
+    profile = replace(
+        DEFAULT_PROFILE,
+        max_steps=30,
+        max_tool_calls=None,
+        max_search_calls=None,
+        max_page_calls=None,
+        max_inspections=None,
+        strict_model_step_budget=True,
+    )
+    return RunTurn(
+        model=model,
+        conversations=conversations,
+        turns=turns,
+        toolbox=toolbox,
+        profile=replace(profile, **overrides),
+    )
+
+
+def test_native_multi_tool_calls_do_not_hide_a_28_call_cap(env):
+    _, turns, conversation, _ = env
+    replies = [tool_call("search_memories", "search", query="海边")]
+    for i in range(27):
+        replies.append(
+            ModelReply(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=tuple(
+                    ToolCall(
+                        call_id=f"page-{i}-{j}",
+                        name="get_result_page",
+                        arguments_json=json.dumps({"result_set_id": "rs_1", "page": 2 * i + j + 2}),
+                    )
+                    for j in range(2)
+                ),
+            )
+        )
+    replies.append(final_call("这是你要的海边照片。", "photo_1", "photo_2"))
+    model = ScriptedModel(replies)
+    runner = native_runner(
+        env,
+        model,
+        StubToolbox(
+            {"search_memories": SEARCH_OK, "get_result_page": PAGE_OK, FINAL_ANSWER_TOOL: DELIVER_OK}
+        ),
+    )
+    turn_id = start(runner, conversation)
+    result = runner.run(turn_id)
+    record = turns.get(turn_id)
+    assert result.answer == "这是你要的海边照片。"
+    # Planner is separately recorded. 29 main calls + one L2 = 30; 55 tools are allowed.
+    assert record.trace["budget"]["model_steps"] == 30
+    assert record.trace["budget"]["tool_round_trips"] == 55
+    assert record.trace["budget"]["max_tool_calls"] is None
+    assert record.trace["budget_events"] == []
+    assert all(model.tool_sets)
+
+
+def test_native_thirty_steps_cannot_dispatch_an_extra_forced_final(env):
+    _, turns, conversation, _ = env
+    replies = [tool_call("search_memories", "search", query="海边")] + [
+        tool_call("get_result_page", f"page{i}", result_set_id="rs_1", page=i + 2) for i in range(29)
+    ]
+    model = ScriptedModel(replies)
+    runner = native_runner(
+        env, model, StubToolbox({"search_memories": SEARCH_OK, "get_result_page": PAGE_OK})
+    )
+    turn_id = start(runner, conversation)
+    result = runner.run(turn_id)
+    assert result.termination_reason is TerminationReason.STEP_BUDGET_EXHAUSTED
+    assert len(model.calls) == 30
+    assert len(model.planner_calls) == 1
+    assert turns.get(turn_id).trace["budget"]["model_steps"] == 30
+    assert not any(c["call_type"] == "recovery" for c in turns.get(turn_id).trace["model_calls"])
+
+
+def test_native_early_forced_final_uses_one_of_the_thirty_steps(env):
+    _, turns, conversation, _ = env
+    model = ScriptedModel([final(""), final(""), final("这次未能完整查到照片。")])
+    runner = native_runner(env, model, StubToolbox())
+    turn_id = start(runner, conversation)
+    runner.run(turn_id)
+    trace = turns.get(turn_id).trace
+    assert trace["budget"]["model_steps"] == 3
+    assert [c["call_type"] for c in trace["model_calls"]] == ["planner", "agent", "agent", "recovery"]
+
+
+def test_withdrawing_tools_records_limit_even_when_answer_is_kept(env):
+    _, turns, conversation, _ = env
+    model = ScriptedModel(
+        [tool_call("search_memories", "search", query="海边"), final("这是你要的海边照片。")]
+    )
+    runner = native_runner(env, model, StubToolbox({"search_memories": SEARCH_OK}), max_tool_calls=1)
+    turn_id = start(runner, conversation)
+    result = runner.run(turn_id)
+    assert result.answer == "这是你要的海边照片。"
+    assert turns.get(turn_id).trace["budget_events"] == [
+        {"error_code": "tool_budget_exhausted", "budget_name": "max_tool_calls", "used": 1, "limit": 1}
+    ]
+
+
+def test_late_final_answer_records_wall_limit_instead_of_hiding_it(env, monkeypatch):
+    from sentrix.domain.assistant.task_state import TaskState
+
+    remaining = [1000.0]
+    monkeypatch.setattr(TaskState, "wall_remaining", lambda self: remaining[0])
+
+    class LateModel(ScriptedModel):
+        def complete(self, messages, tools):
+            result = super().complete(messages, tools)
+            if PLANNER_MARKER not in messages[0].content:
+                remaining[0] = -1.0
+            return result
+
+    _, turns, conversation, _ = env
+    model = LateModel([final("这次没有可供确认的照片。")])
+    runner = native_runner(env, model, StubToolbox())
+    turn_id = start(runner, conversation)
+    runner.run(turn_id)
+    assert any(event["error_code"] == "time_limit" for event in turns.get(turn_id).trace["budget_events"])
+
+
+def test_native_context_recovery_cannot_bypass_the_model_step_budget(env):
+    _, turns, conversation, _ = env
+    model = ScriptedModel(
+        [
+            tool_call("search_memories", "search", query="海边"),
+            tool_call("get_result_page", "page", result_set_id="rs_1", page=2),
+            PromptTooLongError("fixture context limit", error_code="context_limit"),
+            final("must not be requested"),
+        ]
+    )
+    runner = native_runner(
+        env, model, StubToolbox({"search_memories": SEARCH_OK, "get_result_page": PAGE_OK}), max_steps=3
+    )
+    turn_id = start(runner, conversation)
+    result = runner.run(turn_id)
+    assert result.termination_reason is TerminationReason.STEP_BUDGET_EXHAUSTED
+    assert len(model.calls) == 3
+    assert turns.get(turn_id).trace["budget"]["model_steps"] == 3
+
+
+def test_explicit_search_cap_records_its_gate_even_if_model_later_answers(env):
+    _, turns, conversation, _ = env
+    model = ScriptedModel(
+        [tool_call("search_memories", "search", query="海边"), final("这次没有查到足够证据。")]
+    )
+    runner = native_runner(env, model, StubToolbox(), max_search_calls=0)
+    turn_id = start(runner, conversation)
+    runner.run(turn_id)
+    trace = turns.get(turn_id).trace
+    assert {
+        "error_code": "search_call_limit",
+        "budget_name": "max_search_calls",
+        "used": 0,
+        "limit": 0,
+    } in trace["budget_events"]
+    assert trace["tool_calls"][0]["failure_reason"] == "search_call_limit"
+
+
+@pytest.mark.parametrize("unfaithful", [False, True])
+def test_native_last_l2_step_records_only_a_budget_blocked_rewrite(env, unfaithful):
+    _, turns, conversation, _ = env
+    replies = (
+        [tool_call("search_memories", "search", query="海边")]
+        + [tool_call("get_result_page", f"page{i}", result_set_id="rs_1", page=i + 2) for i in range(27)]
+        + [final_call("这是你要的海边照片。", "photo_1", "photo_2")]
+    )
+    model = ScriptedModel(
+        replies,
+        judge=judge_reply(("fabrication", "工具观察不支持该说法")) if unfaithful else judge_reply(),
+    )
+    runner = native_runner(
+        env,
+        model,
+        StubToolbox(
+            {
+                "search_memories": SEARCH_OK,
+                "get_result_page": PAGE_OK,
+                FINAL_ANSWER_TOOL: DELIVER_OK,
+            }
+        ),
+    )
+    turn_id = start(runner, conversation)
+    result = runner.run(turn_id)
+    trace = turns.get(turn_id).trace
+    assert result.answer == "这是你要的海边照片。"  # Preserve authored output even when unevaluable.
+    assert trace["budget"]["model_steps"] == 30  # 29 main + 1 L2; planner is independent.
+    assert len(model.calls) == 29 and len(model.judge_calls) == 1
+    assert trace["budget_events"] == (
+        [
+            {
+                "error_code": "step_budget_exhausted",
+                "budget_name": "max_steps",
+                "used": 30,
+                "limit": 30,
+            }
+        ]
+        if unfaithful
+        else []
+    )

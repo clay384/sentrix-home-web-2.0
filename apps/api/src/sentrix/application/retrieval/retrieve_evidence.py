@@ -59,6 +59,7 @@ from sentrix.domain.media.models import MediaType
 from sentrix.domain.retrieval.conditions import Condition
 from sentrix.domain.retrieval.fusion import DEFAULT_CHANNEL_WEIGHTS, fuse
 from sentrix.domain.retrieval.models import CandidateHit, ChannelTrace, FusedCandidate
+from sentrix.domain.retrieval.ports import retrieval_operational_issue
 
 log = logging.getLogger("sentrix.retrieval.evidence")
 
@@ -270,14 +271,17 @@ class RetrieveEvidence:
             try:
                 hits, backend, degraded, degraded_reason, operational_issue = run()
             except Exception as error:  # noqa: BLE001 - 见 docstring
-                log.warning("召回通道 %s 抛异常，本次按空结果继续: %s", name, error)
+                issue = retrieval_operational_issue(error)
+                reason = str(issue["failure_code"]) if issue else str(error)
+                log.warning("召回通道 %s 抛异常，本次按空结果继续: %s", name, reason)
                 traces.append(
                     ChannelTrace(
                         channel=name,
                         status="error",
                         candidate_count=0,
                         latency_ms=round((time.monotonic() - started) * 1000, 1),
-                        reason=str(error),
+                        reason=reason,
+                        operational_issue=issue,
                     )
                 )
                 return ()
@@ -393,7 +397,9 @@ class RetrieveEvidence:
                     )
                 )
             except Exception as error:  # noqa: BLE001 - 图是可降级的派生通道
-                log.warning("图记忆拓展抛异常，本次按空结果继续: %s", error)
+                issue = retrieval_operational_issue(error)
+                reason = str(issue["failure_code"]) if issue else str(error)
+                log.warning("图记忆拓展抛异常，本次按空结果继续: %s", reason)
                 channel_hits[GRAPH_CHANNEL] = ()
                 traces.append(
                     ChannelTrace(
@@ -401,7 +407,8 @@ class RetrieveEvidence:
                         status="error",
                         candidate_count=0,
                         latency_ms=round((time.monotonic() - graph_started) * 1000, 1),
-                        reason=str(error),
+                        reason=reason,
+                        operational_issue=issue,
                     )
                 )
 

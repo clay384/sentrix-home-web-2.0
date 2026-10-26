@@ -273,9 +273,9 @@ class OpenAIChatModel:
             raise ChatModelError("system 消息只能出现在开头；后续约束请折进第一条")
 
         # 名字先拿到再请求：拿不到就在这里失败，不会带着一个空名字去问端点。
-        model_name = self._model.current()
         policy = self._request_policy(messages, tools)
         try:
+            model_name = self._model.current()
             response = self._post(model_name, messages, tools)
         except ModelServiceError as error:
             error.request_policy = {**policy, **error.request_policy}
@@ -341,8 +341,23 @@ class OpenAIChatModel:
             body = response.json()
             choice = body["choices"][0]
             message = choice["message"]
-        except (ValueError, KeyError, IndexError) as error:
-            raise ModelServiceError(f"模型响应结构不可识别：{response.text[:200]}") from error
+            if not isinstance(message, dict):
+                raise ValueError("message must be an object")
+        except (ValueError, KeyError, IndexError, TypeError) as error:
+            raise ModelServiceError(
+                "模型响应协议结构不可识别。",
+                error_code="provider_rejected",
+                http_status=response.status_code,
+                request_policy=policy,
+            ) from error
+        if choice.get("finish_reason") == "content_filter":
+            raise ModelServiceError(
+                "供应商内容过滤拒绝完成请求。",
+                error_code="provider_rejected",
+                http_status=response.status_code,
+                request_policy=policy,
+                finish_reason="content_filter",
+            )
 
         usage = body.get("usage") or {}
         if choice.get("finish_reason") == "length":

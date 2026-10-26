@@ -35,6 +35,7 @@ from sentrix.domain.retrieval.ports import (
     VectorIndexUnavailable,
     VectorRepository,
     VisualEmbedder,
+    retrieval_operational_issue,
 )
 
 log = logging.getLogger("sentrix.retrieval.visual")
@@ -110,7 +111,7 @@ class RetrieveVisual:
             )
 
         limit = max(1, request.limit)
-        candidates, backend, degraded, reason = self._recall(request, query, limit)
+        candidates, backend, degraded, reason, operational_issue = self._recall(request, query, limit)
         authoritative = self._vectors.count(space=scheme.VISUAL_SPACE, model_name=self._embedder.model_id)
         # **方案漂移盖过索引健康度。** 索引再健康，只要库里没有一条当前方案的向量，
         # 召回出来的东西就是错的——所以这里不看 ``_recall`` 有没有已经置过 degraded，
@@ -146,20 +147,22 @@ class RetrieveVisual:
             degraded=degraded,
             degraded_reason=reason,
             authoritative_vectors=authoritative,
+            operational_issue=operational_issue,
         )
 
     # ---- 召回 ------------------------------------------------------------
 
     def _recall(
         self, request: VisualSearchRequest, query: Sequence[float], limit: int
-    ) -> tuple[Sequence[VectorHit], str, bool, str]:
-        """返回 ``(候选, 实际后端, 是否降级, 原因)``。"""
+    ) -> tuple[Sequence[VectorHit], str, bool, str, Mapping[str, Any] | None]:
+        """返回 ``(候选, 实际后端, 是否降级, 原因, 故障证据)``。"""
         fetch = max(limit * OVERSAMPLE_FACTOR, limit)
         status = self._index_status()
-        reason = "" if status.available else status.reason
+        issue = status.operational_issue if not status.available else None
+        reason = "" if status.available else (str(issue["failure_code"]) if issue else status.reason)
 
         if status.available and self._index is not None:
-            reason = self._staleness_reason()
+            reason, issue = self._staleness_reason()
             if not reason:
                 try:
                     hits = self._index.search(
@@ -172,10 +175,12 @@ class RetrieveVisual:
                 except VectorIndexUnavailable as error:
                     # status()/count() 与 search() 之间索引掉了（例如另一个进程
                     # 刚好在这时拿走目录锁）。这一格必须回退，不能把异常抛给用户。
-                    log.warning("派生索引在检索中途不可用，回退权威存储: %s", error)
-                    reason = str(error)
+                    issue = retrieval_operational_issue(error)
+                    assert issue is not None
+                    reason = str(issue["failure_code"])
+                    log.warning("派生索引在检索中途不可用，回退权威存储: %s", reason)
                 else:
-                    return hits, "qdrant", False, ""
+                    return hits, "qdrant", False, "", None
 
         hits = self._vectors.search_exact(
             space=scheme.VISUAL_SPACE,
@@ -184,7 +189,7 @@ class RetrieveVisual:
             scope_id=request.scope_id,
             model_name=self._embedder.model_id,
         )
-        return hits, "sqlite_exact", True, reason or "index_unavailable"
+        return hits, "sqlite_exact", True, reason or "index_unavailable", issue
 
     def _index_status(self) -> VectorIndexStatus:
         if self._index is None:
@@ -193,16 +198,18 @@ class RetrieveVisual:
             )
         return self._index.status()
 
-    def _staleness_reason(self) -> str:
-        """索引条数与权威条数对不上时给出原因；对得上返回空串。"""
+    def _staleness_reason(self) -> tuple[str, Mapping[str, Any] | None]:
+        """索引条数与权威条数对不上时给出原因；真正资源故障单列证据。"""
         assert self._index is not None
         try:
             indexed = self._index.count(space=scheme.VISUAL_SPACE, model_name=self._embedder.model_id)
         except VectorIndexUnavailable as error:
-            return str(error)
+            issue = retrieval_operational_issue(error)
+            assert issue is not None
+            return str(issue["failure_code"]), issue
         authoritative = self._vectors.count(space=scheme.VISUAL_SPACE, model_name=self._embedder.model_id)
         if indexed == 0 and authoritative > 0:
-            return f"index_empty:index=0,authoritative={authoritative}"
+            return f"index_empty:index=0,authoritative={authoritative}", None
         if indexed < authoritative:
-            return f"index_stale:index={indexed},authoritative={authoritative}"
-        return ""
+            return f"index_stale:index={indexed},authoritative={authoritative}", None
+        return "", None

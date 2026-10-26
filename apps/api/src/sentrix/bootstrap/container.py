@@ -292,6 +292,9 @@ class Container:
             settings.vlm_base_url,
             generation_profile=settings.vlm_generation_profile,
             native_output_budget=settings.vlm_native_output_budget,
+            json_streaming=settings.vlm_json_streaming,
+            json_evidence_dir=settings.vlm_json_evidence_dir if settings.vlm_json_streaming else None,
+            json_private_content=settings.vlm_json_private_content,
         )
         # 单个并发槽的上下文窗口——**问端点**，理由与上面那个模型名同一条：窗口是
         # **部署事实**，配置里那个 6144 是照部署的某一次实测抄的，部署一改它就过期。

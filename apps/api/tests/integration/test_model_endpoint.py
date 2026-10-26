@@ -199,3 +199,32 @@ def test_a_probe_that_fails_is_retried_on_the_next_call(endpoint: str):
 
     _Handler.status = 200
     assert model.current() == "gemma4-12b-it"
+
+
+@pytest.mark.parametrize("status", [401, 429, 503])
+def test_discovery_rejection_is_structured_before_any_completion(endpoint, status):
+    _Handler.status = status
+    with pytest.raises(ModelServiceError) as raised:
+        ServedModel(endpoint).current()
+    assert raised.value.error_code == "provider_rejected"
+    assert raised.value.http_status == status
+    assert raised.value.request_policy["request_phase"] == "model_discovery"
+    assert raised.value.request_policy["request_outcome_unknown"] is False
+    assert _Handler.gets == ["/v1/models"]
+
+
+def test_discovery_timeout_is_known_not_dispatched(monkeypatch):
+    import httpx
+
+    def timeout(*args, **kwargs):
+        raise httpx.ReadTimeout("fixture")
+
+    monkeypatch.setattr(httpx, "get", timeout)
+    with pytest.raises(ModelServiceError) as raised:
+        ServedModel("http://fixture/v1", timeout_s=9).current()
+    assert raised.value.error_code == "time_limit"
+    assert raised.value.request_policy == {
+        "request_phase": "model_discovery",
+        "request_timeout_s": 9,
+        "request_outcome_unknown": False,
+    }

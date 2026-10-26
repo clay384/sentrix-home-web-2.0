@@ -51,6 +51,7 @@ from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.media.models import MODEL_FACT_CONFIDENCE, ObservationFact
 from sentrix.domain.media.ports import ObservationSemantics
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
+from sentrix.infrastructure.media.vlm_json_stream import stream_json_response
 
 log = logging.getLogger(__name__)
 
@@ -205,6 +206,7 @@ def chat_json(
     for url in [image] if isinstance(image, str) else list(image or ()):
         content.append({"type": "image_url", "image_url": {"url": url}})
     name = "unresolved"
+    dispatched = False
     policy: dict[str, Any] = {
         **model.generation_parameters(),
         "response_format": {"type": "json_object"},
@@ -223,9 +225,32 @@ def chat_json(
             # Unsupported endpoints fail visibly once; never retry unconstrained.
             "response_format": {"type": "json_object"},
         }
-        response = httpx.post(endpoint, json=body, timeout=timeout_s)
-        response.raise_for_status()
-        payload = response.json()
+        dispatched = True
+        status_code = 200
+        if model.json_streaming:
+            stage = (
+                "initial_observation"
+                if prompt == _OBSERVE_PROMPT
+                else "recovery_observation"
+                if prompt == _RECOVERY_PROMPT
+                else "chinese_canonicalization"
+                if prompt.startswith(_CANONICAL_PROMPT)
+                else "json_call"
+            )
+            payload = stream_json_response(
+                endpoint,
+                body,
+                timeout_s,
+                evidence_dir=model.json_evidence_dir,
+                private_content=model.json_private_content,
+                stage=stage,
+                request_policy=policy,
+            )
+        else:
+            response = httpx.post(endpoint, json=body, timeout=timeout_s)
+            response.raise_for_status()
+            status_code = response.status_code
+            payload = response.json()
     except httpx.HTTPStatusError as error:
         raise ModelServiceError(
             f"视觉模型请求被服务拒绝（provider_rejected，HTTP {error.response.status_code}）。",
@@ -244,15 +269,18 @@ def chat_json(
             },
         ) from error
     except ModelServiceError as error:
-        # Discovery happens before the completion POST. Preserve typed cause,
-        # while making discovery failures distinguishable from unknown POSTs.
+        # Keep transport evidence intact; discovery failures precede any POST.
         if error.error_code is None:
             error.error_code = (
                 "time_limit"
                 if isinstance(error.__cause__, httpx.TimeoutException)
                 else "provider_unavailable"
             )
-        error.request_policy = {**policy, **error.request_policy, "request_outcome_unknown": False}
+        error.request_policy = {
+            **policy,
+            **error.request_policy,
+            "request_outcome_unknown": error.request_policy.get("request_outcome_unknown", dispatched),
+        }
         raise
     except ValueError:
         log.warning(
@@ -274,12 +302,28 @@ def chat_json(
     raw_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
     completion_tokens = raw_tokens if type(raw_tokens) is int and raw_tokens >= 0 else None
     parsed = parse_json_object(text)
+    if finish_reason == "content_filter":
+        raise ModelServiceError(
+            "视觉模型服务拒绝返回内容（provider_rejected，content_filter）；未自动重试。",
+            error_code="provider_rejected",
+            http_status=status_code,
+            finish_reason="content_filter",
+            request_policy={**policy, "request_outcome_unknown": False},
+        )
+    if finish_reason in {"tool_calls", "function_call"}:
+        raise ModelServiceError(
+            "视觉JSON请求收到不支持的工具响应（provider_response_invalid）；未自动重试。",
+            error_code="provider_response_invalid",
+            http_status=status_code,
+            finish_reason=finish_reason,
+            request_policy={**policy, "request_outcome_unknown": True},
+        )
     if finish_reason == "length":
         raw_prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
         raise ModelServiceError(
             "视觉模型达到本次可用输出/上下文上限（output_limit），回复未完成。",
             error_code="output_limit",
-            http_status=response.status_code,
+            http_status=status_code,
             request_policy=policy,
             finish_reason="length",
             prompt_tokens=raw_prompt_tokens

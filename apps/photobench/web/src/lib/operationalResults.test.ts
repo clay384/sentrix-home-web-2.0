@@ -46,7 +46,7 @@ describe("operational results remain separate from answer quality", () => {
     expect(judgeScoreLabel({ judge_issue: { kind: "output_limit" } }, null)).toBe("评分未完成（输出预算）");
     expect(judgeScoreLabel({ judge: { score: 0 } }, null)).toBe("0分");
     const rows = keyMetricRows({}, { operational: { not_evaluable_count: 2, by_kind: { step_limit: 2 }, judge_incomplete_count: 1, judge_by_kind: { output_limit: 1 } } });
-    expect(rows.find((row) => row.label === "不可评估")).toMatchObject({ value: "2 题", note: "轮次预算 2 题" });
+    expect(rows.find((row) => row.label === "不可评估")).toMatchObject({ value: "2 题", note: "轮次或工具次数限制 2 题" });
     expect(rows.find((row) => row.label === "评分未完成")).toMatchObject({ value: "1 题", note: "输出预算 1 题" });
   });
 });

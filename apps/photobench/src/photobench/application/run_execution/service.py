@@ -1735,6 +1735,19 @@ class RunExecution:
                     **({"operational_issue": family_issue} if family_issue else {}),
                 }
             )
+        # Keep producer evidence: missing legacy counts remain unknown, never zero.
+        insights = result.get("insights")
+        moment_failures = insights.get("moment_failures") if isinstance(insights, dict) else None
+        insights_failed = type(moment_failures) is int and moment_failures > 0
+        if insights_failed:
+            error_details.append(
+                {
+                    "sample_id": "person_insights",
+                    "status": "failed",
+                    "error_type": "person_insights_incomplete",
+                    "reason": f"{moment_failures} 张人物瞬间预览处理失败；本次记忆构建不完整",
+                }
+            )
         final_processed = len([item for item in assets if item.get("status") == "processed"])
         phase_result = {
             "total_seconds": round(float(timings.get("total") or time.perf_counter() - started), 3),
@@ -1755,6 +1768,7 @@ class RunExecution:
             "causal_graph_seconds": timings.get("causal_graph", 0.0),
             "memory_graph": result.get("memory_graph"),
             "family_graph": family_graph,
+            "insights": insights if isinstance(insights, dict) else None,
             "error": (
                 f"{failed_count} 个资产流水线处理失败"
                 if failed_count
@@ -1762,6 +1776,8 @@ class RunExecution:
                 if graph_result is None
                 else "家庭图谱推断失败"
                 if family_failed
+                else "人物瞬间处理不完整"
+                if insights_failed
                 else "因果边判定部分失败"
                 if error_details
                 else None

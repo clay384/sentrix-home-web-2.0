@@ -110,3 +110,43 @@ def test_embedding_timeout_environment_is_in_runtime_evidence(monkeypatch):
     actual = Settings().runtime_configuration()
     assert actual["text_embedder_timeout_s"] == 120
     assert actual["legacy_clip_timeout_s"] == 120
+
+
+def test_native_explicit_null_environment_disables_only_tool_caps(monkeypatch):
+    monkeypatch.setenv("SENTRIX_VLM_NATIVE_OUTPUT_BUDGET", "true")
+    monkeypatch.setenv("SENTRIX_AGENT_MAX_STEPS", "30")
+    keys = ["agent_max_tool_calls", "agent_max_search_calls", "agent_max_page_calls", "agent_max_inspections"]
+    for key in keys:
+        monkeypatch.setenv("SENTRIX_" + key.upper(), "null")
+    settings = Settings()
+    assert settings.agent_max_steps == 30
+    assert all(settings.runtime_configuration()[key] is None for key in keys)
+    monkeypatch.setenv("SENTRIX_VLM_NATIVE_OUTPUT_BUDGET", "false")
+    import pytest
+
+    with pytest.raises(ValueError, match="native"):
+        Settings()
+    monkeypatch.setenv("SENTRIX_VLM_NATIVE_OUTPUT_BUDGET", "true")
+    monkeypatch.setenv("SENTRIX_AGENT_MAX_TOOL_CALLS", "None")
+    with pytest.raises(ValueError):
+        Settings()
+
+
+def test_optional_json_stream_evidence_defaults_and_data_root(tmp_path):
+    settings = Settings(data_dir=tmp_path)
+    assert settings.vlm_json_streaming is False
+    assert settings.vlm_json_private_content is False
+    assert settings.vlm_json_evidence_dir == tmp_path / "diagnostics" / "vlm-json"
+
+
+def test_json_stream_environment_is_reported_and_private_requires_stream(monkeypatch, tmp_path):
+    import pytest
+
+    with pytest.raises(ValueError, match="requires streaming"):
+        Settings(data_dir=tmp_path, vlm_json_private_content=True)
+    monkeypatch.setenv("SENTRIX_VLM_JSON_STREAMING", "true")
+    monkeypatch.setenv("SENTRIX_VLM_JSON_PRIVATE_CONTENT", "true")
+    settings = Settings(data_dir=tmp_path)
+    facts = settings.runtime_configuration()
+    assert facts["vlm_json_streaming"] is True
+    assert facts["vlm_json_private_content"] is True
