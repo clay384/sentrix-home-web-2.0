@@ -246,6 +246,26 @@ def progress_view(state: Json) -> Json:
     }
 
 
+def judge_failure_count(state: Json) -> int:
+    """Count failed items once, including failed sub-Judges in earlier turns.
+
+    Failure cause is unknown unless separately recorded; never parse Judge prose
+    or mistake a valid zero / not-applicable score for a transport failure.
+    """
+    failed = 0
+    for item in state.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        records = [item, *(turn for turn in item.get("runtime_turns") or [] if isinstance(turn, dict))]
+        if item.get("judge_status") == "failed" or any(
+            isinstance(record.get(key), dict) and record[key].get("judge_status") == "failed"
+            for record in records
+            for key in ("judge", "task_judge", "evidence_judge")
+        ):
+            failed += 1
+    return failed
+
+
 def run_problem(state: Json, count: int, concurrency: int, judge_concurrency: int) -> str | None:
     if state.get("qa_count") is not None and state["qa_count"] != count:
         return "actual_run_question_count_mismatch"
@@ -267,6 +287,8 @@ def run_problem(state: Json, count: int, concurrency: int, judge_concurrency: in
         return "operational_issue"
     if any(item.get("operational_issue") or item.get("judge_issue") for item in state.get("items") or []):
         return "operational_issue"
+    if judge_failure_count(state):
+        return "judge_failed"
     return None
 
 
@@ -392,6 +414,7 @@ def poll_run(
     samples = Journal(output / "photobench-progress.jsonl")
     state: Json = {}
     observed_items: dict[int, Json] = {}
+    observed_judge_terminal_count: int | None = None
     while True:
         try:
             state = json.loads(
@@ -402,8 +425,12 @@ def poll_run(
             )
             if source_rows is not None:
                 count_seen = state.get("item_count")
-                # In-flight placeholders can change. Completed Agent results are
-                # immutable for model-error attribution even while Judge continues.
+                # Agent traces are immutable when complete, but Judge status is not.
+                # Refresh unfinished Judges only when their terminal counter changes.
+                judge_terminal_count = (
+                    ((state.get("phases") or {}).get("qa_eval") or {}).get("progress") or {}
+                ).get("judge_completed")
+                judge_changed = judge_terminal_count != observed_judge_terminal_count
                 pending_indexes = [
                     i
                     for i in range(
@@ -412,8 +439,14 @@ def poll_run(
                     if i not in observed_items
                     or observed_items[i].get("execution_status")
                     not in {"completed", "failed", "timeout", "outcome_unknown"}
+                    or (
+                        judge_changed
+                        and observed_items[i].get("judge_status")
+                        not in {"completed", "failed", "skipped", "outcome_unknown"}
+                    )
                 ]
                 observed_items.update(fetch_item_details(bench, run_id, state, source_rows, pending_indexes))
+                observed_judge_terminal_count = judge_terminal_count
                 state = {**state, "items": [observed_items[i] for i in sorted(observed_items)]}
             save_json(output / "latest-run.json", state)
         except Exception as exc:
@@ -470,6 +503,8 @@ def poll_run(
         "elapsed_seconds": time.monotonic() - started,
         "progress": progress,
         "judge_requests": qa.get("judge_requests"),
+        "judge_failure_count": judge_failure_count(state),
+        "judge_failure_cause": "unknown" if judge_failure_count(state) else None,
         "stage_timings": state.get("phases"),
         "cancel_dispatch": cancel_event,
         "model_metric_peaks": sampler.peaks,
@@ -552,7 +587,22 @@ def final_evidence(bench: str, run_id: str, output: Path, source_rows: Sequence[
             samples.extend(json.loads(line) for line in path.read_text().splitlines() if line.strip())
     report = summarize_run(state, samples)
     report["resource_failure"] = resource_failure(state)
+    report["judge_failure_count"] = judge_failure_count(state)
+    report["judge_failure_cause"] = "unknown" if report["judge_failure_count"] else None
     return report
+
+
+def apply_final_evidence(result: Json, report: Json) -> None:
+    """Full terminal details decide qualification; cloud counts remain run-level facts."""
+    result["attribution"] = report
+    if report["resource_failure"]:
+        result.update(passed=False, failure="resource_failure")
+    elif any(report["operational"].get(key) for key in ("not_evaluable_count", "judge_incomplete_count")):
+        result.update(passed=False, failure="operational_issue")
+    elif report.get("judge_failure_count", 0):
+        result.update(passed=False, failure="judge_failed")
+    result["judge_failure_count"] = report.get("judge_failure_count")
+    result["judge_failure_cause"] = report.get("judge_failure_cause")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -780,18 +830,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             if existing.get("status") in TERMINAL:
                 save_json(args.output / "latest-run.json", existing)
-                save_json(
-                    args.output / "summary.json",
-                    {
-                        "run_id": run_id,
-                        "state": existing["status"],
-                        "observed_only": True,
-                        "progress": progress_view(existing),
-                        "no_post_replayed": True,
-                        "attribution": final_evidence(bench, run_id, args.output, source_rows),
-                    },
-                )
-                return 0
+                result = {
+                    "run_id": run_id,
+                    "state": existing["status"],
+                    "observed_only": True,
+                    "progress": progress_view(existing),
+                    "no_post_replayed": True,
+                }
+                apply_final_evidence(result, final_evidence(bench, run_id, args.output, source_rows))
+                save_json(args.output / "summary.json", result)
+                return 2 if result.get("passed") is False else 0
         sampler.sample_once()
         if sampler.failure:
             save_json(
@@ -868,14 +916,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if sampler.failure:
                     result.update(passed=False, failure=sampler.failure)
             try:
-                result["attribution"] = final_evidence(bench, run_id, args.output, source_rows)
-                if result["attribution"]["resource_failure"]:
-                    result.update(passed=False, failure="resource_failure")
-                elif any(
-                    result["attribution"]["operational"].get(key)
-                    for key in ("not_evaluable_count", "judge_incomplete_count")
-                ):
-                    result.update(passed=False, failure="operational_issue")
+                apply_final_evidence(result, final_evidence(bench, run_id, args.output, source_rows))
             except Exception as exc:
                 result.update(
                     passed=False,

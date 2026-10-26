@@ -224,3 +224,7 @@ CN-CLIP身份清单按实际包的模型导入覆盖 `modeling_bert.py` 和 `con
 容量实验的 expected-runtime 必须包含 text_embedder_timeout_s 和 legacy_clip_timeout_s，与 Sentrix /diagnostics.runtime_configuration 相等。本轮显式环境建议为 SENTRIX_TEXT_EMBEDDER_TIMEOUT_S=120、SENTRIX_LEGACY_CLIP_TIMEOUT_S=120；产品默认仍是 10 / 30 秒。修改预算形成新的实验条件，不能把旧超时样本改判为质量错误。
 
 BGE / CLIP 请求超时、HTTP 拒绝、不可用、空或非法向量现在有线程隔离的结构化证据，沿内部 retrieval_channels[].operational_issue 保留。PhotoBench 对这种样本记不可评估 / 空分、跳过 Judge；容量入口停止新派发。本轮失败并不自动成为已确认容量边界。正常检索无命中、合法 SQLite 索引回退和历史缺少 typed 证据的降级不猜测故障原因；后者需单独检查原始通道状态。
+
+### Judge 终态与容量资格
+
+judge_completed 计数包含 completed 和 failed，不能当作成功评分数。容量入口遇到明确 judge_status=failed（含较早对话轮次的子 Judge）即停止派发并将本轮标记 judge_failed；原因没有结构化记录时明确为 unknown，云请求总数及429仅保留运行级事实，不能猜成某一道题的失败原因。终态完整采集与仅观察恢复也执行此判定，不重发 QA 或 Judge。有效0分、not_labeled / not_applicable 空分不会仅因分数为空被判失败；已恢复的429也不会单独否定一轮。此类失败不自动证明本地模型容量边界。

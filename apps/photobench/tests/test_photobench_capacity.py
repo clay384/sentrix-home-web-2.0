@@ -699,3 +699,107 @@ def test_embedding_operational_failure_stops_capacity_round(kind):
         )
     ]
     assert capacity.run_problem(current, 64, 2, 4) in {"resource_failure", "operational_issue"}
+
+
+def test_all_failed_judges_are_not_a_pass_despite_terminal_counters(tmp_path, monkeypatch):
+    finished = state("completed")
+    finished["status"] = "completed_with_errors"
+    finished["items"] = [
+        {"qa_id": str(i), "execution_status": "completed", "judge_status": "failed", "judge": {"score": None}}
+        for i in range(64)
+    ]
+    finished["phases"]["qa_eval"]["judge_requests"] = {"requests_started": 384, "http_429": 384}
+    monkeypatch.setattr(capacity, "get_text", lambda *_: json.dumps(finished))
+    monkeypatch.setattr(capacity, "post_once", lambda *_: pytest.fail("terminal failures cannot be replayed"))
+    result = capacity.poll_run(**poll_kwargs(tmp_path))
+    assert result["passed"] is False and result["failure"] == "judge_failed"
+    assert result["judge_failure_count"] == 64 and result["judge_failure_cause"] == "unknown"
+    assert result["judge_requests"]["http_429"] == 384
+
+
+@pytest.mark.parametrize(
+    "judge",
+    [
+        {"score": 0, "judge_status": "completed"},
+        {"score": None, "reason": "not_labeled"},
+        {"score": None, "reason": "not_applicable"},
+    ],
+)
+def test_valid_zero_and_applicable_absence_do_not_invent_judge_failure(judge):
+    finished = state("completed")
+    finished["items"] = [
+        {
+            "execution_status": "completed",
+            "judge_status": "completed",
+            "judge": judge,
+            "evidence_judge": {"score": None, "reason": "not_applicable"},
+        }
+    ]
+    # A run-level 429 may have recovered. It cannot be assigned to this item.
+    assert capacity.run_problem(finished, 64, 2, 4) is None
+    assert capacity.judge_failure_count(finished) == 0
+
+
+def test_earlier_subjudge_failure_is_not_hidden_by_later_valid_quality_score():
+    finished = state("completed")
+    finished["items"] = [
+        {
+            "judge_status": "completed",
+            "judge": {"score": 2},
+            "runtime_turns": [
+                {"task_judge": {"judge_status": "failed", "correct": None}},
+                {"task_judge": {"judge_status": "completed", "correct": True}},
+            ],
+        }
+    ]
+    assert capacity.run_problem(finished, 64, 2, 4) == "judge_failed"
+    assert capacity.judge_failure_count(finished) == 1
+
+
+def test_poll_refreshes_unfinished_judge_only_after_terminal_counter_changes(tmp_path, monkeypatch):
+    overview, items = detail_fixture(2)
+    overview["status"] = "running"
+    items[0]["judge_status"] = "pending"
+    items[0]["judge"] = {"score": None}
+    reads = {0: 0, 1: 0}
+    polls = 0
+    cancels = []
+
+    def read(url, *_):
+        nonlocal polls
+        if "/items/" in url:
+            index = int(url.rsplit("/", 1)[1])
+            reads[index] += 1
+            return json.dumps({"index": index, "item": items[index]})
+        polls += 1
+        assert polls <= 3, "new Judge failure must stop this round"
+        if polls == 3:
+            items[0]["judge_status"] = "failed"
+        overview["phases"]["qa_eval"]["progress"]["judge_completed"] = 2 if polls == 3 else 1
+        return json.dumps(overview)
+
+    def cancel(*args):
+        cancels.append(args[0])
+        return {"state": "acknowledged"}
+
+    monkeypatch.setattr(capacity, "get_text", read)
+    monkeypatch.setattr(capacity, "post_once", cancel)
+    kw = {**poll_kwargs(tmp_path), "count": 2, "source_rows": rows(2), "poll_seconds": 0}
+    result = capacity.poll_run(**kw)
+    assert not result["passed"] and result["failure"] == "judge_failed"
+    assert reads == {0: 2, 1: 1} and len(cancels) == 1
+
+
+def test_full_terminal_evidence_disqualifies_generic_judge_failure(tmp_path, monkeypatch):
+    overview, items = detail_fixture()
+    items[0]["judge_status"] = "failed"
+    items[0]["task_judge"] = {"judge_status": "failed", "correct": None}
+    monkeypatch.setattr(capacity, "get_text", detail_reader(overview, items))
+    report = capacity.final_evidence("http://safe", "known", tmp_path, rows(8))
+    assert report["judge_failure_count"] == 1 and report["judge_failure_cause"] == "unknown"
+    assert report["coverage"]["item_outcomes"]["judge"]["failed"] == 1
+    assert report["operational"]["judge_incomplete_count"] == 0
+    result = {"passed": True}
+    capacity.apply_final_evidence(result, report)
+    assert result["passed"] is False and result["failure"] == "judge_failed"
+    assert result["attribution"] is report
