@@ -38,9 +38,9 @@ python3 runtime/control.py stop photobench
 
 根目录：`/home/realmagic/benchmarks/sentrix-concurrency-20261026/model-service`。
 
-已核实存在：`OPERATIONS.md`、`control.py`、`service.json`、`launch-fixed262k-seq32-kv16p5g.json`、`wemm-before.json`。200 镜像身份为 `runtime/model-100-identity.json`。
+已核实存在：`OPERATIONS.md`、`control.py`、`service.json`、`launch-fixed262k-seq32-kv16p5g-xgrammar-compact.json`、`wemm-before.json`。200 镜像身份为 `runtime/model-100-identity.json`。
 
-当前核对事实：API PID 3530788，start_ticks 46278046；launch SHA256 `decb644d30498474babaae7c855f924c589141f6e2ed96e3451532715e3d345c`；物理 GPU1 UUID `GPU-4ef9200c-d8f3-638a-3eeb-26fe4fa3d7b0`。执行时仍须重新核对，不能把本报告里的 PID 当永久身份。
+当前紧凑结构空白配置：API PID 1436424，start_ticks 48820917；EngineCore PID 1437396，start_ticks 48822052；launch SHA256 `764e2df33fe06a73199beecc12f68042f4de92e9880c71de746e2995773c00c7`；物理 GPU1 UUID `GPU-4ef9200c-d8f3-638a-3eeb-26fe4fa3d7b0`。执行时仍须重新核对，不能把本报告里的 PID 当永久身份。
 
 前置核验：`service.json` 指向上述 launch；launch SHA 与验收身份一致；活进程 start_ticks/cwd/完整 argv 与记录及 launch 的 `argv` 一致；物理 GPU UUID 对应 GPU1。不要读取或打印 launch 的 environment 字段。`control.py status/stop` 自带 PID/start_ticks/cwd/vLLM 模块身份保护；执行前补全 launch SHA/完整 argv 比对。
 
@@ -58,7 +58,7 @@ python3 control.py stop
 /home/realmagic/wemm-embedding-lab/.venv/bin/python /home/realmagic/wemm-embedding-lab/scripts/manage.py status
 ```
 
-该 manager 路径已核实存在；原进程 cwd 为 `/home/realmagic/wemm-embedding-lab`，服务记录为该目录 `run/service.json`；交接配置 SHA 为 `53f77318b715bf981dcf87e71f3d590fa78b263115f6076aaf5f38213cd0c58d`。不从公开文档重建环境，使用原未改配置。不得让 WeMM 与本轮 vLLM 同时驻留 GPU1。若另行需要恢复本轮 vLLM，先停止 WeMM并确认释放，再用 `python3 control.py start --launch launch-fixed262k-seq32-kv16p5g.json`，这是另一次明确切换，不是自动 fallback。
+该 manager 路径已核实存在；原进程 cwd 为 `/home/realmagic/wemm-embedding-lab`，服务记录为该目录 `run/service.json`；交接配置 SHA 为 `53f77318b715bf981dcf87e71f3d590fa78b263115f6076aaf5f38213cd0c58d`。不从公开文档重建环境，使用原未改配置。不得让 WeMM 与本轮 vLLM 同时驻留 GPU1。若另行需要恢复本轮 vLLM，先停止 WeMM并确认释放，再用 `python3 control.py start --launch launch-fixed262k-seq32-kv16p5g-xgrammar-compact.json`，这是另一次明确切换，不是自动 fallback。
 
 ## 118：完整 ID 停止本轮容器，再恢复旧 llama / SGLang
 
