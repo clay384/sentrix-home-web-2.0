@@ -143,6 +143,26 @@ def test_aggregates_sse_without_caps_or_sampling_changes_and_keeps_content_priva
     assert rows[-1]["state"] == "completed" and rows[-1]["usage"]["completion_tokens"] == 29
     assert rows[-1]["images"] == [{"kind": "content", "sha256": hashlib.sha256(b"secret-image").hexdigest()}]
     assert rows[-1]["request_id"] == server.request_ids[0]
+    actual_parameters = {
+        key: sent[key]
+        for key in (
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "presence_penalty",
+            "seed",
+            "chat_template_kwargs",
+        )
+    }
+    assert all(row["generation_parameters"] == actual_parameters for row in rows)
+    assert all(
+        set(row["generation_parameters_omitted"])
+        == {"repetition_penalty", "max_tokens", "max_completion_tokens"}
+        for row in rows
+    )
+    assert all(row["generation_parameters_invalid"] == [] for row in rows)
+    assert len({row["generation_parameters_sha256"] for row in rows}) == 1
     assert rows[-1]["ttft_s"] is not None
     assert rows[-1]["characters_after_complete_json"] == 0
     text = "".join(p.read_text() for p in tmp_path.iterdir())
@@ -419,3 +439,92 @@ def test_valid_empty_object_is_preserved(server, tmp_path, streamed):
         server.json_response = {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}
     assert call(server, tmp_path, streamed=streamed, mode="prompt_only") == {}
     assert len(server.posts) == 1
+
+
+@pytest.mark.parametrize("penalty", [0, 1.5])
+def test_generation_evidence_uses_final_sent_body_not_declared_profile(server, tmp_path, penalty):
+    body = {
+        "model": "test-vlm",
+        "messages": [],
+        "presence_penalty": penalty,
+        "temperature": 0.7,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    original = json.loads(json.dumps(body))
+    vlm_json_stream.stream_json_response(
+        server.url + "/chat/completions",
+        body,
+        2.0,
+        evidence_dir=tmp_path,
+        private_content=False,
+        stage="sampling_identity_test",
+        request_policy={"declared_profile": "qwen35_nonthinking"},
+    )
+    assert body == original and len(server.posts) == 1
+    assert server.posts[0]["presence_penalty"] == penalty
+    rows = status_rows(tmp_path)
+    assert rows[0]["state"] == "dispatched_outcome_unknown" and rows[-1]["state"] == "completed"
+    for row in rows:
+        assert row["generation_parameters"]["presence_penalty"] == penalty
+        assert "max_tokens" in row["generation_parameters_omitted"]
+        assert "max_completion_tokens" in row["generation_parameters_omitted"]
+    other = vlm_json_stream._request_identity(
+        "http://example.test", {**body, "presence_penalty": 1.5 if penalty == 0 else 0}
+    )
+    assert rows[-1]["generation_parameters_sha256"] != other["generation_parameters_sha256"]
+
+
+def test_generation_identity_canonicalizes_order_and_records_explicit_null_caps():
+    body = {"top_p": 0.8, "seed": 42, "max_tokens": None, "max_completion_tokens": 8192}
+    identity = vlm_json_stream._request_identity("http://example.test", body)
+    reversed_identity = vlm_json_stream._request_identity(
+        "http://example.test", dict(reversed(list(body.items())))
+    )
+    assert identity["generation_parameters_sha256"] == reversed_identity["generation_parameters_sha256"]
+    assert identity["generation_parameters"]["max_tokens"] is None
+    assert identity["generation_parameters"]["max_completion_tokens"] == 8192
+    assert "max_tokens" not in identity["generation_parameters_omitted"]
+    assert "max_completion_tokens" not in identity["generation_parameters_omitted"]
+    omitted_identity = vlm_json_stream._request_identity("http://example.test", {"top_p": 0.8, "seed": 42})
+    assert identity["generation_parameters_sha256"] != omitted_identity["generation_parameters_sha256"]
+    canonical = json.dumps(
+        {
+            "parameters": identity["generation_parameters"],
+            "omitted": identity["generation_parameters_omitted"],
+            "invalid": identity["generation_parameters_invalid"],
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    assert identity["generation_parameters_sha256"] == hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def test_generation_identity_whitelist_never_copies_private_or_malformed_values():
+    body = {
+        "model": "safe",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "private-prompt"}]}],
+        "api_key": "private-api-key",
+        "metadata": {"private": "private-metadata"},
+        "temperature": "private-numeric-field",
+        "top_p": float("nan"),
+        "top_k": True,
+        "max_tokens": {"private": "private-cap"},
+        "chat_template_kwargs": {"enable_thinking": False, "private": "private-template"},
+    }
+    identity = vlm_json_stream._request_identity(
+        "http://user:private-pass@example.test?key=private-query", body
+    )
+    assert identity["generation_parameters"] == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert set(identity["generation_parameters_invalid"]) == {"temperature", "top_p", "top_k", "max_tokens"}
+    assert "max_tokens" not in identity["generation_parameters_omitted"]
+    assert "private-" not in json.dumps(identity)
+    malformed_template = vlm_json_stream._request_identity(
+        "http://example.test",
+        {
+            "chat_template_kwargs": {"enable_thinking": "private-thinking"},
+        },
+    )
+    assert malformed_template["generation_parameters_invalid"] == ["chat_template_kwargs.enable_thinking"]
+    assert "private-thinking" not in json.dumps(malformed_template)

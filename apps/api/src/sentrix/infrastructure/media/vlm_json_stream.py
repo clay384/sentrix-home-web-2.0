@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -32,6 +33,57 @@ log = logging.getLogger(__name__)
 _STATUS_INTERVAL_S = 5.0
 _REPEAT_WINDOW_CHARS = 16384
 _FINISH_REASONS = {"stop", "length", "content_filter"}
+
+
+def _generation_identity(body: dict[str, Any]) -> dict[str, Any]:
+    """Fingerprint the actual outgoing policy, without copying arbitrary body values."""
+    parameters: dict[str, Any] = {}
+    omitted: list[str] = []
+    invalid: list[str] = []
+    for key in (
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "repetition_penalty",
+        "seed",
+        "max_tokens",
+        "max_completion_tokens",
+    ):
+        if key not in body:
+            omitted.append(key)
+            continue
+        value = body[key]
+        if value is None or type(value) is int or (type(value) is float and math.isfinite(value)):
+            parameters[key] = value
+        else:
+            # Malformed inputs must not smuggle strings/objects into safe status logs.
+            # Do not reject or repair the request here: this is observation only.
+            invalid.append(key)
+    template = body.get("chat_template_kwargs")
+    template_key = "chat_template_kwargs.enable_thinking"
+    if isinstance(template, dict) and "enable_thinking" in template:
+        value = template["enable_thinking"]
+        if value is None or type(value) is bool:
+            parameters["chat_template_kwargs"] = {"enable_thinking": value}
+        else:
+            invalid.append(template_key)
+    elif template is None or isinstance(template, dict):
+        omitted.append(template_key)
+    else:
+        invalid.append(template_key)
+    identity = {"parameters": parameters, "omitted": sorted(omitted), "invalid": sorted(invalid)}
+    canonical = json.dumps(
+        identity, sort_keys=True, ensure_ascii=True, separators=(",", ":"), allow_nan=False
+    )
+    return {
+        "generation_parameters": parameters,
+        "generation_parameters_omitted": identity["omitted"],
+        "generation_parameters_invalid": identity["invalid"],
+        "generation_parameters_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "generation_parameters_hash_format": "whitelisted_parameters_omitted_invalid_sorted_json_v1",
+    }
 
 
 def _request_identity(endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -57,6 +109,7 @@ def _request_identity(endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
         host = f"[{host}]"
     netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
     return {
+        **_generation_identity(body),
         "model": body.get("model"),
         "json_output_mode": "json_object"
         if body.get("response_format") == {"type": "json_object"}
