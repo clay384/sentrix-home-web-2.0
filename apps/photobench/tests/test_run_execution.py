@@ -158,9 +158,7 @@ def _completed_turn(
                         "response": {
                             "content": "",
                             "thought": "先检索",
-                            "tool_calls": [
-                                {"id": "c1", "name": "search_memories", "arguments": "{}"}
-                            ],
+                            "tool_calls": [{"id": "c1", "name": "search_memories", "arguments": "{}"}],
                             "finish_reason": "tool_calls",
                         },
                     }
