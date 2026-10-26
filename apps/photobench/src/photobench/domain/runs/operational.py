@@ -6,7 +6,15 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 KINDS = frozenset(
-    {"output_limit", "context_limit", "step_limit", "time_limit", "provider_rejected", "resource_error"}
+    {
+        "output_limit",
+        "context_limit",
+        "step_limit",
+        "time_limit",
+        "provider_rejected",
+        "resource_error",
+        "model_output_invalid",
+    }
 )
 _CODES = {
     "output_limit": "output_limit",
@@ -28,6 +36,7 @@ _CODES = {
     "provider_rejected": "provider_rejected",
     "provider_unavailable": "provider_rejected",
     "provider_response_invalid": "provider_rejected",
+    "model_output_invalid": "model_output_invalid",
     "resource_error": "resource_error",
     "out_of_memory": "resource_error",
     "cuda_error": "resource_error",
@@ -56,6 +65,7 @@ _POLICY_KEYS = frozenset(
         "output_budget",
         "request_timeout_s",
         "request_phase",
+        "json_output_mode",
         "strict_model_step_budget",
         "request_outcome_unknown",
         "max_tool_calls",

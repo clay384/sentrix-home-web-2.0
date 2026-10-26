@@ -15,6 +15,7 @@ from sentrix.domain.assistant.ports import ModelServiceError
         ("context_limit", 422),
         ("output_limit", 502),
         ("provider_response_invalid", 502),
+        ("model_output_invalid", 502),
     ],
 )
 def test_pipeline_model_failure_returns_safe_typed_detail(client, monkeypatch, code, status):
@@ -31,6 +32,7 @@ def test_pipeline_model_failure_returns_safe_typed_detail(client, monkeypatch, c
                 "output_budget": "native_remaining_context",
                 "request_timeout_s": 1800,
                 "seed": 42,
+                "json_output_mode": "prompt_only",
                 "prompt": "PRIVATE_PROMPT",
                 "image": "PRIVATE_IMAGE",
                 "api_key": "PRIVATE_KEY",
@@ -52,6 +54,7 @@ def test_pipeline_model_failure_returns_safe_typed_detail(client, monkeypatch, c
     policy = body["detail"]["request_policy"]
     assert policy["request_outcome_unknown"] is True
     assert policy["seed"] == 42
+    assert policy["json_output_mode"] == "prompt_only"
     assert policy["chat_template_kwargs"] == {"enable_thinking": False}
     assert policy["response_format"] == {"type": "json_object"}
     assert "PRIVATE" not in response.text

@@ -4,9 +4,9 @@
 ``_commit_semantic_image``（VLM 语义 + 事件 + 事实 + 词法）。2.0 保留同一个分界，
 只是把语义那一段做成可选的协作者：单张上传走快路径，整册导入（``ImportAlbum``）把它接上。
 
-**观察失败不是导入失败。** 模型不可用、图片读不了、返回的不是 JSON——``VlmObserver``
-返回 ``None``，这里就当这次没观察到，Observation 保持空语义。1.0 在
-``_commit_semantic_image`` 里也是这么收尾的：异常吞掉，资产留在 ``processed``。
+**缺席与模型失败分开。** 本地图片不可读或该媒体类型不适用时仍可返回 ``None``，
+这里不写语义。模型的传输、预算和输出格式错误通过结构化异常上抛，流水线将资产标为
+失败；不能把模型坏 JSON 当作空观察继续标 ``processed``。
 """
 
 from __future__ import annotations

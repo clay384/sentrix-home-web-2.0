@@ -71,6 +71,7 @@ class ServedModel:
         generation_profile: str = "legacy",
         native_output_budget: bool = False,
         json_streaming: bool = False,
+        json_output_mode: str = "json_object",
         json_evidence_dir: Path | None = None,
         json_private_content: bool = False,
     ) -> None:
@@ -80,6 +81,9 @@ class ServedModel:
         self.native_output_budget = native_output_budget
         if json_private_content and (not json_streaming or json_evidence_dir is None):
             raise ValueError("private JSON evidence requires streaming and a local evidence directory")
+        if json_output_mode not in {"json_object", "prompt_only"}:
+            raise ValueError("unknown JSON output mode")
+        self.json_output_mode = json_output_mode
         self.json_streaming = json_streaming
         self.json_evidence_dir = json_evidence_dir
         self.json_private_content = json_private_content

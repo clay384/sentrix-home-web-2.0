@@ -858,3 +858,23 @@ def test_retrieval_resource_failure_cannot_pass_or_continue_dispatch(tmp_path, m
     result = capacity.poll_run(**poll_kwargs(tmp_path), source_rows=rows(64))
     assert result["failure"] == "resource_failure" and not result["passed"]
     assert len(calls) == 1 and calls[0].endswith("/cancel")
+
+
+def test_model_output_format_error_is_unevaluable_and_stops_capacity_dispatch():
+    from photobench.domain.runs.operational import exclude_operational_quality
+
+    current = state()
+    current["items"] = [
+        exclude_operational_quality(
+            {
+                "execution_status": "completed",
+                "error_code": "model_output_invalid",
+                "finish_reason": "stop",
+                "request_policy": {"request_outcome_unknown": False},
+                "judge": {"score": 0},
+            }
+        )
+    ]
+    assert current["items"][0]["judge"]["score"] is None
+    assert capacity.run_problem(current, 64, 2, 4) == "operational_issue"
+    assert not capacity.resource_failure(current)  # A format failure does not establish a capacity maximum.

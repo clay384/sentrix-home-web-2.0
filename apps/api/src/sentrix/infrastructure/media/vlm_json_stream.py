@@ -58,6 +58,9 @@ def _request_identity(endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
     netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
     return {
         "model": body.get("model"),
+        "json_output_mode": "json_object"
+        if body.get("response_format") == {"type": "json_object"}
+        else "prompt_only",
         "endpoint": urlunsplit((parsed.scheme, netloc, parsed.path, "", "")),
         "prompt_sha256": hashlib.sha256(
             json.dumps(text_parts, ensure_ascii=False, separators=(",", ":")).encode()

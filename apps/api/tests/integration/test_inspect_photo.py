@@ -532,7 +532,8 @@ def test_confirms_visual_only_is_false_when_a_face_is_bound(bundle):
 
 
 @pytest.mark.parametrize(
-    "code,status", [("provider_rejected", 429), ("output_limit", 200), ("time_limit", None)]
+    "code,status",
+    [("provider_rejected", 429), ("output_limit", 200), ("time_limit", None), ("model_output_invalid", 200)],
 )
 def test_operational_visual_error_reaches_tool_evidence_without_becoming_an_answer(bundle, code, status):
     from sentrix.domain.assistant.ports import ModelServiceError

@@ -1350,6 +1350,7 @@ components:
           - time_limit
           - provider_rejected
           - resource_error
+          - model_output_invalid
           title: Kind
         evidence:
           additionalProperties: true

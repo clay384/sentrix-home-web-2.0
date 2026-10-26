@@ -7,7 +7,15 @@ from photobench.api.metrics_schema import RunItemObservation, RunMetricsResponse
 
 @pytest.mark.parametrize(
     "kind",
-    ["output_limit", "context_limit", "step_limit", "time_limit", "provider_rejected", "resource_error"],
+    [
+        "output_limit",
+        "context_limit",
+        "step_limit",
+        "time_limit",
+        "provider_rejected",
+        "resource_error",
+        "model_output_invalid",
+    ],
 )
 def test_operational_item_keeps_execution_evidence_separate_from_judge_score(kind):
     raw = {
@@ -85,3 +93,25 @@ def test_judge_incomplete_counts_and_item_issue_are_distinct_from_agent_not_eval
         "phases": {"qa_eval": {"operational": counts, "progress": {"operational": counts}}},
     }
     assert RunMetricsResponse.model_validate(response).model_dump(exclude_unset=True) == response
+
+
+def test_invalid_model_output_keeps_own_kind_and_null_score_in_public_contract():
+    issue = {
+        "version": 1,
+        "kind": "model_output_invalid",
+        "evidence": {"error_code": "model_output_invalid", "http_status": 200},
+    }
+    item = {
+        "execution_status": "operational_failure",
+        "evaluation_status": "not_evaluable",
+        "judge_status": "skipped",
+        "operational_issue": issue,
+        "judge": {"score": None},
+    }
+    projected = RunItemObservation.model_validate(item).model_dump(exclude_unset=True)
+    assert projected == item
+    counts = {"not_evaluable_count": 1, "by_kind": {"model_output_invalid": 1}}
+    response = {"summary": {"operational": counts}}
+    assert RunMetricsResponse.model_validate(response).model_dump(exclude_unset=True) == response
+    schema = RunItemObservation.model_json_schema()
+    assert "model_output_invalid" in schema["$defs"]["OperationalIssue"]["properties"]["kind"]["enum"]

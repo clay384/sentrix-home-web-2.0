@@ -65,7 +65,7 @@ export interface ImportObservation {
 /** Version 1 operational evidence; it is not an answer-quality failure. */
 export interface OperationalIssue {
   version: 1;
-  kind: "output_limit" | "context_limit" | "step_limit" | "time_limit" | "provider_rejected" | "resource_error";
+  kind: "output_limit" | "context_limit" | "step_limit" | "time_limit" | "provider_rejected" | "resource_error" | "model_output_invalid";
   evidence: Record<string, unknown>;
   scope?: "judge" | null;
   [key: string]: unknown;

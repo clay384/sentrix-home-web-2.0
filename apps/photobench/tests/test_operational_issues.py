@@ -416,3 +416,46 @@ def test_invalid_provider_stream_keeps_unknown_and_is_not_graded():
     assert result["execution_status"] == "outcome_unknown"
     assert result["judge_status"] == "skipped"
     assert result["judge"]["score"] is None
+
+
+def test_known_model_output_format_error_has_own_reason_and_is_not_replayed():
+    from photobench.application.run_execution.service import RunExecution
+    from photobench.domain.runs.analysis import effective_summary
+
+    raw = {
+        "execution_status": "completed",
+        "judge_status": "completed",
+        "judge": {"score": 0},
+        "runtime_turns": [
+            {
+                "trace_bundle": {
+                    "tool_calls": [
+                        {
+                            "tool": "inspect_photo",
+                            "observation": {
+                                "operational_issue": {
+                                    "kind": "model_output_invalid",
+                                    "error_code": "model_output_invalid",
+                                    "finish_reason": "stop",
+                                    "http_status": 200,
+                                    "request_policy": {
+                                        "request_outcome_unknown": False,
+                                        "json_output_mode": "prompt_only",
+                                    },
+                                }
+                            },
+                        }
+                    ]
+                }
+            }
+        ],
+    }
+    result = RunExecution.resume_item(raw)
+    assert result["operational_issue"]["kind"] == "model_output_invalid"
+    assert result["evaluation_status"] == "not_evaluable"
+    assert result["execution_status"] == "operational_failure"
+    assert result["judge_status"] == "skipped" and result["judge"]["score"] is None
+    assert result["operational_issue"]["evidence"]["request_policy"]["request_outcome_unknown"] is False
+    assert result["runtime_turns"] == raw["runtime_turns"]
+    assert RunExecution.resume_item(result) == result
+    assert effective_summary({"items": [result]})["operational"]["by_kind"]["model_output_invalid"] == 1

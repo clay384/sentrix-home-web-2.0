@@ -104,13 +104,20 @@ def server() -> Iterator[Any]:
 
 
 def call(
-    server: Any, tmp_path: Path, *, private: bool = False, timeout: float = 2.0, streamed: bool = True
+    server: Any,
+    tmp_path: Path,
+    *,
+    private: bool = False,
+    timeout: float = 2.0,
+    streamed: bool = True,
+    mode: str = "json_object",
 ) -> Any:
     model = ServedModel(
         server.url,
         generation_profile="qwen35_nonthinking",
         native_output_budget=True,
         json_streaming=streamed,
+        json_output_mode=mode,
         json_evidence_dir=tmp_path,
         json_private_content=private,
     )
@@ -211,9 +218,13 @@ def test_total_deadline_cancels_connection_even_if_tokens_keep_arriving(server, 
     assert server.connection_closed.wait(1.0)
 
 
-def test_non_json_completed_content_is_quality_degradation_not_transport_error(server, tmp_path):
+def test_non_json_completed_transport_is_known_format_failure(server, tmp_path):
     server.chunks = [event("not json"), event(finish="stop"), USAGE, DONE]
-    assert call(server, tmp_path) is None
+    with pytest.raises(ModelServiceError) as caught:
+        call(server, tmp_path)
+    assert caught.value.error_code == "model_output_invalid"
+    assert caught.value.request_policy["request_outcome_unknown"] is False
+    # Transport completed is distinct from usable semantic output; never relabel it unknown.
     assert status_rows(tmp_path)[-1]["state"] == "completed"
 
 
@@ -317,7 +328,10 @@ def test_periodic_status_survives_until_timeout(server, tmp_path, monkeypatch):
     assert rows[-1]["state"] == "unknown"
 
 
-def test_container_wires_streaming_to_real_observer_without_changing_default_transport(server, tmp_path):
+@pytest.mark.parametrize("mode", ["json_object", "prompt_only"])
+def test_container_wires_streaming_to_real_observer_without_changing_default_transport(
+    server, tmp_path, mode
+):
     from sentrix.bootstrap.container import Container
     from sentrix.config import Settings
 
@@ -327,14 +341,81 @@ def test_container_wires_streaming_to_real_observer_without_changing_default_tra
         USAGE,
         DONE,
     ]
-    settings = Settings(data_dir=tmp_path, vlm_base_url=server.url, vlm_json_streaming=True)
+    settings = Settings(
+        data_dir=tmp_path, vlm_base_url=server.url, vlm_json_streaming=True, vlm_json_output_mode=mode
+    )
     container = Container.build(settings)
     image = tmp_path / "test.jpg"
     image.write_bytes(b"local-private-image")
     result = container.vlm_observer.observe(image)
     assert result is not None and result.caption == "中文"
     assert len(server.posts) == 1 and server.posts[0]["stream"] is True
+    assert server.posts[0].get("response_format") == (
+        {"type": "json_object"} if mode == "json_object" else None
+    )
     rows = status_rows(settings.vlm_json_evidence_dir)
+    assert rows[-1]["json_output_mode"] == mode
     assert rows[-1]["stage"] == "initial_observation"
     assert rows[-1]["state"] == "completed"
     assert rows[-1]["private_content_enabled"] is False
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("mode", ["json_object", "prompt_only"])
+def test_explicit_json_mode_changes_only_response_format(server, tmp_path, streamed, mode):
+    if not streamed:
+        server.json_response = {
+            "choices": [{"message": {"content": '{"caption":"ok"}'}, "finish_reason": "stop"}]
+        }
+    assert call(server, tmp_path, streamed=streamed, mode=mode) == {"caption": "ok"}
+    assert len(server.posts) == 1
+    body = server.posts[0]
+    assert body.get("response_format") == ({"type": "json_object"} if mode == "json_object" else None)
+    assert ("response_format" in body) is (mode == "json_object")
+    assert "max_tokens" not in body and "max_completion_tokens" not in body
+    assert body["seed"] == 42 and body["temperature"] == 0.7
+    if streamed:
+        assert status_rows(tmp_path)[-1]["json_output_mode"] == mode
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("content", ["not JSON PRIVATE_BODY", "", "[1,2]", '{"caption":"broken'])
+def test_completed_bad_json_is_known_format_failure_without_retry(server, tmp_path, streamed, content):
+    server.chunks = [event(content), event(finish="stop"), USAGE, DONE]
+    if not streamed:
+        server.json_response = {"choices": [{"message": {"content": content}, "finish_reason": "stop"}]}
+    with pytest.raises(ModelServiceError) as caught:
+        call(server, tmp_path, streamed=streamed, mode="prompt_only")
+    error = caught.value
+    assert error.error_code == "model_output_invalid"
+    assert error.http_status == 200 and error.finish_reason == "stop"
+    assert error.request_policy["request_outcome_unknown"] is False
+    assert error.request_policy["json_output_mode"] == "prompt_only"
+    assert "PRIVATE" not in str(error)
+    assert len(server.posts) == 1
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"choices": []},
+        {"choices": [{"message": {"content": "{}"}}]},
+        {"choices": [{"message": None, "finish_reason": "stop"}]},
+    ],
+)
+def test_nonstream_incomplete_envelope_is_unknown_not_a_format_quality_failure(server, tmp_path, response):
+    server.json_response = response
+    with pytest.raises(ModelServiceError) as caught:
+        call(server, tmp_path, streamed=False)
+    assert caught.value.error_code == "provider_response_invalid"
+    assert caught.value.request_policy["request_outcome_unknown"] is True
+    assert len(server.posts) == 1
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+def test_valid_empty_object_is_preserved(server, tmp_path, streamed):
+    server.chunks = [event("{}"), event(finish="stop"), DONE]
+    if not streamed:
+        server.json_response = {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}
+    assert call(server, tmp_path, streamed=streamed, mode="prompt_only") == {}
+    assert len(server.posts) == 1

@@ -13,7 +13,13 @@ class OperationalIssue(BaseModel):
     model_config = ConfigDict(extra="allow")
     version: Literal[1]
     kind: Literal[
-        "output_limit", "context_limit", "step_limit", "time_limit", "provider_rejected", "resource_error"
+        "output_limit",
+        "context_limit",
+        "step_limit",
+        "time_limit",
+        "provider_rejected",
+        "resource_error",
+        "model_output_invalid",
     ]
     evidence: dict[str, Any]
     scope: Literal["judge"] | None = None

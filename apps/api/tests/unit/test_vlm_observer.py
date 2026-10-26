@@ -411,12 +411,14 @@ def test_invalid_json_is_reported_without_repair_retry_or_private_content(endpoi
         "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
         "usage": {"completion_tokens": 50},
     }
-    assert OpenAIVlmObserver(endpoint, ServedModel(endpoint)).observe(image) is None
+    with pytest.raises(ModelServiceError) as caught:
+        OpenAIVlmObserver(endpoint, ServedModel(endpoint)).observe(image)
     assert len(_Endpoint.received) == 1
-    assert "reason=invalid_json" in caplog.text
-    assert "finish_reason=stop" in caplog.text
-    assert "completion_tokens=50" in caplog.text
-    assert "PRIVATE_RAW_CONTENT" not in caplog.text
+    assert caught.value.error_code == "model_output_invalid"
+    assert caught.value.finish_reason == "stop"
+    assert caught.value.completion_tokens == 50
+    assert caught.value.request_policy["request_outcome_unknown"] is False
+    assert "PRIVATE_RAW_CONTENT" not in str(caught.value) + caplog.text
 
 
 def test_truncated_json_is_a_typed_limit_even_when_prefix_object_parses(endpoint, image):
@@ -503,7 +505,8 @@ def test_error_warning_does_not_echo_untrusted_response_metadata(endpoint, image
         "choices": [{"message": {"content": "not JSON"}, "finish_reason": "PRIVATE_METADATA"}],
         "usage": {"completion_tokens": "PRIVATE_USAGE"},
     }
-    assert OpenAIVlmObserver(endpoint, ServedModel(endpoint)).observe(image) is None
-    assert "finish_reason=unknown" in caplog.text
-    assert "completion_tokens=None" in caplog.text
-    assert "PRIVATE" not in caplog.text
+    with pytest.raises(ModelServiceError) as caught:
+        OpenAIVlmObserver(endpoint, ServedModel(endpoint)).observe(image)
+    assert caught.value.error_code == "provider_response_invalid"
+    assert caught.value.request_policy["request_outcome_unknown"] is True
+    assert "PRIVATE" not in str(caught.value) + caplog.text

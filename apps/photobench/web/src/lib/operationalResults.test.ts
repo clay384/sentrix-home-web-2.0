@@ -50,3 +50,9 @@ describe("operational results remain separate from answer quality", () => {
     expect(rows.find((row) => row.label === "评分未完成")).toMatchObject({ value: "1 题", note: "输出预算 1 题" });
   });
 });
+
+
+it("names a model output format failure separately from provider refusal", () => {
+  expect(judgeScoreLabel({ operational_issue: { kind: "model_output_invalid" } }, null))
+    .toBe("不可评估（模型输出格式错误）");
+});

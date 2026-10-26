@@ -150,3 +150,18 @@ def test_json_stream_environment_is_reported_and_private_requires_stream(monkeyp
     facts = settings.runtime_configuration()
     assert facts["vlm_json_streaming"] is True
     assert facts["vlm_json_private_content"] is True
+
+
+def test_json_output_mode_is_independent_explicit_and_reported(monkeypatch):
+    import pytest
+
+    monkeypatch.setenv("SENTRIX_VLM_JSON_OUTPUT_MODE", "prompt_only")
+    settings = Settings()
+    assert settings.vlm_json_output_mode == "prompt_only"
+    assert settings.runtime_configuration()["vlm_json_output_mode"] == "prompt_only"
+    assert settings.vlm_json_streaming is False
+    assert settings.vlm_native_output_budget is False
+    monkeypatch.delenv("SENTRIX_VLM_JSON_OUTPUT_MODE")
+    assert Settings().vlm_json_output_mode == "json_object"
+    with pytest.raises(ValueError):
+        Settings(vlm_json_output_mode="auto")

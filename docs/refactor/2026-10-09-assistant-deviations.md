@@ -130,3 +130,7 @@
 ### 2026-10-26：显式 native 实验预算与操作证据
 
 在 native 模式允许四项工具次数预算以准确环境字符串 `null` 关闭，仍执行显式模型步和墙钟；不更改 legacy 默认。Planner单独记录，native主循环/L2/上下文恢复/forced final共用30步，强制收尾不再获得预算外第31次调用。工具帽/收尾时间预留实际限制执行时记录budget_events，末尾已超墙钟也记录；PhotoBench排除这些题的质量评分并保留真实答案及轨迹。模型发现失败不再仅有泛型ModelServiceError，供应商内容过滤/无效响应也保留操作类型。此偏离遵循用户“所有限额或供应商故障必须明确，不得当架构回答质量0”要求；并不修改正常错误答案、合法模型拒答和不合法tool arguments的评分规则。
+
+### 2026-10-27：显式 JSON 输出模式与格式失败
+
+`SENTRIX_VLM_JSON_OUTPUT_MODE=json_object|prompt_only` 独立于 native 输出预算和流式传输，默认 `json_object` 保持兼容；`prompt_only` 只省略 `response_format`，不自动降级、不修补 JSON、不增加 token/字符帽。Settings 的运行诊断、请求 policy 和流式状态均记录实际模式。观察、图片复核、人物视觉共用此配置。完整 `stop` 响应无法解析 JSON 对象时抛 `model_output_invalid`，明确结果已知但格式不可用；流水线失败、QA 不可评估，不能把缺语义作为答案错误。合法 `{}` 与不可读本地图片的既有缺席语义保留。

@@ -293,6 +293,7 @@ class Container:
             generation_profile=settings.vlm_generation_profile,
             native_output_budget=settings.vlm_native_output_budget,
             json_streaming=settings.vlm_json_streaming,
+            json_output_mode=settings.vlm_json_output_mode,
             json_evidence_dir=settings.vlm_json_evidence_dir if settings.vlm_json_streaming else None,
             json_private_content=settings.vlm_json_private_content,
         )

@@ -61,6 +61,7 @@ _OPERATIONAL_ERRORS = {
     "context_limit": (422, "输入超出模型可用上下文；本次操作未完成。"),
     "output_limit": (502, "模型输出达到可用上限；本次操作未完成。"),
     "provider_response_invalid": (502, "模型服务响应封装不可识别；本次操作未完成。"),
+    "model_output_invalid": (502, "模型输出格式错误；本次操作未完成。"),
 }
 
 
@@ -96,6 +97,8 @@ def _safe_request_policy(policy: Mapping[str, Any]) -> dict[str, object]:
     chat = policy.get("chat_template_kwargs")
     if isinstance(chat, dict) and type(chat.get("enable_thinking")) is bool:
         safe["chat_template_kwargs"] = {"enable_thinking": chat["enable_thinking"]}
+    if policy.get("json_output_mode") in ("json_object", "prompt_only"):
+        safe["json_output_mode"] = policy["json_output_mode"]
     response_format = policy.get("response_format")
     if isinstance(response_format, dict) and response_format.get("type") == "json_object":
         safe["response_format"] = {"type": "json_object"}

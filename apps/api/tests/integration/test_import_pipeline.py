@@ -230,3 +230,47 @@ def test_non_image_upload_skips_metadata_and_place(tmp_path, recorder, repos):
     assert result.media_type is MediaType.TEXT
     assert result.placed is False
     assert "place" not in recorder.order
+
+
+def test_completed_invalid_json_marks_pipeline_asset_failed_without_empty_memory(
+    tmp_path, recorder, repos, monkeypatch
+):
+    from dataclasses import replace
+
+    import httpx
+
+    from sentrix.application.media.import_album import AlbumProcessRequest, ProcessAlbumPipeline
+    from sentrix.application.media.observe_asset import ObserveAsset
+    from sentrix.domain.media.models import AssetStatus
+    from sentrix.infrastructure.assistant.model_endpoint import ServedModel
+    from sentrix.infrastructure.media.vlm_observer import OpenAIVlmObserver
+
+    assets, observations = repos
+    calls = []
+    monkeypatch.setattr(ServedModel, "current", lambda self: "test-vlm")
+
+    def received(*args, **kwargs):
+        calls.append(kwargs["json"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", "http://model.invalid/v1/chat/completions"),
+            json={"choices": [{"message": {"content": "PRIVATE_INVALID_JSON"}, "finish_reason": "stop"}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", received)
+    observer = ObserveAsset(
+        observations=observations,
+        observer=OpenAIVlmObserver(
+            "http://model.invalid/v1", ServedModel("http://model.invalid/v1", json_output_mode="prompt_only")
+        ),
+    )
+    importer = build(tmp_path, recorder, repos, observer=observer)
+    staged = importer.stage(replace(_request(), defer_processing=True))
+    pipeline = ProcessAlbumPipeline(importer=importer, assets=assets, workers=1)
+    result = pipeline.execute(AlbumProcessRequest(scope_id="album1", asset_ids=(staged.asset.id,)))
+    assert result.processed == 0 and len(result.failures) == 1
+    assert "model_output_invalid" in result.failures[0].reason
+    assert "PRIVATE" not in result.failures[0].reason
+    assert assets.get(staged.asset.id).status is AssetStatus.FAILED
+    assert recorder.order == []  # No empty observation or derived memory was committed.
+    assert len(calls) == 1 and "response_format" not in calls[0]

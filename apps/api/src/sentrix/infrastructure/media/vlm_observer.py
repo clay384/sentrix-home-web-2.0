@@ -23,7 +23,8 @@
 「这条候选怎么写」，它变不出候选；少了这一路，``MaintainFacts`` 的 ``candidates``
 在生产装配下恒为空元组，门禁全开也写不出一条事实。
 
-所有 JSON 调用复用 ServedModel 的显式采样策略，并请求标准 response_format=json_object；
+所有 JSON 调用复用 ServedModel 的显式采样策略；默认请求 response_format=json_object，
+显式 prompt_only 模式仅省略该字段，不自动降级或重试。
 不指定 max_tokens/max_completion_tokens，让后端按实际输入计算原生剩余窗口。
 不支持该模式的端点不会被静默重试或降为非约束生成。运行错误与质量 warning 均不含原文。
 
@@ -122,7 +123,7 @@ def parse_json_object(text: str) -> dict[str, Any] | None:
     只做两件事：先试整串，再试第一个 ``{...}`` 块。1.0 的
     ``parse_json_response`` 还要补花括号、补引号、删尾随逗号（``runtime.py:1586-1661``），
     那套修复器是为「让模型在正文里写 action JSON」服务的；这里少一层，
-    解析不出来就当这次观察没拿到。
+    解析不出来返回 None，由调用方报告结构化格式错误。
     """
     stripped = text.strip()
     for candidate in (stripped, *(_JSON_OBJECT_RE.findall(stripped))):
@@ -189,7 +190,7 @@ def chat_json(
     image: str | Sequence[str] | None,
     timeout_s: float,
 ) -> dict[str, Any] | None:
-    """一次「提示词（+ 一张或多张图）→ JSON 对象」的往返。内容无效返回 None，操作失败抛类型错误。
+    """一次「提示词（+ 一张或多张图）→ JSON 对象」的往返。格式/运行失败抛结构化类型错误。
 
     ``OpenAIVlmObserver`` / ``person_vision_model.OpenAIPersonVision`` /
     ``photo_inspector.OpenAIPhotoInspector`` 共用这一段：请求体的形状（``content`` 是块
@@ -207,9 +208,13 @@ def chat_json(
         content.append({"type": "image_url", "image_url": {"url": url}})
     name = "unresolved"
     dispatched = False
+    format_parameters: dict[str, Any] = (
+        {"response_format": {"type": "json_object"}} if model.json_output_mode == "json_object" else {}
+    )
     policy: dict[str, Any] = {
         **model.generation_parameters(),
-        "response_format": {"type": "json_object"},
+        **format_parameters,
+        "json_output_mode": model.json_output_mode,
         "output_budget_policy": "native_remaining_context",
         "timeout_s": timeout_s,
     }
@@ -221,9 +226,9 @@ def chat_json(
             **model.generation_parameters(),
             # Omit output caps: the provider computes native remaining context
             # after tokenizing the full prompt, including images and template.
-            # llama.cpp and vLLM both support this standard constrained-JSON mode.
+            # The explicit format mode is independent of sampling and native budgets.
             # Unsupported endpoints fail visibly once; never retry unconstrained.
-            "response_format": {"type": "json_object"},
+            **format_parameters,
         }
         dispatched = True
         status_code = 200
@@ -282,13 +287,13 @@ def chat_json(
             "request_outcome_unknown": error.request_policy.get("request_outcome_unknown", dispatched),
         }
         raise
-    except ValueError:
-        log.warning(
-            "视觉 JSON 降级 endpoint=%s model=%s reason=invalid_response_json",
-            endpoint,
-            name,
-        )
-        return None
+    except ValueError as error:
+        raise ModelServiceError(
+            "视觉模型响应协议结构不可识别（provider_response_invalid）；未自动重试。",
+            error_code="provider_response_invalid",
+            http_status=status_code,
+            request_policy={**policy, "request_outcome_unknown": True},
+        ) from error
     text = _first_content(payload)
     choices = payload.get("choices") if isinstance(payload, dict) else None
     first = choices[0] if isinstance(choices, list) and choices else None
@@ -331,19 +336,35 @@ def chat_json(
             else None,
             completion_tokens=completion_tokens,
         )
-    if parsed is None:
-        # Status-only evidence: do not expose image content, prompts or raw answers.
-        log.warning(
-            "视觉 JSON 降级 endpoint=%s model=%s reason=%s "
-            "finish_reason=%s content_chars=%d completion_tokens=%s",
-            endpoint,
-            name,
-            "invalid_json",
-            finish_reason,
-            len(text),
-            completion_tokens,
+    if finish_reason != "stop":
+        raise ModelServiceError(
+            "视觉模型响应缺少完整结束证据（provider_response_invalid）；未自动重试。",
+            error_code="provider_response_invalid",
+            http_status=status_code,
+            request_policy={**policy, "request_outcome_unknown": True},
         )
-        return None
+    message = first.get("message") if isinstance(first, dict) else None
+    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+        raise ModelServiceError(
+            "视觉模型响应协议结构不可识别（provider_response_invalid）；未自动重试。",
+            error_code="provider_response_invalid",
+            http_status=status_code,
+            request_policy={**policy, "request_outcome_unknown": True},
+        )
+    if parsed is None:
+        # A known completed generation with unusable structure is not a lost request.
+        raw_prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+        raise ModelServiceError(
+            "模型输出格式错误（model_output_invalid）：完整响应中没有可解析的 JSON 对象；未自动重试。",
+            error_code="model_output_invalid",
+            http_status=status_code,
+            request_policy={**policy, "request_outcome_unknown": False},
+            finish_reason="stop",
+            prompt_tokens=raw_prompt_tokens
+            if type(raw_prompt_tokens) is int and raw_prompt_tokens >= 0
+            else None,
+            completion_tokens=completion_tokens,
+        )
     return parsed
 
 
