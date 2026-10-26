@@ -2517,6 +2517,7 @@ class RunExecution:
             item["attribution"] = derive_attribution(item)
             item["execution_status"] = "completed"
         except Exception as exc:  # noqa: BLE001 —— 1.0 ``:3571``
+            item["runtime_turns"] = turn_records
             item["error_type"] = type(exc).__name__
             message = str(exc).lower()
             # **判据比 1.0 多一条 ``isinstance``**：1.0 ``:3573`` 只按文案里的
@@ -2546,7 +2547,6 @@ class RunExecution:
                     "completed_turn_count": len(turn_records),
                     **({"turn_id": active_turn_id} if active_turn_id else {}),
                 }
-                item["runtime_turns"] = turn_records
                 item["evaluation_status"] = "not_evaluable"
                 item["judge_status"] = "skipped"
             item.update(

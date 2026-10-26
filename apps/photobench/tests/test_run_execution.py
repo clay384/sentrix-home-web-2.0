@@ -2050,3 +2050,48 @@ def test_resume_received_invalid_judge_never_dispatches_qa_or_judge(monkeypatch,
     assert result["execution_status"] == "completed"
     assert result["judge_status"] == ("outcome_unknown" if judge_status == "outcome_unknown" else "failed")
     assert result["judge"]["score"] is None
+
+
+@pytest.mark.parametrize("failure", ["poll_timeout", "post_unknown"])
+def test_later_turn_unknown_preserves_completed_history_without_replay(monkeypatch, failure):
+    from photobench.domain.errors import RequestOutcomeUnknownError
+
+    execution, client, _, _, _ = _execution()
+    posts = []
+
+    def start_turn(**kwargs):
+        posts.append(kwargs)
+        if len(posts) == 2 and failure == "post_unknown":
+            raise RequestOutcomeUnknownError(method="POST", cause_type="ReadTimeout", attempts=1)
+        return {"turn_id": f"turn-{len(posts)}"}
+
+    def get_turn(**kwargs):
+        if kwargs["turn_id"] == "turn-2":
+            raise TimeoutError("second turn polling timed out")
+        return {
+            "status": "completed",
+            "result": {"answer": "first answer", "termination_reason": "completed"},
+        }
+
+    monkeypatch.setattr(client, "start_turn", start_turn)
+    monkeypatch.setattr(client, "get_turn", get_turn)
+    row = {**_rows()[0], "conversation": [{"message": "first"}, {"message": "second"}]}
+    item = execution._evaluate_one(row, "s", {}, _request(turn_timeout=0))
+    assert len(posts) == 2
+    assert item["execution_status"] == "outcome_unknown"
+    assert item["request_failure"]["automatic_replay"] is False
+    assert len(item["runtime_turns"]) == 1
+    assert item["runtime_turns"][0]["turn_id"] == "turn-1"
+    assert item["runtime_turns"][0]["answer"] == "first answer"
+    if failure == "poll_timeout":
+        assert item["request_failure"]["turn_id"] == "turn-2"
+        assert item["request_failure"]["cause_type"] == "TimeoutError"
+    else:
+        assert item["request_failure"]["cause_type"] == "ReadTimeout"
+        assert item["request_failure"]["attempts"] == 1
+    monkeypatch.setattr(execution, "_evaluate_one", lambda *_: pytest.fail("unknown Agent replayed"))
+    state = RunState({"scope_id": "s", "album_id": ALBUM})
+    execution._phase_qa_eval(state, _request(prior_items=[item]))
+    assert state.data["items"][0]["execution_status"] == "outcome_unknown"
+    assert state.data["items"][0]["runtime_turns"] == item["runtime_turns"]
+    assert len(posts) == 2
