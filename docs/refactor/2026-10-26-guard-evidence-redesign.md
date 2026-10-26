@@ -49,6 +49,11 @@ prompt token 31,653 vs 基线 29,316（+7.97%）。
   - 每回合最多一次；`SENTRIX_CLAIM_VERIFIER=0` 整体回退旧 L2；
   - `contradicted/unsupported` 才重答，`ambiguous/supported` 放行。
 - 轨迹新增 `claim_reviews`。
+- **触发收窄（487 QA 首轮实测 45% → 最终 15%）**：
+  - 计数 claim 若能由 `media_set` 的候选数确定性绑定，不调 L3；
+  - 地点 claim 用双向子串匹配 scope；
+  - `partial` / `scope_mismatch` 记为 gap 并放行——L3 补不出工具没有的 scope 信息；
+  - 空/未知/占位 scope 键直接丢弃，不阻断规划。
 
 ## 4. 交付生命周期（P4）
 
