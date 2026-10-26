@@ -57,6 +57,7 @@ from sentrix.domain.assistant import emergency
 from sentrix.domain.assistant.claim_verifier import (
     Claim,
     ClaimReview,
+    claim_numbers,
     claim_requirement,
     high_risk_claims,
 )
@@ -1371,26 +1372,57 @@ class RunTurn:
             if binding is not None:
                 if binding.verdict is BindingVerdict.SATISFIES:
                     return True
+                if binding.verdict is BindingVerdict.PARTIAL:
+                    # 覆盖不全但方向一致：允许带缺口回答，不再为它花一次 L3。
+                    return True
                 if binding.verdict in {
                     BindingVerdict.UNSUPPORTED,
-                    BindingVerdict.PARTIAL,
                     BindingVerdict.SCOPE_MISMATCH,
                     BindingVerdict.CONFLICT,
+                    BindingVerdict.UNKNOWN,
                 }:
                     return False
         typed = [fact for fact in facts if fact.value_type is claim.value_type]
+        numbers = claim_numbers(claim.text)
+
+        # **计数可以直接由候选集绑定。** 「两张照片」与 media_set 的 asset 数一致时，
+        # 不需要模型再核验；不一致才交给 L3。这是 L3 触发率的主要来源。
+        if claim.value_type is RequirementValueType.COUNT:
+            media_facts = [fact for fact in facts if fact.value_type is RequirementValueType.MEDIA_SET]
+            if numbers and media_facts:
+                return any(
+                    any(float(number) == float(len(fact.value)) for number in numbers)
+                    for fact in media_facts
+                    if isinstance(fact.value, (list, tuple, set))
+                )
+            if numbers and typed:
+                return any(
+                    str(int(number)) == str(fact.value).strip() for number in numbers for fact in typed
+                )
+            return False
+
         if not typed:
             return False
-        numbers = re.findall(r"\d+(?:\.\d+)?", claim.text)
+        if claim.value_type is RequirementValueType.TIME:
+            years = re.findall(r"(?:19|20)\d{2}", claim.text)
+            if years:
+                return any(
+                    any(
+                        year in str(fact.value) or any(year in str(value) for value in fact.scope.values())
+                        for year in years
+                    )
+                    for fact in typed
+                )
+            return bool(numbers) and any(
+                any(str(int(number)) in str(fact.value) for number in numbers) for fact in typed
+            )
         if numbers and claim.value_type in {
-            RequirementValueType.COUNT,
             RequirementValueType.AMOUNT,
             RequirementValueType.DURATION,
-            RequirementValueType.TIME,
         }:
             for fact in typed:
                 haystacks = [str(fact.value), *[str(value) for value in fact.scope.values()]]
-                if all(any(number in haystack for haystack in haystacks) for number in numbers):
+                if all(any(str(number) in haystack for haystack in haystacks) for number in numbers):
                     return True
             return False
         if claim.value_type is RequirementValueType.PLACE:

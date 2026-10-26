@@ -6,6 +6,7 @@ from sentrix.application.assistant.claim_verifier import ClaimVerifier
 from sentrix.domain.assistant.claim_verifier import (
     ClaimVerdict,
     build_claim_messages,
+    claim_numbers,
     high_risk_claims,
     parse_claim_review,
 )
@@ -25,6 +26,12 @@ def test_high_risk_claims_extract_amount_time_count_and_place():
         RequirementValueType.COUNT,
         RequirementValueType.PLACE,
     ]
+
+
+def test_claim_numbers_reads_arabic_and_chinese():
+    assert claim_numbers("一共 12 张，三个人") == (12.0, 3.0)
+    assert claim_numbers("十二张照片") == (12.0,)
+    assert claim_numbers("两张") == (2.0,)
 
 
 def test_a_plain_sentence_has_no_claims():

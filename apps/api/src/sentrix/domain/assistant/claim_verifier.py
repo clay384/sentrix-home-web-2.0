@@ -55,6 +55,46 @@ _COUNT = re.compile(r"\d+\s*(?:张|个|人|次|位|名|条|段|场)")
 _PLACE = re.compile(r"(?:在|去|到|位于)\s*([一-鿿]{2,12}?(?:市|县|区|镇|村|街|路|山|湖|机场|酒店|景区|公园))")
 _SENTENCE = re.compile(r"[^。！？!?；;\n]+[。！？!?；;]?")
 
+_CN_DIGITS = {
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+
+
+def claim_numbers(text: str) -> tuple[float, ...]:
+    """claim 里出现的数字（阿拉伯 + 常用中文数字）。
+
+    只用于**确定性绑定**：回答说「两张」而候选集正好两张，就不必再调 L3 核验。
+    中文数字只解析到 99，够覆盖「几张/几个人/几次」这类家庭相册问题。
+    """
+    numbers = [float(item) for item in re.findall(r"\d+(?:\.\d+)?", text)]
+    for match in re.finditer(
+        r"([一二两三四五六七八九十]+)\s*(?:张|个|人|次|位|名|条|段|场|只|份)",
+        text,
+    ):
+        token = match.group(1)
+        if token == "十":
+            numbers.append(10.0)
+            continue
+        if "十" in token:
+            left, _, right = token.partition("十")
+            tens = _CN_DIGITS.get(left, 1) if left else 1
+            ones = _CN_DIGITS.get(right, 0) if right else 0
+            numbers.append(float(tens * 10 + ones))
+            continue
+        if len(token) == 1 and token in _CN_DIGITS:
+            numbers.append(float(_CN_DIGITS[token]))
+    return tuple(numbers)
+
 
 def high_risk_claims(answer: str) -> tuple[Claim, ...]:
     """从回答里抽出高风险句子。同一句只取最高的那一类，避免重复核验。"""

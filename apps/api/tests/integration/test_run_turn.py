@@ -772,6 +772,26 @@ def test_l3_verifies_an_unbound_count_and_allows_a_corrected_answer(env, monkeyp
     assert result.termination_reason is TerminationReason.ANSWERED_WITH_GAP
 
 
+def test_a_count_matching_the_candidate_set_does_not_trigger_l3(env, monkeypatch):
+    """「两张照片」与 media_set 的 2 个 asset 一致——确定性绑定，不花 L3。"""
+    monkeypatch.setenv("SENTRIX_CLAIM_VERIFIER", "1")
+    _conversations, _turns, conversation, _db = env
+    model = ScriptedModel(
+        [
+            tool_call("search_memories", "c1", query="海边"),
+            final_call("一共有两张海边的照片。", "photo_1"),
+        ],
+        planner=planner_reply("photo_set", value_type="media_set"),
+        claim=PlannerScript(['{"verdict":"ambiguous"}']),
+    )
+    run_turn = build(env, model, StubToolbox({"search_memories": SEARCH_OK}))
+    turn_id = start(run_turn, conversation)
+
+    run_turn.run(turn_id)
+
+    assert model.claim_calls == []
+
+
 # ---- 需求的收尾记账：分清「没去取」与「取了没取到」 --------------------------
 
 
