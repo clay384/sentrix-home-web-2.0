@@ -359,6 +359,8 @@ def _consume_event(data: str, event_name: str, evidence: _Evidence, policy: dict
         delta = choice.get("delta") or {}
         if not isinstance(delta, dict):
             raise _protocol_error("invalid_delta", policy)
+        if delta.get("tool_calls") or delta.get("function_call"):
+            raise _protocol_error("unrequested_tool_call", policy)
         content = delta.get("content") or ""
         reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
         if not isinstance(content, str) or not isinstance(reasoning, str):

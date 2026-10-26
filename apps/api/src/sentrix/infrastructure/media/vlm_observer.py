@@ -361,6 +361,13 @@ def chat_json(
             http_status=status_code,
             request_policy={**policy, "request_outcome_unknown": True},
         )
+    if message.get("tool_calls") or message.get("function_call"):
+        raise ModelServiceError(
+            "视觉JSON请求收到未请求的工具调用（provider_response_invalid）；未自动重试。",
+            error_code="provider_response_invalid",
+            http_status=status_code,
+            request_policy={**policy, "request_outcome_unknown": True},
+        )
     if parsed is None or (contract is not None and not matches_output_contract(parsed, contract)):
         # A known completed generation with unusable structure is not a lost request.
         raw_prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None

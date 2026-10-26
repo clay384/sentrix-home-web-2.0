@@ -785,3 +785,36 @@ def test_all_three_observer_stages_use_observation_contract_without_changing_pro
     assert prompts[:2] == [_OBSERVE_PROMPT, _RECOVERY_PROMPT]
     assert prompts[2].startswith(_CANONICAL_PROMPT)
     assert [len(body["messages"][0]["content"]) for body in server.posts] == [2, 2, 1]
+
+
+@pytest.mark.parametrize("field", ["tool_calls", "function_call"])
+@pytest.mark.parametrize("streamed", [True, False])
+def test_unrequested_tool_payload_with_stop_and_valid_schema_is_unknown(server, tmp_path, field, streamed):
+    from sentrix.infrastructure.media.json_output_contracts import INSPECTION_SCHEMA
+
+    text = json.dumps({"observation": "合成色块", "certainty": "supported", "target_face_id": ""})
+    tool = {"name": "unrequested", "arguments": "{}"}
+    value = [{"id": "call", "type": "function", "function": tool}] if field == "tool_calls" else tool
+    if streamed:
+        event_body = {
+            "choices": [{"index": 0, "delta": {"content": text, field: value}, "finish_reason": "stop"}]
+        }
+        server.chunks = [("data: " + json.dumps(event_body) + "\n\n").encode(), DONE]
+    else:
+        server.json_response = {
+            "choices": [{"message": {"content": text, field: value}, "finish_reason": "stop"}]
+        }
+    with pytest.raises(ModelServiceError) as caught:
+        call(
+            server,
+            tmp_path,
+            streamed=streamed,
+            mode="json_schema",
+            output_schema=INSPECTION_SCHEMA,
+            schema_name="inspection_v1",
+        )
+    assert caught.value.error_code == "provider_response_invalid"
+    assert caught.value.request_policy["request_outcome_unknown"] is True
+    assert len(server.posts) == 1
+    if streamed:
+        assert status_rows(tmp_path)[-1]["state"] == "unknown"
