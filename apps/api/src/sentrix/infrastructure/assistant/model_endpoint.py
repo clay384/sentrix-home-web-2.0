@@ -67,7 +67,13 @@ class ServedModel:
         timeout_s: float = PROBE_TIMEOUT_S,
         ttl_s: float = PROBE_TTL_S,
         monotonic: Callable[[], float] = time.monotonic,
+        generation_profile: str = "legacy",
+        native_output_budget: bool = False,
     ) -> None:
+        if generation_profile not in {"legacy", "qwen35_nonthinking"}:
+            raise ValueError("unknown generation profile")
+        self._generation_profile = generation_profile
+        self.native_output_budget = native_output_budget
         self._base_url = base_url.rstrip("/")
         self._timeout_s = timeout_s
         self._ttl_s = ttl_s
@@ -75,6 +81,20 @@ class ServedModel:
         self._lock = threading.Lock()
         self._name = ""
         self._expires_at = 0.0
+
+    def generation_parameters(self) -> dict[str, object]:
+        """Explicit sampling policy shared by every local model adapter."""
+        if self._generation_profile == "qwen35_nonthinking":
+            return {
+                "temperature": 0.7,
+                "seed": 42,
+                "top_p": 0.8,
+                "top_k": 20,
+                "min_p": 0.0,
+                "presence_penalty": 1.5,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+        return {"temperature": 0.0}
 
     @property
     def base_url(self) -> str:

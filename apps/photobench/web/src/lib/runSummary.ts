@@ -6,7 +6,7 @@
 //
 // 核心口径（逐字段保留，**不要**简化）：
 //   先信后端已存的 `run.summary` 里的字段，缺失（`??`）才用 `run.items` 现算——
-//   每个字段都是 `saved.X ?? 现算(X)` 的形状。历史 run 的 summary 是**当时的后端代码**
+//   operational契约的显式null保留，禁止从排除观察回算；历史 run 的 summary 是**当时的后端代码**
 //   算出来的，一律改成现算会与历史显示不一致。
 //
 // 类型说明：1.0 的这几个函数是无类型 JS。本移植把内部记录（`saved` / `item` / `call`）
@@ -74,12 +74,14 @@ export function macroMetrics(items: readonly Loose[], prefix: string): Retrieval
 export function effectiveRunSummary(run: Run | null | undefined): RunSummary {
   const saved = (run?.summary || {}) as Loose;
   const items = (run?.items || []) as unknown as Loose[];
-  const metricItems = items.filter((item) => String(item?.answerability || "").toLowerCase() !== "unanswerable");
-  const judged = items.filter((item) => typeof item.judge?.score === "number" && [0, 1, 2].includes(item.judge.score) && item.judge?.consistency_status !== "inconsistent");
+  const qualityItems = items.filter((item) => !item.operational_issue && item.evaluation_status !== "not_evaluable");
+  const scoredItems = qualityItems.filter((item) => !item.judge_issue);
+  const metricItems = qualityItems.filter((item) => String(item?.answerability || "").toLowerCase() !== "unanswerable");
+  const judged = scoredItems.filter((item) => typeof item.judge?.score === "number" && [0, 1, 2].includes(item.judge.score) && item.judge?.consistency_status !== "inconsistent" && !["failed", "outcome_unknown"].includes(item.judge?.judge_status));
   const recalls = metricItems.map((item) => item.retrieval_recall).filter((value) => Number.isFinite(Number(value)));
   const scores = judged.map((item) => item.judge.score as number);
-  const evidenceScores = items.map((item) => item.evidence_judge?.score).filter((score) => [0, 1, 2].includes(score));
-  const typedRetrieval = items.some((item) => Object.prototype.hasOwnProperty.call(item, "retrieval_media_refs"));
+  const evidenceScores = scoredItems.map((item) => item.evidence_judge?.score).filter((score) => [0, 1, 2].includes(score));
+  const typedRetrieval = qualityItems.some((item) => Object.prototype.hasOwnProperty.call(item, "retrieval_media_refs"));
   const retrievalItems = metricItems.filter((item) => mediaRefs(item).length);
   const retrievalTp = retrievalItems.reduce((sum, item) => sum + (item.matched_file_names || []).length, 0);
   const retrievalPredicted = retrievalItems.reduce((sum, item) => sum + (item.retrieved_file_names || []).length, 0);
@@ -94,11 +96,11 @@ export function effectiveRunSummary(run: Run | null | undefined): RunSummary {
   const mediaMacro = macroMetrics(metricItems, "media");
   const imageMacro = macroMetrics(metricItems, "image");
   const videoMacro = macroMetrics(metricItems, "video");
-  const actionJudges = items.flatMap((item) => item.task_judges?.length ? item.task_judges : [item.task_judge])
-    .filter((judge) => [true, false].includes(judge?.correct));
+  const actionJudges = scoredItems.flatMap((item) => item.task_judges?.length ? item.task_judges : [item.task_judge])
+    .filter((judge) => [true, false].includes(judge?.correct) && !judge.operational_issue && !["failed", "outcome_unknown"].includes(judge.judge_status));
   const parseTotals = items.map((item) => item.agent_stability?.json_parse_total).filter(Number.isFinite);
   const parseSuccesses = items.map((item) => item.agent_stability?.json_parse_success).filter(Number.isFinite);
-  const completion = items.map((item) => item.agent_stability?.completed_within_steps).filter((value) => typeof value === "boolean");
+  const completion = qualityItems.map((item) => item.agent_stability?.completed_within_steps).filter((value) => typeof value === "boolean");
   const agentTaskLatencies = items.map((item) => item.timing_breakdown?.agent_wall_ms ?? (item.metrics_contract_version === 2 ? item.wall_clock_ms : undefined)).filter(Number.isFinite);
   const agentLoopCounts = items.map((item) => {
     const calls: Loose[] = itemCallMetrics(item);
@@ -118,7 +120,7 @@ export function effectiveRunSummary(run: Run | null | undefined): RunSummary {
   const promptTokens = allCalls.map((call) => Number(call.preflight_prompt_tokens ?? call.prompt_tokens)).filter(Number.isFinite);
   const completionTokens = callTokenCounts.map((call) => call.completion);
   const contextTokens = callTokenCounts.map((call) => call.context);
-  return {
+  const result: Loose = {
     ...saved,
     run_valid: run?.mode === "build" ? null : saved.run_valid,
     completed: saved.completed ?? items.length,
@@ -129,7 +131,7 @@ export function effectiveRunSummary(run: Run | null | undefined): RunSummary {
     retrieval_precision_macro: saved.retrieval_precision_macro ?? (typedRetrieval ? mediaMacro.precision : averageMetric(retrievalItems.map((item) => item.retrieval_precision).filter(Number.isFinite))),
     retrieval_recall_macro: saved.retrieval_recall_macro ?? (typedRetrieval ? mediaMacro.recall : averageMetric(recalls)),
     retrieval_f1_macro: saved.retrieval_f1_macro ?? (typedRetrieval ? mediaMacro.f1 : averageMetric(retrievalItems.map((item) => item.retrieval_f1).filter(Number.isFinite))),
-    retrieval_excluded_unanswerable_count: saved.retrieval_excluded_unanswerable_count ?? (items.length - metricItems.length),
+    retrieval_excluded_unanswerable_count: saved.retrieval_excluded_unanswerable_count ?? (qualityItems.length - metricItems.length),
     answer_quality_mean: saved.answer_quality_mean ?? (scores.length ? averageMetric(scores) : null),
     exact_accuracy: saved.exact_accuracy ?? (scores.length ? scores.filter((score) => score === 2).length / scores.length : null),
     core_accuracy: saved.core_accuracy ?? (scores.length ? scores.filter((score) => score >= 1).length / scores.length : null),
@@ -193,4 +195,10 @@ export function effectiveRunSummary(run: Run | null | undefined): RunSummary {
     judge_phase_wall_ms: saved.judge_phase_wall_ms ?? run?.phases?.qa_eval?.judge_phase_wall_ms ?? null,
     judge_concurrency: saved.judge_concurrency ?? run?.phases?.qa_eval?.judge_concurrency ?? run?.judge_concurrency ?? null,
   };
+  // The operational contract uses explicit null for excluded/unknown metrics.
+  // Never resurrect those values from retained raw observations; legacy fallback stays unchanged.
+  if (Object.prototype.hasOwnProperty.call(saved, "operational")) {
+    for (const [key, value] of Object.entries(saved)) if (value === null) result[key] = null;
+  }
+  return result as RunSummary;
 }

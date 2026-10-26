@@ -131,6 +131,11 @@ def _run_turn(container: Container) -> RunTurn:
         profile=replace(
             DEFAULT_PROFILE,
             wall_time_s=container.settings.agent_wall_time_s,
+            max_steps=container.settings.agent_max_steps,
+            max_tool_calls=container.settings.agent_max_tool_calls,
+            max_search_calls=container.settings.agent_max_search_calls,
+            max_page_calls=container.settings.agent_max_page_calls,
+            max_inspections=container.settings.agent_max_inspections,
         ),
     )
 

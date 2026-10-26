@@ -1633,3 +1633,49 @@ def test_the_fallback_text_is_never_used_when_the_model_said_anything(env):
 
     assert "这一轮检索到" not in result.answer
     assert "提前结束" not in result.answer
+
+
+@pytest.mark.parametrize("phase", ["planner", "agent"])
+def test_operational_error_evidence_survives_the_turn_record(env, phase):
+    _conversations, turns, conversation, _db = env
+    error = ModelServiceError(
+        "provider rejected request",
+        error_code="provider_rejected",
+        http_status=429,
+        request_policy={"max_model_len": 262144, "max_output_tokens": None},
+    )
+    model = ScriptedModel([error], planner=error if phase == "planner" else None)
+    run_turn = build(env, model, StubToolbox())
+    turn_id = start(run_turn, conversation)
+    run_turn.run(turn_id)
+    record = turns.get(turn_id)
+    assert record is not None
+    failures = [call for call in record.trace["model_calls"] if call.get("error_code")]
+    assert len(failures) == 1
+    assert failures[0]["error_code"] == "provider_rejected"
+    assert failures[0]["http_status"] == 429
+    assert failures[0]["request_policy"]["max_model_len"] == 262144
+
+
+def test_faithfulness_fail_open_keeps_operational_evidence(env):
+    _conversations, turns, conversation, _db = env
+    model = ScriptedModel(
+        [tool_call("search_memories", "c1", query="海边"), final("这是你要的海边照片。")],
+        judge=ModelServiceError(
+            "provider rejected review",
+            error_code="provider_rejected",
+            http_status=429,
+            request_policy={"max_model_len": 262144, "max_output_tokens": None},
+        ),
+    )
+    run_turn = build(env, model, StubToolbox({"search_memories": SEARCH_OK}))
+    turn_id = start(run_turn, conversation)
+    result = run_turn.run(turn_id)
+    assert result.answer == "这是你要的海边照片。"
+    record = turns.get(turn_id)
+    assert record is not None
+    reviews = [call for call in record.trace["model_calls"] if call["call_type"] == "faithfulness"]
+    assert len(reviews) == 1
+    assert reviews[0]["http_status"] == 429
+    assert reviews[0]["error_code"] == "provider_rejected"
+    assert reviews[0]["request_policy"]["max_model_len"] == 262144

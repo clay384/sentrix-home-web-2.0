@@ -530,3 +530,63 @@ def test_received_server_error_remains_retryable():
     runner = _runner(http)
     runner._request({"model": "m"})
     assert len(http.calls) == 2
+
+
+@pytest.mark.parametrize("method", ["quality", "task", "evidence"])
+def test_cloud_finish_length_is_incomplete_even_with_valid_json_and_never_retries(method):
+    raw = judge_reply('{"score":0,"reason":"内容错误","actual_action":"answer"}')
+    raw["choices"][0]["finish_reason"] = "length"
+    http = FakeHttpClient([raw])
+    runner = _runner(
+        http, inline_images=lambda *_: [{"type": "image_url", "image_url": {"url": "data:test"}}]
+    )
+    if method == "quality":
+        result = runner.judge("q", "ref", "answer")
+    elif method == "task":
+        result = runner.judge_task_action("q", "answer", "answer", "complete", "answered")
+    else:
+        result = runner.judge_evidence("q", "answer", [{"file_name": "a"}], {})
+    assert result["score"] is None
+    assert result["judge_status"] == "failed"
+    assert result["operational_issue"]["kind"] == "output_limit"
+    assert result["operational_issue"]["scope"] == "judge"
+    assert result["raw_response"] == raw
+    assert len(http.calls) == 1
+
+
+def test_item_with_operational_failure_never_calls_cloud():
+    http = FakeHttpClient([])
+    result = _runner(http).judge_item(
+        {
+            "execution_status": "completed",
+            "termination_reason": "step_budget_exhausted",
+            "runtime_turns": [{"message": "q", "answer": "a", "expected_action": "answer"}],
+        },
+        {},
+        {},
+    )
+    assert result["judge"]["score"] is None
+    assert result["judge_status"] == "skipped"
+    assert http.calls == []
+
+
+def test_cloud_truncation_stops_later_judge_subrequests_and_preserves_raw_turn():
+    raw = judge_reply('{"actual_action":"answer","reason":"足够"}')
+    raw["choices"][0]["finish_reason"] = "length"
+    http = FakeHttpClient([raw])
+    result = _runner(http).judge_item(
+        {
+            "execution_status": "completed",
+            "runtime_turns": [
+                {"message": "q", "answer": "a", "expected_action": "answer", "termination_reason": "answered"}
+            ],
+        },
+        {},
+        {},
+    )
+    assert result["execution_status"] == "completed"
+    assert result["judge_status"] == "failed"
+    assert result["judge"]["score"] is None
+    assert result["judge_issue"]["kind"] == "output_limit"
+    assert result["runtime_turns"][0]["task_judge"]["raw_response"] == raw
+    assert len(http.calls) == 1

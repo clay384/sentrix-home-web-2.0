@@ -23,13 +23,13 @@
 「这条候选怎么写」，它变不出候选；少了这一路，``MaintainFacts`` 的 ``candidates``
 在生产装配下恒为空元组，门禁全开也写不出一条事实。
 
-所有 JSON 调用固定 temperature=0，并请求标准 response_format=json_object；
-不支持该模式的端点不会被静默重试或降为非约束生成。输出截断/解析失败记录不含原文的 warning。
+所有 JSON 调用复用 ServedModel 的显式采样策略，并请求标准 response_format=json_object；
+不指定 max_tokens/max_completion_tokens，让后端按实际输入计算原生剩余窗口。
+不支持该模式的端点不会被静默重试或降为非约束生成。运行错误与质量 warning 均不含原文。
 
-模型不可用、HTTP 失败、返回的不是 JSON——一律返回 ``None``：观察是**增强**，
-不是导入的前置条件。1.0 在 ``pipeline`` 里也是这么收尾的（异常吞掉、留下无向量的资产）。
-**探测不到模型名（``ModelServiceError``）也走这一条**，但那条 ``log.warning`` 里带着端点
-地址与原因——降级是设计好的，静默不是。
+无法读取图片或内容不是 JSON 时返回 ``None``，保留内容质量降级语义。
+HTTP 拒绝、超时、连接故障、输出截断则抛带操作原因的 ``ModelServiceError``，
+由流水线/工具层向用户报告；不能把运行失败伪装为已完成的空观察。
 
 **模型名同样不写死**：观察与对话打的是同一个 8100，写死名字的后果与对话侧一样（换后端
 就 404）。名字由 ``ServedModel`` 问端点要，见 ``assistant/model_endpoint.py``。
@@ -50,7 +50,6 @@ import httpx
 from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.media.models import MODEL_FACT_CONFIDENCE, ObservationFact
 from sentrix.domain.media.ports import ObservationSemantics
-from sentrix.infrastructure.assistant.chat_client import MAX_ANSWER_TOKENS
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
 
 log = logging.getLogger(__name__)
@@ -189,12 +188,12 @@ def chat_json(
     image: str | Sequence[str] | None,
     timeout_s: float,
 ) -> dict[str, Any] | None:
-    """一次「提示词（+ 一张或多张图）→ JSON 对象」的往返。任何失败都返回 ``None``。
+    """一次「提示词（+ 一张或多张图）→ JSON 对象」的往返。内容无效返回 None，操作失败抛类型错误。
 
     ``OpenAIVlmObserver`` / ``person_vision_model.OpenAIPersonVision`` /
     ``photo_inspector.OpenAIPhotoInspector`` 共用这一段：请求体的形状（``content`` 是块
     数组、图走 ``image_url`` 的 data URL）与失败口径只在这一处，改一次三边都动——三条
-    链路都不许把「模型没答」升级成「导入失败」。
+    链路都区分内容质量降级与运行限制；操作失败必须由各自调用方报告。
 
     **为什么会收一串图。** 1.0 的 ``inspect_photo`` 在指名了目标人物时发**两张**：
     裁剪件在前、原图在后（``tools.py:2192``）。多图在这里只是多几个 ``image_url`` 块，
@@ -206,13 +205,20 @@ def chat_json(
     for url in [image] if isinstance(image, str) else list(image or ()):
         content.append({"type": "image_url", "image_url": {"url": url}})
     name = "unresolved"
+    policy: dict[str, Any] = {
+        **model.generation_parameters(),
+        "response_format": {"type": "json_object"},
+        "output_budget_policy": "native_remaining_context",
+        "timeout_s": timeout_s,
+    }
     try:
         name = model.current()
         body = {
             "model": name,
             "messages": [{"role": "user", "content": content}],
-            "max_tokens": MAX_ANSWER_TOKENS,
-            "temperature": 0,
+            **model.generation_parameters(),
+            # Omit output caps: the provider computes native remaining context
+            # after tokenizing the full prompt, including images and template.
             # llama.cpp and vLLM both support this standard constrained-JSON mode.
             # Unsupported endpoints fail visibly once; never retry unconstrained.
             "response_format": {"type": "json_object"},
@@ -221,19 +227,38 @@ def chat_json(
         response.raise_for_status()
         payload = response.json()
     except httpx.HTTPStatusError as error:
+        raise ModelServiceError(
+            f"视觉模型请求被服务拒绝（provider_rejected，HTTP {error.response.status_code}）。",
+            error_code="provider_rejected",
+            http_status=error.response.status_code,
+            request_policy=policy,
+        ) from error
+    except httpx.HTTPError as error:
+        code = "time_limit" if isinstance(error, httpx.TimeoutException) else "provider_unavailable"
+        raise ModelServiceError(
+            f"视觉模型请求未能完成（{code}，{type(error).__name__}）；未自动重试。",
+            error_code=code,
+            request_policy={
+                **policy,
+                "request_outcome_unknown": not isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)),
+            },
+        ) from error
+    except ModelServiceError as error:
+        # Discovery happens before the completion POST. Preserve typed cause,
+        # while making discovery failures distinguishable from unknown POSTs.
+        if error.error_code is None:
+            error.error_code = (
+                "time_limit"
+                if isinstance(error.__cause__, httpx.TimeoutException)
+                else "provider_unavailable"
+            )
+        error.request_policy = {**policy, **error.request_policy, "request_outcome_unknown": False}
+        raise
+    except ValueError:
         log.warning(
-            "视觉调用失败，本次结果跳过 endpoint=%s model=%s response_format=json_object http_status=%s",
+            "视觉 JSON 降级 endpoint=%s model=%s reason=invalid_response_json",
             endpoint,
             name,
-            error.response.status_code,
-        )
-        return None
-    except (httpx.HTTPError, ModelServiceError, ValueError) as error:
-        log.warning(
-            "视觉调用失败，本次结果跳过 endpoint=%s model=%s response_format=json_object error_type=%s",
-            endpoint,
-            name,
-            type(error).__name__,
         )
         return None
     text = _first_content(payload)
@@ -249,15 +274,27 @@ def chat_json(
     raw_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
     completion_tokens = raw_tokens if type(raw_tokens) is int and raw_tokens >= 0 else None
     parsed = parse_json_object(text)
-    reason = "output_truncated" if finish_reason == "length" else "invalid_json" if parsed is None else None
-    if reason is not None:
+    if finish_reason == "length":
+        raw_prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+        raise ModelServiceError(
+            "视觉模型达到本次可用输出/上下文上限（output_limit），回复未完成。",
+            error_code="output_limit",
+            http_status=response.status_code,
+            request_policy=policy,
+            finish_reason="length",
+            prompt_tokens=raw_prompt_tokens
+            if type(raw_prompt_tokens) is int and raw_prompt_tokens >= 0
+            else None,
+            completion_tokens=completion_tokens,
+        )
+    if parsed is None:
         # Status-only evidence: do not expose image content, prompts or raw answers.
         log.warning(
             "视觉 JSON 降级 endpoint=%s model=%s reason=%s "
             "finish_reason=%s content_chars=%d completion_tokens=%s",
             endpoint,
             name,
-            reason,
+            "invalid_json",
             finish_reason,
             len(text),
             completion_tokens,

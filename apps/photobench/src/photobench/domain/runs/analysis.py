@@ -33,6 +33,12 @@ from typing import Any
 
 from photobench.domain.runs.graph_quality import aggregate_graph_qa_by_type
 from photobench.domain.runs.judge import normalize_judge_score, parse_judge_json
+from photobench.domain.runs.operational import (
+    exclude_operational_quality,
+    incomplete_judge_issue,
+    operational_counts,
+    operational_issue,
+)
 from photobench.domain.runtime.metrics import (
     apple_power,
     apple_temperature,
@@ -101,6 +107,16 @@ def judge_score_consistency(
 def judge_projection(judge: dict[str, Any] | None) -> dict[str, Any]:
     """Versioned read-only derivation; saved observations and execution status stay intact."""
     result = dict(judge or {})
+    if issue := incomplete_judge_issue(result):
+        return {
+            **result,
+            "score": None,
+            "correct": None,
+            "operational_issue": issue,
+            "judge_status": "outcome_unknown"
+            if result.get("judge_status") == "outcome_unknown"
+            else "failed",
+        }
     if result.get("score_normalization_version") == 1 or result.get("score_derivation"):
         return result
     original = result.get("score")
@@ -162,7 +178,8 @@ def judge_score_for_summary(judge: dict[str, Any] | None) -> int | None:
     score = normalize_judge_score(judge.get("score"))["score"]
     return (
         score
-        if judge.get("judge_status") != "failed" and judge_consistency_status(judge) != "inconsistent"
+        if judge.get("judge_status") not in {"failed", "outcome_unknown"}
+        and judge_consistency_status(judge) != "inconsistent"
         else None
     )
 
@@ -495,7 +512,7 @@ def agent_stability(item: dict[str, Any]) -> dict[str, Any]:
         "tool_argument_json_rate": round(sum(f["json_object_valid"] for f in facts) / len(facts), 3)
         if facts
         else None,
-        "completed_within_steps": complete,
+        "completed_within_steps": None if operational_issue(item) else complete,
         "final_turn_outcome": turn_outcome,
     }
 
@@ -510,6 +527,8 @@ def _round_or_none(metrics: dict[str, Any] | None, key: str) -> float | None:
 
 def derive_attribution(item: dict[str, Any]) -> dict[str, Any]:
     """1.0 ``:4202``。从已存的 turn 字段里判定失败层。"""
+    if operational_issue(item):
+        return dict(exclude_operational_quality(item)["attribution"])
     judge_score = judge_score_for_summary(item.get("judge"))
     recall = item.get("retrieval_recall")
     # **R 层问的是「检索找到了吗」，不是「交付了吗」。**
@@ -1017,13 +1036,14 @@ def capability_summary(
     items: Sequence[dict[str, Any]], phases: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     """1.0 ``:4639`` 的 ``BenchmarkRun._capability_summary``。"""
-    answer_judges = [item.get("judge") or {} for item in items]
+    quality_items = [exclude_operational_quality(item) for item in items if not operational_issue(item)]
+    answer_judges = [item.get("judge") or {} for item in quality_items]
     answer_scores = [
         score for judge in answer_judges if (score := judge_score_for_summary(judge)) is not None
     ]
     answer_dist = {str(score): answer_scores.count(score) for score in (0, 1, 2)}
-    metric_items = [item for item in items if retrieval_metric_eligible(item)]
-    excluded_unanswerable_count = len(items) - len(metric_items)
+    metric_items = [item for item in quality_items if retrieval_metric_eligible(item)]
+    excluded_unanswerable_count = len(quality_items) - len(metric_items)
     typed_retrieval_items = [item for item in metric_items if "retrieval_media_refs" in item]
     media_metrics: dict[str, Any] | None
     image_metrics: dict[str, Any]
@@ -1094,7 +1114,7 @@ def capability_summary(
         micro_metrics_from_counts(candidate_items, "candidate_retrieval_counts") if candidate_items else None
     )
     candidate_metric_count = len(candidate_items)
-    evidence_judges = [item.get("evidence_judge") or {} for item in items]
+    evidence_judges = [item.get("evidence_judge") or {} for item in quality_items]
     evidence_scores = [
         score
         for judge in evidence_judges
@@ -1103,11 +1123,17 @@ def capability_summary(
     evidence_dist = {str(score): evidence_scores.count(score) for score in (0, 1, 2)}
     action_judges = [
         judge
-        for item in items
+        for item in quality_items
         for judge in (item.get("task_judges") or [item.get("task_judge") or {}])
         if judge.get("expected_action") in {"answer", "refuse", "clarify"}
     ]
-    action_valid = [value for value in action_judges if value.get("correct") in {True, False}]
+    action_valid = [
+        value
+        for value in action_judges
+        if value.get("correct") in {True, False}
+        and not incomplete_judge_issue(value)
+        and value.get("judge_status") not in {"failed", "outcome_unknown"}
+    ]
     parse_totals = [item.get("agent_stability", {}).get("json_parse_total") for item in items]
     parse_successes = [item.get("agent_stability", {}).get("json_parse_success") for item in items]
     tool_argument_total = sum(
@@ -1118,7 +1144,7 @@ def capability_summary(
     )
     parse_total = sum(value for value in parse_totals if isinstance(value, int))
     parse_success = sum(value for value in parse_successes if isinstance(value, int))
-    completion = [item.get("agent_stability", {}).get("completed_within_steps") for item in items]
+    completion = [item.get("agent_stability", {}).get("completed_within_steps") for item in quality_items]
     completion_valid = [value for value in completion if isinstance(value, bool)]
     wall_times = [
         float(item["wall_clock_ms"]) for item in items if isinstance(item.get("wall_clock_ms"), (int, float))
@@ -1221,6 +1247,7 @@ def capability_summary(
         and any(call.get("call_type") for call in item["model_call_metrics"])
     ]
     return {
+        "operational": operational_counts(items),
         "judge_distribution": answer_dist,
         "judge_valid_count": len(answer_scores),
         "answer_quality_mean": round(sum(answer_scores) / len(answer_scores), 3) if answer_scores else None,
@@ -1398,9 +1425,9 @@ def benchmark_e2e_latency_excluding_judge_ms(
 def list_summary(state: dict[str, Any]) -> dict[str, Any]:
     """1.0 ``:6825`` 的 ``OrchestratorRepository._list_summary``。"""
     saved = dict(state.get("summary") or {})
-    items = state.get("items") or []
+    items = [exclude_operational_quality(item) for item in state.get("items") or []]
     recalls = [
-        item.get("retrieval_recall")
+        float(item["retrieval_recall"])
         for item in items
         if isinstance(item.get("retrieval_recall"), (int, float))
     ]
@@ -1410,6 +1437,7 @@ def list_summary(state: dict[str, Any]) -> dict[str, Any]:
         {
             "total": saved.get("total") or state.get("qa_count") or len(items),
             "completed": len(items),
+            "operational": operational_counts(items),
             "judge_valid_count": len(scores),
             "judge_distribution": distribution,
             "retrieval_recall_mean": saved.get("retrieval_recall_mean")
@@ -1418,9 +1446,11 @@ def list_summary(state: dict[str, Any]) -> dict[str, Any]:
             "answer_quality_mean": round(sum(scores) / len(scores), 3) if scores else None,
         }
     )
+    has_operational = any(operational_issue(item) or item.get("judge_issue") for item in items)
     for key, value in capability_summary(items, state.get("phases") or {}).items():
         if (
-            key == "retrieval_recall_mean"
+            has_operational
+            or key in {"retrieval_recall_mean", "operational"}
             or key.startswith(("retrieval_", "media_retrieval_", "image_retrieval_", "video_retrieval_"))
             or saved.get(key) is None
         ):
@@ -1464,14 +1494,19 @@ def effective_summary(state: dict[str, Any]) -> dict[str, Any]:
     而之后的 ``get_run_items`` 又要用这份补过的数据，所以照搬。
     """
     saved = dict(state.get("summary") or {})
-    items = state.get("items") or []
+    for item in state.get("items") or []:
+        if isinstance(item, dict) and item.get("execution_trace"):
+            item["agent_stability"] = agent_stability(item)
+    items = [exclude_operational_quality(item) for item in state.get("items") or []]
     if not saved.get("image_ranking"):
         saved["image_ranking"] = (
             mean_ranking_metrics(
                 [
                     {"image_ranking": ranking_from_item(item)}
                     for item in items
-                    if isinstance(item, dict) and retrieval_metric_eligible(item)
+                    if isinstance(item, dict)
+                    and not operational_issue(item)
+                    and retrieval_metric_eligible(item)
                 ]
             )
             or None
@@ -1528,6 +1563,7 @@ def effective_summary(state: dict[str, Any]) -> dict[str, Any]:
             "completed": sum(1 for item in items if item.get("execution_status") == "completed"),
             # 读侧重算，理由见 ``_run_valid``。
             "run_valid": _run_valid(state, items),
+            "operational": operational_counts(items),
             "judge_valid_count": len(scores),
             "judge_distribution": distribution,
             "retrieval_recall_mean": saved.get(
@@ -1576,12 +1612,16 @@ def effective_summary(state: dict[str, Any]) -> dict[str, Any]:
             "delivery_breakdown": saved.get("delivery_breakdown", aggregate_delivery(items)),
             # 历史 run 没有 graph_* 遥测时仍输出题型表，但行内会明确标记
             # ``telemetry_status=not_recorded``，不把普通检索结果冒充图拓展结果。
-            "graph_qa_by_type": aggregate_graph_qa_by_type(items),
+            "graph_qa_by_type": aggregate_graph_qa_by_type(
+                [item for item in items if not operational_issue(item)]
+            ),
         }
     )
+    has_operational = any(operational_issue(item) or item.get("judge_issue") for item in items)
     for key, value in capability_summary(items, state.get("phases") or {}).items():
         if (
-            key == "retrieval_recall_mean"
+            has_operational
+            or key in {"retrieval_recall_mean", "operational"}
             or key.startswith(("retrieval_", "media_retrieval_", "image_retrieval_", "video_retrieval_"))
             or key.startswith(
                 (
@@ -1614,6 +1654,7 @@ def run_list_entry(state: dict[str, Any]) -> dict[str, Any]:
     """1.0 ``:5309`` 的 ``OrchestratorRepository._run_list_entry``。"""
     summary = list_summary(state)
     summary_keys = {
+        "operational",
         "total",
         "completed",
         "judge_valid_count",
@@ -1684,13 +1725,21 @@ def run_list_entry(state: dict[str, Any]) -> dict[str, Any]:
 
 def item_summary(item: dict[str, Any], index: int, review: dict[str, Any] | None = None) -> dict[str, Any]:
     """1.0 ``:6559`` 的 ``_item_summary``。"""
+    item = exclude_operational_quality(item)
     judge = judge_projection(item.get("judge"))
     return {
         "index": index,
         "qa_id": item.get("qa_id"),
         **{
             key: item[key]
-            for key in ("execution_status", "judge_status", "judge_dispatch_status")
+            for key in (
+                "execution_status",
+                "judge_status",
+                "judge_dispatch_status",
+                "operational_issue",
+                "judge_issue",
+                "evaluation_status",
+            )
             if key in item
         },
         "question": item.get("question"),
@@ -1747,7 +1796,7 @@ def item_summary(item: dict[str, Any], index: int, review: dict[str, Any] | None
 def hydrate_qa_metadata(item: dict[str, Any], qa_metadata: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """1.0 ``:4919`` 的 ``_hydrate_qa_metadata``；``qa_metadata`` 从 ``self`` 变成入参。"""
     metadata = qa_metadata.get(str(item.get("qa_id") or "")) or {}
-    hydrated = {**metadata, **item}
+    hydrated = exclude_operational_quality({**metadata, **item})
     tag_fields = {
         "task_type": "task",
         "question_type": "question",

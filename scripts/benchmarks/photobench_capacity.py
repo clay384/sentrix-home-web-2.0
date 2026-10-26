@@ -44,6 +44,7 @@ from scripts.benchmarks.remote_vllm_capacity import (  # noqa: E402
     validate_endpoint,
 )
 from scripts.benchmarks.summarize_photobench_capacity import summarize_run  # noqa: E402
+from scripts.maintenance import embedding_identity  # noqa: E402
 
 Json = dict[str, Any]
 TERMINAL = {"completed", "completed_with_errors", "failed", "cancelled", "interrupted"}
@@ -128,6 +129,31 @@ def validate_rows(
     return count
 
 
+def embedding_connections(config: Json, diagnostics: Json, expected_runtime: Json) -> dict[str, str]:
+    """Addresses are deployment facts, never vector-space compatibility keys."""
+    connection = (config.get("runtime_config") or {}).get("embedding") or {}
+    actual = diagnostics.get("runtime_configuration") or {}
+    if connection.get("mode") != "split_text_image" or expected_runtime.get("embedding_scheme") != "legacy":
+        raise ValueError("capacity snapshot embedding requires the complete legacy scheme")
+    endpoints: dict[str, str] = {}
+    for role, setting, connection_key in (
+        ("text", "text_embedder_url", "text_url"),
+        ("visual", "legacy_clip_url", "image_url"),
+    ):
+        expected = expected_runtime.get(setting)
+        if not isinstance(expected, str) or not expected:
+            raise ValueError("expected runtime must declare both embedding connection addresses")
+        if not same_url(actual.get(setting), expected) or not same_url(
+            connection.get(connection_key), expected
+        ):
+            raise ValueError("PhotoBench/Sentrix embedding connection differs from expected runtime")
+        host = urllib.parse.urlsplit(expected).hostname
+        if host is None:
+            raise ValueError("embedding connection has no host")
+        endpoints[role] = service_url(expected, host)
+    return endpoints
+
+
 def validate_configuration(
     config: Json,
     diagnostics: Json,
@@ -139,6 +165,7 @@ def validate_configuration(
     window: int,
     expected_runtime: Json,
     embedding: Any,
+    embedding_health: Json,
 ) -> None:
     runtime = config.get("runtime_config") or {}
     if not same_url(runtime.get("sentrix_url", config.get("default_sentrix_url")), sentrix):
@@ -149,8 +176,9 @@ def validate_configuration(
         raise ValueError("PhotoBench model URL differs from this experiment")
     if runtime.get("vllm_manager_url") or config.get("default_vllm_api_url"):
         raise ValueError("capacity run requires an unmanaged remote model endpoint")
-    if runtime.get("embedding") != embedding:
-        raise ValueError("memory snapshot embedding differs from PhotoBench configuration")
+    embedding_identity.validate_space(embedding)
+    embedding_connections(config, diagnostics, expected_runtime)
+    embedding_identity.validate_health(embedding, embedding_health)
     actual = diagnostics.get("runtime_configuration") or {}
     if not same_url(actual.get("vlm_base_url"), model_base + "/v1"):
         raise ValueError("Sentrix VLM URL differs from the explicit model endpoint")
@@ -224,7 +252,14 @@ def run_problem(state: Json, count: int, concurrency: int, judge_concurrency: in
             return "effective_judge_concurrency_mismatch"
         if progress.get("outcome_unknown", 0):
             return "request_outcome_unknown"
-    return "resource_failure" if resource_failure(state) else None
+    if resource_failure(state):
+        return "resource_failure"
+    counts = progress.get("operational") or {}
+    if counts.get("not_evaluable_count", 0) or counts.get("judge_incomplete_count", 0):
+        return "operational_issue"
+    if any(item.get("operational_issue") or item.get("judge_issue") for item in state.get("items") or []):
+        return "operational_issue"
+    return None
 
 
 def resource_failure(state: Json) -> bool:
@@ -234,6 +269,8 @@ def resource_failure(state: Json) -> bool:
     )
     # Error evidence is structured; never scan QA prose, answers or tool arguments.
     for item in state.get("items") or []:
+        if (item.get("operational_issue") or {}).get("kind") in {"resource_error", "time_limit"}:
+            return True
         turns = [turn for turn in item.get("runtime_turns") or [] if isinstance(turn, dict)]
         records = [item, *turns]
         calls = item.get("model_call_metrics")
@@ -657,6 +694,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = json.loads(get_text(bench + "/api/v1/config", 30))
         diagnostics = json.loads(get_text(sentrix + "/api/v1/diagnostics", 30))
         models = json.loads(get_text(model_base + "/v1/models", 10))
+        embedding_identity.validate_space(memory_identity.get("embedding"))
+        embedding_endpoints = embedding_connections(config, diagnostics, expected_runtime)
+        embedding_health = {
+            role: json.loads(get_text(base + "/health", 30)) for role, base in embedding_endpoints.items()
+        }
         validate_configuration(
             config,
             diagnostics,
@@ -667,6 +709,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             window=args.window,
             expected_runtime=expected_runtime,
             embedding=memory_identity["embedding"],
+            embedding_health=embedding_health,
         )
         query = urllib.parse.urlencode(
             {"album_id": args.album_id, "qa_set": args.qa_set, "sentrix_url": sentrix}
@@ -679,6 +722,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "config": config,
                 "diagnostics": diagnostics,
                 "models": models,
+                "embedding_health": embedding_health,
                 "qa_count": count,
                 "qa_sha256": args.qa_sha256,
                 "memory_manifest_sha256": snapshot_manifest_sha,
@@ -819,6 +863,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result["attribution"] = final_evidence(bench, run_id, args.output, source_rows)
                 if result["attribution"]["resource_failure"]:
                     result.update(passed=False, failure="resource_failure")
+                elif any(
+                    result["attribution"]["operational"].get(key)
+                    for key in ("not_evaluable_count", "judge_incomplete_count")
+                ):
+                    result.update(passed=False, failure="operational_issue")
             except Exception as exc:
                 result.update(
                     passed=False,

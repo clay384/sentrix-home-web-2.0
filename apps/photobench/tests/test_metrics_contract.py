@@ -210,7 +210,7 @@ def test_native_completion_does_not_require_legacy_turn_outcome() -> None:
     [
         ("answered", "answer", "completed", 4, True),
         ("answered_with_gap", "answer", "completed", 4, True),
-        ("step_budget_exhausted", "answer", "completed", 4, False),
+        ("step_budget_exhausted", "answer", "completed", 4, None),
         ("answered", "", "completed", 4, False),
         ("answered", "answer", "failed", 4, False),
         ("answered", "answer", "completed", 5, False),
@@ -254,7 +254,8 @@ def test_later_answer_does_not_hide_a_failed_earlier_turn() -> None:
             {"termination_reason": "answered", "answer": "answer"},
         ],
     }
-    assert analysis.agent_stability(item)["completed_within_steps"] is False
+    assert analysis.agent_stability(item)["completed_within_steps"] is None
+    assert analysis.capability_summary([item])["operational"]["by_kind"]["time_limit"] == 1
 
 
 def test_endpoint_attribution_tracks_descendants_and_port_reuse() -> None:

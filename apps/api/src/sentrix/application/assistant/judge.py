@@ -16,11 +16,12 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from sentrix.domain.assistant.judge import JudgeVerdict, build_messages, parse_verdict, verdict_from_payload
-from sentrix.domain.assistant.models import ChatMessage, ChatRole
+from sentrix.domain.assistant.models import ChatMessage, ChatRole, ModelReply
 from sentrix.domain.assistant.ports import ChatModel
+from sentrix.domain.assistant.tools import ToolSpec
 
 log = logging.getLogger("sentrix.assistant.judge")
 
@@ -35,6 +36,7 @@ class FaithfulnessJudge:
         query: str,
         answer: str,
         transcript: Sequence[ChatMessage],
+        complete: Callable[[Sequence[ChatMessage], Sequence[ToolSpec]], ModelReply] | None = None,
     ) -> JudgeVerdict:
         """评审一次。任何失败都返回「忠实」——这是 1.0 的 fail-open 口径。"""
         call = build_messages(
@@ -45,7 +47,8 @@ class FaithfulnessJudge:
         messages = [ChatMessage(ChatRole(str(item["role"])), str(item["content"])) for item in call.messages]
         try:
             # 评审不带工具：它要的是一段裁决 JSON，不是一次工具往返。
-            reply = self._model.complete(messages, ())
+            # The turn supplies its recorder so fail-open never discards operational evidence.
+            reply = (complete or self._model.complete)(messages, ())
         except Exception:
             log.warning("L2 评审调用失败，按忠实放行", exc_info=True)
             return JudgeVerdict()

@@ -1096,6 +1096,10 @@ components:
       title: ImportObservationProjection
     JudgeObservation:
       properties:
+        operational_issue:
+          anyOf:
+          - $ref: '#/components/schemas/OperationalIssue'
+          - type: 'null'
         score:
           title: Score
         score_normalization_version:
@@ -1303,8 +1307,75 @@ components:
       additionalProperties: true
       type: object
       title: MemoryObservation
+    OperationalCounts:
+      properties:
+        not_evaluable_count:
+          type: integer
+          title: Not Evaluable Count
+        by_kind:
+          additionalProperties:
+            type: integer
+          type: object
+          title: By Kind
+        judge_incomplete_count:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Judge Incomplete Count
+        judge_by_kind:
+          anyOf:
+          - additionalProperties:
+              type: integer
+            type: object
+          - type: 'null'
+          title: Judge By Kind
+      additionalProperties: true
+      type: object
+      required:
+      - not_evaluable_count
+      - by_kind
+      title: OperationalCounts
+    OperationalIssue:
+      properties:
+        version:
+          type: integer
+          const: 1
+          title: Version
+        kind:
+          type: string
+          enum:
+          - output_limit
+          - context_limit
+          - step_limit
+          - time_limit
+          - provider_rejected
+          - resource_error
+          title: Kind
+        evidence:
+          additionalProperties: true
+          type: object
+          title: Evidence
+        scope:
+          anyOf:
+          - type: string
+            const: judge
+          - type: 'null'
+          title: Scope
+      additionalProperties: true
+      type: object
+      required:
+      - version
+      - kind
+      - evidence
+      title: OperationalIssue
+      description: Versioned execution evidence, separate from answer/architecture
+        quality.
     PhaseMetricsProjection:
       properties:
+        operational:
+          anyOf:
+          - $ref: '#/components/schemas/OperationalCounts'
+          - type: 'null'
         judge_requests:
           anyOf:
           - $ref: '#/components/schemas/JudgeRequestMetrics'
@@ -1349,6 +1420,10 @@ components:
       title: PhaseMetricsProjection
     PhaseProgressProjection:
       properties:
+        operational:
+          anyOf:
+          - $ref: '#/components/schemas/OperationalCounts'
+          - type: 'null'
         total:
           anyOf:
           - type: integer
@@ -1468,6 +1543,19 @@ components:
       title: PhaseProgressProjection
     RunItemObservation:
       properties:
+        operational_issue:
+          anyOf:
+          - $ref: '#/components/schemas/OperationalIssue'
+          - type: 'null'
+        judge_issue:
+          anyOf:
+          - $ref: '#/components/schemas/OperationalIssue'
+          - type: 'null'
+        evaluation_status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Evaluation Status
         execution_status:
           anyOf:
           - type: string
@@ -1513,6 +1601,10 @@ components:
       title: RunItemsResponse
     RunMetricsResponse:
       properties:
+        summary:
+          anyOf:
+          - $ref: '#/components/schemas/RunSummaryProjection'
+          - type: 'null'
         read_revision:
           anyOf:
           - type: string
@@ -1588,6 +1680,15 @@ components:
       additionalProperties: true
       type: object
       title: RunMetricsResponse
+    RunSummaryProjection:
+      properties:
+        operational:
+          anyOf:
+          - $ref: '#/components/schemas/OperationalCounts'
+          - type: 'null'
+      additionalProperties: true
+      type: object
+      title: RunSummaryProjection
     RuntimeConfigResponse:
       properties:
         runtime_config:

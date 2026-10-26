@@ -16,8 +16,10 @@ import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import httpx
 import pytest
 
+from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
 from sentrix.infrastructure.media.vlm_observer import (
     MAX_MODEL_CALLS,
@@ -317,41 +319,80 @@ def test_the_first_call_carries_the_image_and_the_canonicalization_does_not(imag
     assert observer.calls[1] is not None, "补全那一轮同样要看图"
 
 
-def test_a_chat_failure_returns_none(endpoint, image):
-    """对话端点报错时返回 ``None``：观察是**增强**，不是导入的前置条件。"""
+def test_a_chat_failure_is_a_typed_operational_error(endpoint, image):
     observer = OpenAIVlmObserver(endpoint, ServedModel(endpoint))
+    with pytest.raises(ModelServiceError) as caught:
+        observer.observe(image)
+    assert caught.value.error_code == "provider_rejected"
+    assert caught.value.http_status == 503
+    assert len(_Endpoint.received) == 1
 
-    assert observer.observe(image) is None
 
-
-def test_an_unreachable_endpoint_returns_none(image):
-    """连不上时 httpx 抛 ``ConnectError``（``HTTPError`` 的子类），探测那一层也一样。
-
-    这里连探测都过不去——一个连不上的端点连「我服务谁」都答不出来。
-    """
+def test_an_unreachable_model_discovery_propagates_without_completion_post(image):
     dead = "http://127.0.0.1:1/v1"
     observer = OpenAIVlmObserver(dead, ServedModel(dead, timeout_s=1.0))
+    with pytest.raises(ModelServiceError) as caught:
+        observer.observe(image)
+    assert caught.value.error_code == "provider_unavailable"
+    assert caught.value.request_policy["request_outcome_unknown"] is False
 
-    assert observer.observe(image) is None
+
+@pytest.mark.parametrize(
+    ("error_type", "code", "unknown"),
+    [
+        (httpx.ReadTimeout, "time_limit", True),
+        (httpx.ConnectTimeout, "time_limit", False),
+        (httpx.ConnectError, "provider_unavailable", False),
+    ],
+)
+def test_transport_failure_propagates_unknown_state_without_retry(
+    endpoint, image, monkeypatch, error_type, code, unknown
+):
+    calls = []
+
+    def fail_post(url, **kwargs):
+        calls.append(url)
+        raise error_type("PRIVATE_TRANSPORT_DETAIL")
+
+    monkeypatch.setattr(httpx, "post", fail_post)
+    with pytest.raises(ModelServiceError) as caught:
+        OpenAIVlmObserver(endpoint, ServedModel(endpoint), timeout_s=600).observe(image)
+    assert caught.value.error_code == code
+    assert caught.value.request_policy["request_outcome_unknown"] is unknown
+    assert caught.value.request_policy["timeout_s"] == 600
+    assert caught.value.request_policy["output_budget_policy"] == "native_remaining_context"
+    assert "PRIVATE" not in str(caught.value)
+    assert len(calls) == 1
 
 
-def test_prompt_budget_constant_is_shared_with_the_chat_client(endpoint, image):
-    """观察的 JSON 与对话的回答**共用同一个常量**，不再各写一个数。
+def test_visual_request_leaves_output_budget_to_provider_native_remaining_context(endpoint, image):
+    _Endpoint.reply = {
+        "choices": [{"message": {"content": '{"caption": "海边"}'}, "finish_reason": "stop"}],
+        "usage": {"completion_tokens": 4096},
+    }
+    result = OpenAIVlmObserver(endpoint, ServedModel(endpoint)).observe(image)
+    assert result is not None
+    assert len(_Endpoint.received) == 1
+    assert "max_tokens" not in _Endpoint.received[0]
+    assert "max_completion_tokens" not in _Endpoint.received[0]
 
-    **断言的是「共用」，不是那个数的值。** 原先这里写死 ``== '{"max": 1501}'``——
-    那正好是「把常量抄一遍」：值一改，红的是测试而不是被测的东西，而这条用例本来要守的
-    「两处是不是同一个来源」反倒没人验。2026-10-09 改 ``1501 → 2048`` 时它就红了，
-    而两处**仍然共用**——测试守错了东西。
 
-    现在直接从**观察器发出去的请求体**里读 max_tokens，与常量比。
-    """
-    from sentrix.infrastructure.assistant.chat_client import MAX_ANSWER_TOKENS
-
-    _Endpoint.reply = {"choices": [{"message": {"content": '{"caption": "海边"}'}, "finish_reason": "stop"}]}
-    OpenAIVlmObserver(endpoint, ServedModel(endpoint)).observe(image)
-
-    assert _Endpoint.received, "观察器必须真的发出了请求，否则这条断言什么也没验"
-    assert _Endpoint.received[0]["max_tokens"] == MAX_ANSWER_TOKENS
+def test_visual_request_shares_the_selected_qwen_non_thinking_profile(endpoint, image):
+    _Endpoint.reply = {"choices": [{"message": {"content": '{"caption": "室内"}'}, "finish_reason": "stop"}]}
+    model = ServedModel(endpoint, generation_profile="qwen35_nonthinking", native_output_budget=True)
+    result = OpenAIVlmObserver(endpoint, model).observe(image)
+    assert result is not None
+    body = _Endpoint.received[0]
+    assert body["temperature"] == 0.7
+    assert body["top_p"] == 0.8
+    assert body["top_k"] == 20
+    assert body["min_p"] == 0.0
+    assert body["presence_penalty"] == 1.5
+    assert body["seed"] == 42
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert body["response_format"] == {"type": "json_object"}
+    assert "max_tokens" not in body
+    assert "max_completion_tokens" not in body
 
 
 def test_json_observation_request_fixes_sampling_and_constrains_format(endpoint, image):
@@ -378,24 +419,43 @@ def test_invalid_json_is_reported_without_repair_retry_or_private_content(endpoi
     assert "PRIVATE_RAW_CONTENT" not in caplog.text
 
 
-def test_truncated_json_is_not_accepted_even_when_a_prefix_object_parses(endpoint, image, caplog):
+def test_truncated_json_is_a_typed_limit_even_when_prefix_object_parses(endpoint, image):
     _Endpoint.reply = {
-        "choices": [{"message": {"content": '{"caption":"室内"}'}, "finish_reason": "length"}],
-        "usage": {"completion_tokens": 2048},
+        "choices": [{"message": {"content": '{"caption":"PRIVATE_IMAGE_TEXT"}'}, "finish_reason": "length"}],
+        "usage": {"prompt_tokens": 200, "completion_tokens": 2048},
     }
-    assert OpenAIVlmObserver(endpoint, ServedModel(endpoint)).observe(image) is None
+    with pytest.raises(ModelServiceError) as caught:
+        OpenAIVlmObserver(endpoint, ServedModel(endpoint)).observe(image)
     assert len(_Endpoint.received) == 1
-    assert "reason=output_truncated" in caplog.text
+    assert caught.value.error_code == "output_limit"
+    assert caught.value.finish_reason == "length"
+    assert caught.value.prompt_tokens == 200
+    assert caught.value.completion_tokens == 2048
+    assert "PRIVATE" not in str(caught.value)
 
 
-def test_unsupported_json_mode_is_visible_and_not_retried_unconstrained(endpoint, image, caplog):
+def test_unsupported_json_mode_propagates_once_without_private_provider_body(endpoint, image):
     _Endpoint.reply_status = 400
-    _Endpoint.reply = {"error": {"message": "response_format json_object unsupported"}}
-    assert OpenAIVlmObserver(endpoint, ServedModel(endpoint)).observe(image) is None
+    _Endpoint.reply = {"error": {"message": "PRIVATE_PROMPT response_format unsupported"}}
+    with pytest.raises(ModelServiceError) as caught:
+        OpenAIVlmObserver(endpoint, ServedModel(endpoint)).observe(image)
+    assert caught.value.error_code == "provider_rejected"
+    assert caught.value.http_status == 400
+    assert caught.value.request_policy["response_format"] == {"type": "json_object"}
     assert len(_Endpoint.received) == 1
     assert _Endpoint.received[0]["response_format"] == {"type": "json_object"}
-    assert "http_status=400" in caplog.text
-    assert "response_format=json_object" in caplog.text
+    assert "PRIVATE" not in str(caught.value)
+
+
+def test_shared_inspector_and_person_vision_propagate_operational_errors(endpoint, image):
+    from sentrix.infrastructure.media.person_vision_model import OpenAIPersonVision
+    from sentrix.infrastructure.media.photo_inspector import OpenAIPhotoInspector
+
+    with pytest.raises(ModelServiceError, match="provider_rejected"):
+        OpenAIPhotoInspector(endpoint, ServedModel(endpoint)).inspect(image, "衣着如何？")
+    with pytest.raises(ModelServiceError, match="provider_rejected"):
+        OpenAIPersonVision(endpoint, ServedModel(endpoint)).analyze_person_appearance(str(image))
+    assert len(_Endpoint.received) == 2
 
 
 def test_shared_json_protocol_preserves_inspection_image_order_and_person_appearance(
@@ -434,7 +494,8 @@ def test_shared_json_protocol_preserves_inspection_image_order_and_person_appear
     for body in _Endpoint.received:
         assert body["temperature"] == 0
         assert body["response_format"] == {"type": "json_object"}
-        assert body["max_tokens"] == 2048
+        assert "max_tokens" not in body
+        assert "max_completion_tokens" not in body
 
 
 def test_error_warning_does_not_echo_untrusted_response_metadata(endpoint, image, caplog):

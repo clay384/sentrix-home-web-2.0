@@ -676,3 +676,31 @@ def test_unknown_qa_set_is_rejected_before_scheduling(tmp_path):
     suites = _suites(tmp_path)
     with pytest.raises(InvalidRequestError, match="unknown qa_set"):
         suites.start_suite(_payload(qa_set="missing"))
+
+
+def test_explicit_rejudge_archives_and_replaces_old_cloud_budget_issue(tmp_path):
+    state = _judged_state()
+    item = state["items"][0]
+    issue = {
+        "version": 1,
+        "scope": "judge",
+        "kind": "output_limit",
+        "evidence": {"field": "finish_reason", "value": "length"},
+    }
+    item["judge_issue"] = issue
+    item["judge"] = {"score": None, "judge_status": "failed", "operational_issue": issue}
+    item["runtime_turns"][0]["task_judge"] = {"correct": None, "operational_issue": issue}
+    item["runtime_turns"][0]["evidence_judge"] = {"score": None, "operational_issue": issue}
+    http = FakeHttpClient(
+        [judge_reply('{"score":2,"reason":"正确"}'), judge_reply('{"actual_action":"answer"}')]
+    )
+    suites = _suites(tmp_path, store=FakeRunStore({"run-1": state}), writer=FakeResultWriter(), http=http)
+    suites.start_rejudge("run-1", {"system_prompt": "new"})
+    assert _wait_until(lambda: (state.get("rejudge") or {}).get("status") == "completed")
+    assert item["judge"]["score"] == 2
+    assert state["summary"]["judge_valid_count"] == 1
+    assert state["summary"]["operational"]["judge_incomplete_count"] == 0
+    assert item["judge_issue_history"][0]["issue"] == issue
+    assert (
+        item["runtime_turns"][0]["evidence_judge_history"][0]["evidence_judge"]["operational_issue"] == issue
+    )

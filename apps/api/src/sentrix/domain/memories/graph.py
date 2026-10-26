@@ -46,6 +46,7 @@ class GraphBuildStats:
     causal_candidate_pairs: int = 0
     causal_edges: int = 0
     causal_status: str = "not_configured"
+    causal_issues: tuple[Mapping[str, object], ...] = ()
     causal_seconds: float = 0.0
     keyframe_count: int = 0
     keyframe_temporal_edges: int = 0

@@ -72,3 +72,33 @@ def test_invalid_deployment_profile_rejected():
 
     with pytest.raises(ValueError):
         Settings(deployment_profile="unknown")
+
+
+def test_explicit_30_step_native_budget_is_reported_without_changing_legacy_defaults(tmp_path):
+    baseline = Settings(data_dir=tmp_path)
+    assert baseline.agent_max_steps == 8
+    settings = Settings(
+        data_dir=tmp_path,
+        agent_max_steps=30,
+        agent_max_tool_calls=28,
+        agent_max_search_calls=28,
+        agent_max_page_calls=28,
+        agent_max_inspections=28,
+        vlm_context_tokens=262144,
+        vlm_native_output_budget=True,
+        vlm_generation_profile="qwen35_nonthinking",
+    )
+    actual = settings.runtime_configuration()
+    assert actual["agent_max_steps"] == 30 and actual["agent_max_tool_calls"] == 28
+    assert actual["vlm_native_output_budget"] is True
+    assert actual["vlm_context_tokens"] == 262144
+    assert actual["vlm_generation_profile"] == "qwen35_nonthinking"
+
+
+def test_contradictory_agent_limits_are_rejected():
+    import pytest
+
+    with pytest.raises(ValueError, match="reserve"):
+        Settings(agent_max_steps=8, agent_max_tool_calls=30)
+    with pytest.raises(ValueError, match="agent_max_search_calls"):
+        Settings(agent_max_search_calls=7)

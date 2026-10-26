@@ -30,6 +30,7 @@ from sentrix.application.media.import_assets import (
     PreparedImage,
     StagedImport,
 )
+from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.media.models import AssetStatus, MediaType
 
 
@@ -358,3 +359,56 @@ def test_progress_counts_settled_media_and_keeps_batch_summary_running(album: Pa
     assert all(p.completed == p.imported + p.deduplicated + p.failed for p in observations)
     assert [p.completed for p in observations] == sorted(p.completed for p in observations)
     assert store.get("op").status == "running"  # route still has participants / insights to execute
+
+
+def test_album_summary_operational_failure_is_not_counted_as_success(album):
+    failure = ModelServiceError("output limit", error_code="output_limit")
+    calls = []
+
+    def summarize(event_id):
+        calls.append(event_id)
+        raise failure
+
+    importer = StubImporter()
+    with pytest.raises(ModelServiceError) as caught:
+        ImportAlbum(importer=importer, summarize_event=summarize).execute(
+            AlbumImportRequest(scope_id="album1", directory=str(album))
+        )
+    assert caught.value is failure
+    assert len(importer.finished) == 3
+    assert calls == ["evt_1"]
+
+
+def test_explicit_pipeline_summary_operational_failure_propagates():
+    from sentrix.application.media.import_album import AlbumProcessRequest, ProcessAlbumPipeline
+
+    asset = SimpleNamespace(
+        id="asset_one",
+        file_name="one.jpg",
+        scope_id="album1",
+        parent_asset_id=None,
+        status=AssetStatus.QUEUED,
+    )
+
+    class Assets:
+        def get(self, asset_id):
+            return asset if asset_id == asset.id else None
+
+        def update_status(self, _asset_id, status):
+            asset.status = status
+
+    class Importer(StubImporter):
+        def resume(self, source):
+            return StagedImport(asset=source, media_type=MediaType.IMAGE)
+
+    failure = ModelServiceError("time limit", error_code="time_limit")
+
+    def summarize(_event_id):
+        raise failure
+
+    with pytest.raises(ModelServiceError) as caught:
+        ProcessAlbumPipeline(importer=Importer(), assets=Assets(), summarize_event=summarize).execute(
+            AlbumProcessRequest(scope_id="album1", asset_ids=(asset.id,))
+        )
+    assert caught.value is failure
+    assert asset.status is AssetStatus.PROCESSED  # persisted media retained; batch operation failed

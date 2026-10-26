@@ -39,7 +39,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from sentrix.domain.assistant.models import ChatMessage, ChatRole
-from sentrix.domain.assistant.ports import ChatModel
+from sentrix.domain.assistant.ports import ChatModel, ModelServiceError
 from sentrix.domain.identity.family import (
     FAMILY_MEMBERSHIPS,
     SOURCE_MODEL,
@@ -190,6 +190,21 @@ class FamilyGraphService:
                 status=COMPLETED,
                 stage="done",
                 stats={**counts, "input_mode": INPUT_MODE},
+            )
+        except ModelServiceError as error:
+            issue = {
+                "error_code": error.error_code or "provider_unavailable",
+                "http_status": error.http_status,
+                "request_policy": dict(error.request_policy),
+                "finish_reason": error.finish_reason,
+                "prompt_tokens": error.prompt_tokens,
+                "completion_tokens": error.completion_tokens,
+            }
+            return self._family.update_run(
+                run_id,
+                status=FAILED,
+                error=f"模型运行失败（{issue['error_code']}），本次家庭关系推断未完成。",
+                stats={**run.stats, "operational_issue": issue},
             )
         except Exception as error:  # noqa: BLE001 —— 1.0 就是全兜，落 failed 而不是炸掉导入
             log.warning("家庭图谱推断失败（run=%s scope=%s）: %s", run_id, scope_id, error)

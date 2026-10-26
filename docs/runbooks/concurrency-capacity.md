@@ -30,11 +30,27 @@ lock, so adding Uvicorn workers is not a concurrency optimization. Each simulate
 client must have a separate SQLite/Qdrant copy and distinct ports. Record the
 actual client hardware; a Linux server run does not validate M4 Mac capacity.
 
-For the Mac deployment budget, set the existing `mac` deployment profile:
-legacy BGE-M3 + Chinese-CLIP, Agent 600 s, chat 180 s, CPU face inference.
+Use the existing `mac` deployment profile for legacy BGE-M3 + Chinese-CLIP
+and CPU face inference. This experiment explicitly overrides its old 600 s / 180 s
+Agent/chat limits: Agent wall time 3600 s, chat and visual HTTP timeout 1800 s,
+30 model steps, and 28 tool/search/page/inspection calls. The remaining two steps
+reserve answer and internal review. Record these overrides; the 200 client is
+not evidence that an M4 has passed the same load.
+
+Set `SENTRIX_VLM_CONTEXT_TOKENS=262144`,
+`SENTRIX_VLM_NATIVE_OUTPUT_BUDGET=true`, and
+`SENTRIX_VLM_GENERATION_PROFILE=qwen35_nonthinking`. The profile pins nonthinking,
+temperature 0.7, top-p 0.8, top-k 20, min-p 0, presence penalty 1.5 and seed 42.
+Native mode omits output token caps so the server's actual tokenizer determines
+the input-plus-output budget. The engine's `max_num_batched_tokens=2048` is a
+prefill scheduling chunk, **not** a 2048-token response or context limit.
+Likewise the synthetic native-window test's deliberate 512-token output is only
+its controlled measurement workload, not the real QA or build policy.
+
 Verify actual embedding model IDs/dimensions and face weights before building.
 Keep imported observation settings and library thread limits fixed throughout
-a comparison.
+a comparison. Every timeout, round limit or provider rejection remains an explicit
+operational issue to repair in a new experiment; it is not a wrong-answer score.
 
 ## Build and freeze memory once
 
@@ -46,7 +62,7 @@ the snapshot; preserve its PID record for the offline check.
 Prepare a JSON identity with these required fields:
 
 - `dataset_sha256`: full corpus identity, including referenced media.
-- `embedding`: scheme, model identities, dimensions and normalization version.
+- `embedding`: versioned semantic vector-space identity; never connection URLs.
 - `source_revision`: provenance of the build, not the candidate QA branch.
 - `observation_model_sha256`: exact weights used to produce observations.
 - `pipeline_config`: build policy plus hashes/version of memory-producing code.
@@ -155,3 +171,48 @@ separate counts from resource failures and answer-quality scores; missing traces
 produce unknown counts, not zero errors. Final evidence repeats the resource check.
 The selected Sentrix PID sample covers that API process only; embedding sidecars
 need their own PID evidence to describe full client CPU consumption.
+
+## Portable legacy embedding identity
+
+The accepted snapshot's `embedding` is `{ "identity_version": 1, "scheme": "legacy",
+"text": <BGE health.embedding_identity>, "visual": <CLIP health.embedding_identity> }`.
+Components include actual loaded weight hashes, tokenizer/config artifacts, dimensions,
+pooling/normalization/truncation policy and a digest of inference/preprocessing code.
+Health caches these at startup after requiring matching pre-load and post-load hashes;
+normal health requests never scan weights. CLIP records its actual model-name-mapped
+checkpoint, not merely the basename in `CHINESE_CLIP_CHECKPOINT`. Its preprocessing
+is 224x224 bicubic resize, RGB and the Chinese-CLIP normalization; it does not center crop.
+
+Put deployment-specific `text_embedder_url` and `legacy_clip_url` in expected-runtime
+alongside `embedding_scheme=legacy`. The CLI requires those addresses to agree with
+both Sentrix diagnostics and PhotoBench's `split_text_image` connection, then GETs
+the actual `/health` endpoints and requires exact semantic identity matches before QA.
+Different directories, hosts or ports can reuse the same vector space. Missing identity,
+changed weights/tokenizers/configuration/pooling/dimension are rejected, even if a
+sidecar reports the same model name. Device, PID/port, threads, parameter dtypes and
+library versions are execution evidence, not URLs or paths inside the compatibility key;
+cross-device vectors are not claimed to be bitwise identical.
+
+Existing schema-1/schema-2 snapshots keep their original verification behavior. A legacy
+connection-only identity can still verify its immutable historical snapshot, but cannot
+pass this CLI's semantic compatibility gate. Do not edit its manifest or silently rename
+its identity. Create a new accepted snapshot with verified semantic provenance. For a
+build made before additive health identity existed, retain its original implementation
+SHA and complete model artifact hashes, compare unchanged inference ASTs/configuration,
+and validate equivalent sidecar identity before approving a new snapshot. Restart sidecars
+only at an explicit deployment boundary; adding identity does not justify interrupting an
+active build.
+
+## 运行限制与质量评分分开
+
+PhotoBench 只有结构化证据才标记 `operational_issue`：输出、上下文、轮次、时间预算，供应商拒绝/不可用，以及资源错误。来源为模型调用的 typed error、HTTP状态、`finish_reason=length`，确切的终止原因，或工具返回的明确 `observation.operational_issue`。回答文本、普通模型工具参数错误和合法拒答不能触发这一分类。
+
+此类题目 `evaluation_status=not_evaluable`、`score=null`，不发云质量评分；有未知在途结果时继续保留 `outcome_unknown`，否则记录 `operational_failure`。本题后续对话轮次停止派发。恢复不重发已执行、预算失败或未知请求；轮询超时仅表示本地停止等待，远端回合是否完成仍未知，记录原turn ID。原始运行轨迹不修改，已有错误零分仅作为 `excluded_observation` 审计保留。质量、检索和架构归因分母排除此类样本，运行耗时/模型和工具调用计数不排除。
+
+云Judge自己的截断单列 `judge_issue`，Agent执行仍可完成；即便截断响应内的JSON合法也不能当有效评分。`operational.judge_incomplete_count/judge_by_kind` 与Agent的 `not_evaluable_count/by_kind` 分开。历史记录有原始 `finish_reason=length` 时同样按未完成投影，不触发请求。显式“全部重评分”仍可重评正常答案和失败Judge；它不会重新运行Agent，也不会把预算失败答案重新纳入质量成绩。
+
+容量CLI遇到运行限制或云Judge预算问题停止新派发，标为 `operational_issue` 的无效实验；真正资源故障仍记 `resource_failure`。这些失败都不会自动证明最大安全并发边界。先修复预算或供应商配置，再用新的独立运行ID实验；不要通过改旧结果或恢复未知请求绕过失败证据。
+
+建库验收额外要求：`scope_build.status=ready` 且所有构建相位均为done。流水线非2xx或资产failures、memory_graph缺失、非空causal_issues或causal_status=degraded、family_graph.run.status=failed或run.stats.operational_issue，均应拒绝验收。PB会保存原memory_graph/family_graph，返回partial/failed和incomplete。离线快照工具的完整性校验本身不证明业务建库成功；只有部署验收方核对原始run证据后才能写入accepted身份。
+
+CN-CLIP身份清单按实际包的模型导入覆盖 `modeling_bert.py` 和 `configuration_bert.py`；不存在的旧假定文件名不能用空hash替代。缺身份时推理服务可继续报告运行状态，但容量/基线认证必须拒绝，直至在部署边界重新加载并验证完整身份。

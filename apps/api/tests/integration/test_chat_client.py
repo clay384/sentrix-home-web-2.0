@@ -22,7 +22,8 @@ from sentrix.domain.assistant.ports import (
 )
 from sentrix.domain.assistant.tools import TOOL_SPECS, openai_tools
 from sentrix.infrastructure.assistant.chat_client import (
-    MAX_ANSWER_TOKENS,
+    CONTEXT_SAFETY_TOKENS,
+    DEFAULT_CONTEXT_TOKENS,
     PROMPT_COMPACTION_RATIO,
     TOKENS_PER_CHAR,
     TOOLS_TOKENS_PER_CHAR,
@@ -417,8 +418,8 @@ def test_the_output_budget_is_derived_from_the_real_window(server: str):
 
     prompt_tokens = OpenAIChatModel.estimate_prompt_tokens(messages_, TOOL_SPECS)
     sent = _Handler.received[0]["body"]["max_tokens"]
-    assert sent == min(MAX_ANSWER_TOKENS, CONTEXT_TOKENS - prompt_tokens)
-    assert sent != min(MAX_ANSWER_TOKENS, 4400 - prompt_tokens)
+    assert sent == CONTEXT_TOKENS - prompt_tokens - CONTEXT_SAFETY_TOKENS
+    assert sent != 4400 - prompt_tokens - CONTEXT_SAFETY_TOKENS
 
 
 def test_the_estimate_counts_the_tool_schemas(server: str):
@@ -467,7 +468,13 @@ def test_a_short_prompt_gets_the_full_answer_budget(server: str):
 
     chat_model(server).complete(messages(), TOOL_SPECS)
 
-    assert _Handler.received[0]["body"]["max_tokens"] == MAX_ANSWER_TOKENS
+    expected = (
+        DEFAULT_CONTEXT_TOKENS
+        - OpenAIChatModel.estimate_prompt_tokens(messages(), TOOL_SPECS)
+        - CONTEXT_SAFETY_TOKENS
+    )
+    assert _Handler.received[0]["body"]["max_tokens"] == expected
+    assert expected > 2048
 
 
 # ---- 生成被截断：它长得像 500，但不是服务故障 -------------------------------
@@ -636,3 +643,77 @@ def test_an_answer_without_any_channel_is_untouched(server: str):
 
     assert result.content == "  这是你要的海边照片。  "
     assert result.thought == ""
+
+
+def test_native_budget_uses_server_tokenizer_without_hidden_client_caps(server: str):
+    _Handler.response = reply("完整答案" * 1000)
+    _Handler.response["usage"] = {"prompt_tokens": 250000, "completion_tokens": 5000}
+    model = OpenAIChatModel(
+        server,
+        ServedModel(server, generation_profile="qwen35_nonthinking", native_output_budget=True),
+        context_tokens=262144,
+    )
+    # A conservative character estimate may exceed the window. Only the actual
+    # provider tokenizer can determine whether the template fits in native mode.
+    result = model.complete(
+        [ChatMessage(ChatRole.SYSTEM, "系统"), ChatMessage(ChatRole.USER, "问" * 400000)], ()
+    )
+    body = _Handler.received[0]["body"]
+    assert "max_tokens" not in body and "max_completion_tokens" not in body
+    assert body["temperature"] == 0.7 and body["presence_penalty"] == 1.5
+    assert body["seed"] == 42 and body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert result.completion_tokens == 5000
+    assert result.request_policy["output_budget"] == "native_remaining_context"
+    assert result.request_policy["max_model_len"] == 262144
+
+
+def test_native_length_is_explicit_limit_with_usage_not_a_valid_answer(server: str):
+    _Handler.response = reply("没有写完")
+    _Handler.response["choices"][0]["finish_reason"] = "length"
+    _Handler.response["usage"] = {"prompt_tokens": 260000, "completion_tokens": 2144}
+    model = OpenAIChatModel(server, ServedModel(server, native_output_budget=True), context_tokens=262144)
+    with pytest.raises(OutputTruncatedError) as error:
+        model.complete(messages(), ())
+    assert error.value.error_code == "output_limit"
+    assert error.value.finish_reason == "length"
+    assert error.value.completion_tokens == 2144
+    assert error.value.request_policy["max_output_tokens"] is None
+    assert len(_Handler.received) == 1
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 429, 503])
+def test_provider_rejection_keeps_typed_status_and_is_not_retried(server: str, status: int):
+    _Handler.status = status
+    _Handler.response = {"error": {"message": "request rejected"}}
+    with pytest.raises(ModelServiceError) as error:
+        chat_model(server).complete(messages(), ())
+    assert error.value.error_code == "provider_rejected"
+    assert error.value.http_status == status
+    assert len(_Handler.received) == 1
+
+
+def test_refreshed_model_transport_error_retains_native_policy(server: str, monkeypatch):
+    import httpx
+
+    served = ServedModel(server, native_output_budget=True)
+    served.current()
+    _Handler.served = ["new-model"]
+    client = OpenAIChatModel(server, served, context_tokens=262144)
+    original = client._post
+
+    def post(name, request_messages, specs):
+        if name == "new-model":
+            raise ModelServiceError(
+                "response timeout",
+                error_code="time_limit",
+                request_policy={"request_outcome_unknown": True},
+            ) from httpx.ReadTimeout("timeout")
+        return original(name, request_messages, specs)
+
+    monkeypatch.setattr(client, "_post", post)
+    with pytest.raises(ModelServiceError) as error:
+        client.complete(messages(), ())
+    assert error.value.error_code == "time_limit"
+    assert error.value.request_policy["max_model_len"] == 262144
+    assert error.value.request_policy["max_output_tokens"] is None
+    assert error.value.request_policy["request_outcome_unknown"] is True

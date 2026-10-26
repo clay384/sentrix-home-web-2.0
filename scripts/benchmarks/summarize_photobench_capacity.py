@@ -192,6 +192,7 @@ def _item_outcomes(items: Sequence[Mapping[str, Any]], available: bool) -> Json:
 
     agent_statuses = {
         "completed",
+        "operational_failure",
         "failed",
         "timeout",
         "outcome_unknown",
@@ -204,7 +205,12 @@ def _item_outcomes(items: Sequence[Mapping[str, Any]], available: bool) -> Json:
 
     def valid_score(item: Mapping[str, Any]) -> bool:
         score = _mapping(item.get("judge")).get("score")
-        return isinstance(score, (int, float)) and not isinstance(score, bool) and score in (0, 1, 2)
+        return (
+            not item.get("operational_issue")
+            and isinstance(score, (int, float))
+            and not isinstance(score, bool)
+            and score in (0, 1, 2)
+        )
 
     def missing_status(key: str, known: set[str]) -> int | None:
         return (
@@ -216,6 +222,7 @@ def _item_outcomes(items: Sequence[Mapping[str, Any]], available: bool) -> Json:
     return {
         "agent": {
             "execution_completed": count("execution_status", {"completed"}),
+            "not_evaluable": count("execution_status", {"operational_failure"}),
             "failed": count("execution_status", {"failed"}),
             "timeout": count("execution_status", {"timeout"}),
             "outcome_unknown": count("execution_status", {"outcome_unknown"}),
@@ -237,6 +244,30 @@ def _item_outcomes(items: Sequence[Mapping[str, Any]], available: bool) -> Json:
             "Execution completion does not imply a correct answer. Judge completion does not imply a valid "
             "answer-quality grade; null may also mean not applicable. Valid grades include zero."
         ),
+    }
+
+
+def operational_coverage(state: Mapping[str, Any]) -> Json:
+    """Only fixed classifications, never provider text or request paths."""
+    kinds = (
+        "output_limit",
+        "context_limit",
+        "step_limit",
+        "time_limit",
+        "provider_rejected",
+        "resource_error",
+    )
+    raw_items = state.get("items")
+    items = [item for item in raw_items if isinstance(item, Mapping)] if isinstance(raw_items, list) else []
+    agent = [_mapping(item.get("operational_issue")).get("kind") for item in items]
+    judge = [_mapping(item.get("judge_issue")).get("kind") for item in items]
+    return {
+        "not_evaluable_count": sum(kind in kinds for kind in agent) if isinstance(raw_items, list) else None,
+        "by_kind": {kind: agent.count(kind) if isinstance(raw_items, list) else None for kind in kinds},
+        "judge_incomplete_count": sum(kind in kinds for kind in judge)
+        if isinstance(raw_items, list)
+        else None,
+        "judge_by_kind": {kind: judge.count(kind) if isinstance(raw_items, list) else None for kind in kinds},
     }
 
 
@@ -336,6 +367,7 @@ def summarize_run(state: Mapping[str, Any], samples: Sequence[Mapping[str, Any]]
     resumed = state.get("snapshot_source") in {"resumed_run", "legacy_resume_current_config"}
     return {
         "schema_version": 1,
+        "operational": operational_coverage(state),
         "coverage": {
             "declared_qa_count": declared_count,
             "items_available": isinstance(raw_items, list),

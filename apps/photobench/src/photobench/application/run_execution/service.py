@@ -90,6 +90,11 @@ from photobench.domain.runs.execution import (
     summarize_progress,
     traces_from_progress,
 )
+from photobench.domain.runs.operational import (
+    exclude_operational_quality,
+    operational_counts,
+    operational_issue,
+)
 from photobench.domain.runtime.ports import (
     InferenceProvider,
     LifecycleProvider,
@@ -1688,7 +1693,9 @@ class RunExecution:
                 }
             )
         graph_result = result.get("memory_graph")
-        if isinstance(graph_result, dict) and graph_result.get("causal_status") == "degraded":
+        if isinstance(graph_result, dict) and (
+            graph_result.get("causal_status") == "degraded" or graph_result.get("causal_issues")
+        ):
             error_details.append(
                 {
                     "sample_id": "causal_graph",
@@ -1710,6 +1717,24 @@ class RunExecution:
                     "reason": "关键帧视觉近邻边不完整；其他记忆图边已保存，请检查视觉向量索引",
                 }
             )
+        family_graph = result.get("family_graph")
+        family_run = family_graph.get("run") if isinstance(family_graph, dict) else None
+        family_issue = (
+            (family_run.get("stats") or {}).get("operational_issue") if isinstance(family_run, dict) else None
+        )
+        family_failed = isinstance(family_run, dict) and (
+            family_run.get("status") == "failed" or family_issue
+        )
+        if family_failed:
+            error_details.append(
+                {
+                    "sample_id": "family_graph",
+                    "status": "failed",
+                    "error_type": "family_graph_error",
+                    "reason": "家庭图谱推断失败；本次记忆构建不可验收",
+                    **({"operational_issue": family_issue} if family_issue else {}),
+                }
+            )
         final_processed = len([item for item in assets if item.get("status") == "processed"])
         phase_result = {
             "total_seconds": round(float(timings.get("total") or time.perf_counter() - started), 3),
@@ -1729,11 +1754,14 @@ class RunExecution:
             "graph_build_seconds": timings.get("memory_graph", 0.0),
             "causal_graph_seconds": timings.get("causal_graph", 0.0),
             "memory_graph": result.get("memory_graph"),
+            "family_graph": family_graph,
             "error": (
                 f"{failed_count} 个资产流水线处理失败"
                 if failed_count
                 else "记忆图构建未完成"
                 if graph_result is None
+                else "家庭图谱推断失败"
+                if family_failed
                 else "因果边判定部分失败"
                 if error_details
                 else None
@@ -1936,7 +1964,7 @@ class RunExecution:
         ):
             restored["judge_status"] = "outcome_unknown"
             restored["judge_dispatch_status"] = "outcome_unknown"
-        return restored
+        return exclude_operational_quality(restored)
 
     def _phase_qa_eval(self, state: RunState, request: RunRequest) -> None:
         """1.0 ``:3103``：Agent 池 + 独立的 Judge 池。**Agent 一完成就立刻排进 Judge**。
@@ -2023,6 +2051,7 @@ class RunExecution:
                         "judge_skipped": sum(
                             item.get("judge_status") == "skipped" for item in items.values()
                         ),
+                        "operational": operational_counts(list(items.values())),
                         "qa_concurrency": concurrency,
                         "judge_concurrency": judge_concurrency if judge is not None else 0,
                         "agent_waiting": len(pending_rows)
@@ -2160,10 +2189,11 @@ class RunExecution:
                             }
                         except Exception as exc:  # noqa: BLE001
                             item = {"error": repr(exc), "failed": True, "execution_status": "failed"}
+                        item = exclude_operational_quality(item)
                         item.setdefault("qa_id", rows[index].get("qa_id"))
                         item["_index"] = index
                         item["judge_dispatch_status"] = "not_started"
-                        if item.get("failed") or item.get("error"):
+                        if item.get("operational_issue") or item.get("failed") or item.get("error"):
                             item["judge_status"] = "skipped"
                         else:
                             item.setdefault("judge_status", "pending")
@@ -2204,14 +2234,15 @@ class RunExecution:
         failed = [
             item
             for item in state.get("items") or []
-            if item.get("execution_status") in {"failed", "timeout", "outcome_unknown"}
+            if item.get("execution_status") in {"failed", "timeout", "outcome_unknown", "operational_failure"}
             or item.get("judge_status") == "outcome_unknown"
         ]
         phase_result = {
             "total_seconds": round(time.perf_counter() - started, 1),
             "qa_concurrency": concurrency,
             "failed_count": len(failed),
-            "error": f"{len(failed)} 道题执行失败、超时或结果待确认" if failed else None,
+            "operational": operational_counts(state.get("items") or []),
+            "error": f"{len(failed)} 道题执行异常、预算受限或结果待确认" if failed else None,
             "error_details": [
                 {
                     "sample_id": item.get("qa_id") or "QA",
@@ -2220,8 +2251,12 @@ class RunExecution:
                     else item.get("execution_status") or "failed",
                     "error_type": "judge_outcome_unknown"
                     if item.get("judge_status") == "outcome_unknown"
-                    else "agent_error",
-                    "reason": str(item.get("error") or "request outcome unknown; not replayed"),
+                    else (item.get("operational_issue") or {}).get("kind", "agent_error"),
+                    "reason": str(
+                        item.get("error")
+                        or (item.get("operational_issue") or {}).get("kind")
+                        or "request outcome unknown; not replayed"
+                    ),
                 }
                 for item in failed
             ],
@@ -2272,6 +2307,7 @@ class RunExecution:
         for name in PASSTHROUGH_FIELDS:
             if row.get(name) is not None:
                 item[name] = row[name]
+        active_turn_id: str | None = None
         try:
             item["execution_status"] = "started"
             conversation_id = str(
@@ -2297,7 +2333,9 @@ class RunExecution:
                 turn_id = str(started_turn.get("turn_id") or "")
                 if not turn_id:
                     raise RuntimeError(f"2.0 发起回合没有返回 turn_id：{started_turn}")
+                active_turn_id = turn_id
                 polled = self._await_turn(turn_id, request)
+                active_turn_id = None
                 last_result = polled.get("result") or {}
                 last_progress = polled.get("public_progress") or []
                 turn_records.append(
@@ -2349,6 +2387,8 @@ class RunExecution:
                         "trace_bundle": dict(last_result.get("trace") or {}),
                     }
                 )
+                if operational_issue({"runtime_turns": turn_records}):
+                    break  # Do not send later conversation turns after an evidenced execution limit.
             # 轨迹：从**同一条事件流**投影出两条（见 ``traces_from_progress``）。
             # 读侧的 ``bind_tool_calls_to_model_rounds`` 早就在等它们了。
             tool_trace, execution_trace = traces_from_progress(turn_records)
@@ -2457,6 +2497,7 @@ class RunExecution:
             item["attribution"] = derive_attribution(item)
             item["execution_status"] = "completed"
         except Exception as exc:  # noqa: BLE001 —— 1.0 ``:3571``
+            item["error_type"] = type(exc).__name__
             message = str(exc).lower()
             # **判据比 1.0 多一条 ``isinstance``**：1.0 ``:3573`` 只按文案里的
             # ``timed out`` / ``timeout`` 判，而它自己的 ``TimeoutError`` 文案是
@@ -2464,6 +2505,14 @@ class RunExecution:
             # 记成 ``failed``。这是照搬会连带搬过来的缺陷，不是风格差异。
             timed_out = isinstance(exc, TimeoutError) or "timed out" in message or "timeout" in message
             item["execution_status"] = "timeout" if timed_out else "failed"
+            if isinstance(exc, TimeoutError) and active_turn_id:
+                item["execution_status"] = "outcome_unknown"
+                item["request_failure"] = {
+                    "phase": "turn_polling",
+                    "turn_id": active_turn_id,
+                    "cause_type": "TimeoutError",
+                    "automatic_replay": False,
+                }
             if isinstance(exc, RequestOutcomeUnknownError):
                 item["execution_status"] = "outcome_unknown"
                 item["request_failure"] = exc.facts
@@ -2481,7 +2530,7 @@ class RunExecution:
                     "wall_clock_ms": round((time.perf_counter() - started) * 1000, 1),
                 }
             )
-        return item
+        return exclude_operational_quality(item)
 
     def _await_turn(self, turn_id: str, request: RunRequest) -> dict[str, Any]:
         """1.0 ``wait_for_assistant_turn``（``:909``）的 2.0 版。

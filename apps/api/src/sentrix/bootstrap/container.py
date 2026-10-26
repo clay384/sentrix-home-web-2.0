@@ -288,7 +288,11 @@ class Container:
         lexical = SqliteLexicalIndex(database, observations, assets=assets, places=asset_places)
         # 对话与视觉是**同一个端点**（8100），所以共用同一个探测。分两个实例会让同一个
         # 进程里存两份可能不一致的答案，还要多探一轮。
-        served_model = ServedModel(settings.vlm_base_url)
+        served_model = ServedModel(
+            settings.vlm_base_url,
+            generation_profile=settings.vlm_generation_profile,
+            native_output_budget=settings.vlm_native_output_budget,
+        )
         # 单个并发槽的上下文窗口——**问端点**，理由与上面那个模型名同一条：窗口是
         # **部署事实**，配置里那个 6144 是照部署的某一次实测抄的，部署一改它就过期。
         # 读不到才退回配置值（那说明端点没在正常服务，此时保守值不添乱）。

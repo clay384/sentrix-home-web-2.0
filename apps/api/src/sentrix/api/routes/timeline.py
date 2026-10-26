@@ -319,6 +319,7 @@ def process_album_pipeline(
                 causal_candidate_pairs=graph.causal_candidate_pairs,
                 causal_edges=graph.causal_edges,
                 causal_status=graph.causal_status,
+                causal_issues=[dict(issue) for issue in graph.causal_issues],
                 causal_seconds=graph.causal_seconds,
                 keyframe_count=graph.keyframe_count,
                 keyframe_temporal_edges=graph.keyframe_temporal_edges,

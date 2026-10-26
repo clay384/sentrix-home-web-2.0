@@ -529,3 +529,28 @@ def test_confirms_visual_only_is_false_when_a_face_is_bound(bundle):
     outcome = run(bundle, RecordingInspector(), RecordingCrops(), question="有吗")
 
     assert outcome.observation["confirms_visual_only"] is False
+
+
+@pytest.mark.parametrize(
+    "code,status", [("provider_rejected", 429), ("output_limit", 200), ("time_limit", None)]
+)
+def test_operational_visual_error_reaches_tool_evidence_without_becoming_an_answer(bundle, code, status):
+    from sentrix.domain.assistant.ports import ModelServiceError
+
+    class LimitedInspector(RecordingInspector):
+        def inspect(self, *args, **kwargs):
+            raise ModelServiceError(
+                "private provider response",
+                error_code=code,
+                http_status=status,
+                request_policy={"max_model_len": 262144, "max_output_tokens": None},
+                finish_reason="length" if code == "output_limit" else None,
+            )
+
+    outcome = run(bundle, LimitedInspector(), RecordingCrops(), asset_handle="photo_1", question="看到了什么")
+    assert outcome.failure_reason == code
+    assert outcome.observation["operational_issue"]["kind"] == code
+    assert outcome.observation["operational_issue"]["http_status"] == status
+    assert outcome.observation["operational_issue"]["request_policy"]["max_model_len"] == 262144
+    assert outcome.model_visible["error"] == code
+    assert "private provider response" not in str(outcome.model_visible)

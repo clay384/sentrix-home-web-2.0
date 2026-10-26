@@ -973,7 +973,10 @@ def test_a_turn_that_never_reaches_a_terminal_state_fails_its_item():
     execution, _client, _writer, _lifecycle, _albums = _execution(client=client)
     state = execution.execute(_request(turn_timeout=0))
     item = state["items"][0]
-    assert item["execution_status"] == "timeout"
+    assert item["execution_status"] == "outcome_unknown"
+    assert item["operational_issue"]["kind"] == "time_limit"
+    assert item["request_failure"]["automatic_replay"] is False
+    assert item["judge"]["score"] is None
     assert "did not complete" in item["error"]
     assert state["run_valid"] is False
 
@@ -1848,3 +1851,128 @@ def test_cancel_during_judge_checkpoint_retains_missing_score_and_backlog(monkey
     assert state.data["items"][0]["judge_status"] == "pending"
     assert state.data["items"][0]["judge_dispatch_status"] == "not_started"
     assert state.data["phases"]["qa_eval"]["progress"]["judge_waiting"] == 1
+
+
+@pytest.mark.parametrize(
+    "code", ["output_limit", "context_limit", "time_limit", "provider_rejected", "resource_error"]
+)
+def test_structured_model_limit_stops_next_turn_and_judge_and_is_not_replayed(monkeypatch, code):
+    first = _completed_turn()
+    first["result"]["trace"] = {
+        "model_calls": [{"error_code": code, "http_status": 400 if code == "provider_rejected" else None}]
+    }
+    row = {
+        **_rows()[0],
+        "conversation": [
+            {"message": "first", "expected_action": "answer"},
+            {"message": "second", "expected_action": "answer"},
+        ],
+    }
+    client = FakeSentrixClient(asset_polls=_polls(_assets()), turns={"turn_1": [first]})
+    execution, *_ = _execution(client=client, albums=FakeAlbums(manifest=_manifest(), qa_rows=[row]))
+    monkeypatch.setattr(
+        execution,
+        "_judge",
+        SimpleNamespace(judge_item=lambda *_: pytest.fail("operational item sent to Judge")),
+    )
+    monkeypatch.setattr(execution, "_probe_endpoint_health", lambda: None)
+    state = RunState({"scope_id": "s", "album_id": ALBUM})
+    execution._phase_qa_eval(state, _request())
+    item = state.data["items"][0]
+    assert len(item["runtime_turns"]) == 1
+    assert item["operational_issue"]["kind"] == code
+    assert item["judge_status"] == "skipped"
+    assert item["judge"]["score"] is None
+    assert state.data["phases"]["qa_eval"]["status"] == "partial"
+    assert state.data["phases"]["qa_eval"]["progress"]["operational"]["not_evaluable_count"] == 1
+    monkeypatch.setattr(execution, "_evaluate_one", lambda *_: pytest.fail("operational QA replayed"))
+    resumed = RunState({"scope_id": "s", "album_id": ALBUM})
+    execution._phase_qa_eval(resumed, _request(prior_items=[item]))
+    assert resumed.data["items"][0]["operational_issue"] == item["operational_issue"]
+
+
+@pytest.mark.parametrize("judge_status", ["pending", "completed", "running", "outcome_unknown"])
+def test_resume_historical_budget_zero_never_dispatches_agent_or_judge(monkeypatch, judge_status):
+    execution, *_ = _execution()
+    monkeypatch.setattr(execution, "_evaluate_one", lambda *_: pytest.fail("QA replayed"))
+    monkeypatch.setattr(
+        execution, "_judge", SimpleNamespace(judge_item=lambda *_: pytest.fail("Judge replayed"))
+    )
+    item = {
+        "qa_id": "q1",
+        "execution_status": "completed",
+        "judge_status": judge_status,
+        "judge_dispatch_status": "not_started",
+        "termination_reason": "step_budget_exhausted",
+        "judge": {"score": 0},
+    }
+    state = RunState({"scope_id": "s", "album_id": ALBUM})
+    execution._phase_qa_eval(state, _request(prior_items=[item]))
+    result = state.data["items"][0]
+    assert result["judge"]["score"] is None
+    assert result["judge_status"] == (
+        "outcome_unknown" if judge_status in {"running", "outcome_unknown"} else "skipped"
+    )
+    assert result["judge"]["excluded_observation"]["score"] == 0
+
+
+@pytest.mark.parametrize("issue_source", ["family_failed", "family_typed_issue", "causal_issues"])
+def test_explicit_build_cannot_accept_failed_graph_work_even_with_all_assets_processed(issue_source):
+    issue = {
+        "error_code": "output_limit",
+        "finish_reason": "length",
+        "request_policy": {"max_model_len": 262144},
+    }
+    graph = {"scope_id": "s", "causal_status": "ok"}
+    family = {"run": {"status": "completed", "stats": {}}}
+    if issue_source == "family_failed":
+        family["run"]["status"] = "failed"
+    elif issue_source == "family_typed_issue":
+        family["run"]["stats"]["operational_issue"] = issue
+    else:
+        graph["causal_issues"] = [issue]
+    client = FakeSentrixClient(
+        explicit_pipeline=True,
+        assets=_assets(),
+        import_result={"imported": 2, "asset_ids": ["asset_a", "asset_b"], "failures": []},
+        pipeline_result={"processed": 2, "failures": [], "memory_graph": graph, "family_graph": family},
+    )
+    execution, *_ = _execution(client=client)
+    state = execution.execute(_request(mode="build"))
+    phase = state["phases"]["pipeline_processing"]
+    assert phase["status"] == "partial"
+    assert phase["processed_asset_count"] == 2
+    assert state["scope_build"]["status"] == "incomplete"
+    assert phase["memory_graph"] == graph
+    assert phase["family_graph"] == family
+    assert phase["error_details"][0]["error_type"] == (
+        "causal_inference_error" if issue_source == "causal_issues" else "family_graph_error"
+    )
+    if issue_source == "family_typed_issue":
+        assert phase["error_details"][0]["operational_issue"] == issue
+
+
+@pytest.mark.parametrize("http_failure", [False, True])
+def test_vlm_build_failure_cannot_be_accepted_in_response_or_http_error(monkeypatch, http_failure):
+    client = FakeSentrixClient(
+        explicit_pipeline=True,
+        assets=_assets(),
+        import_result={"imported": 2, "asset_ids": ["asset_a", "asset_b"], "failures": []},
+        pipeline_result={
+            "processed": 1,
+            "failures": [{"file_name": "a.jpg", "reason": "output_limit"}],
+            "memory_graph": {"scope_id": "s"},
+        },
+    )
+    if http_failure:
+
+        def reject(**_):
+            raise RuntimeError('HTTP 502: {"code":"output_limit","message":"模型输出预算耗尽"}')
+
+        monkeypatch.setattr(client, "process_pipeline", reject)
+    execution, *_ = _execution(client=client)
+    state = execution.execute(_request(mode="build"))
+    phase = state["phases"]["pipeline_processing"]
+    assert phase["status"] == ("failed" if http_failure else "partial")
+    assert state["scope_build"]["status"] == "incomplete"
+    assert "output_limit" in (state["fatal_error"] if http_failure else phase["error_details"][0]["reason"])

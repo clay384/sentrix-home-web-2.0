@@ -410,15 +410,16 @@ class VlmObserver(Protocol):
 
 - 返回固定七字段的 `ObservationSemantics`；
 - 不猜姓名、不输出坐标、不做关系推断；
-- 失败（端点不可达、非 JSON、读图失败）返回 `None`，不抛；
+- 非 JSON 与读图失败保留内容降级并返回 `None`；端点/运行失败显式抛错；
 - 最多 3 次调用：首轮 → 缺自然语言补全 → 出现拉丁文则中文化；
-- 与照片问询、人物视觉共用 `chat_json`：固定 `temperature=0`、标准 `response_format={"type":"json_object"}`，输出预算 2048 不变；
-- 不支持 JSON 模式不重试或回退为自由生成；截断、解析失败与 HTTP 错误返回 `None`，warning 记录端点、模型及状态，不记录输入图片、提示词或回复正文；
+- 与照片问询、人物视觉共用 `chat_json`：复用 `ServedModel.generation_parameters()` 的显式采样策略、标准 `response_format={"type":"json_object"}`；省略输出预算字段，由后端计算原生剩余窗口（含图片与模板输入）；
+- 运行拒绝、网络/超时和 finish_reason=length 抛带 error_code/http_status/request_policy 的 ModelServiceError；结果未知单列且不重试。内容 JSON 无法解析仍返回 None 并记录不含正文的质量降级；图片流水线会把操作失败资产标为 failed，视频关键帧传播相同错误；
+- 不支持 JSON 模式不重试或回退为自由生成；错误与质量 warning 均不记录输入图片、提示词或回复正文；
 - 单次超时 `SENTRIX_VLM_TIMEOUT_S`（默认 180s）。
 
 **替换验收**
 
-- [ ] 坏图、非 JSON、端点 500 三种失败都返回 `None`，导入继续；
+- [ ] 坏图、非 JSON 返回 `None`；端点 500、超时和截断作为 typed 操作失败传播，流水线标 failed 并给出原因；
 - [ ] 观察结果能落 `observations`，且 `source_type="import"`；
 - [ ] 视频关键帧走同一条观察链；
 - [ ] 用 20 张黄金图对比 `caption/activity/place/people` 的非空率。

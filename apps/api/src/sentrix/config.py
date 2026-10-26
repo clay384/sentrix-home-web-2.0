@@ -58,6 +58,15 @@ class Settings(BaseSettings):
                     object.__setattr__(self, key, value)
         return self
 
+    @model_validator(mode="after")
+    def validate_agent_limits(self) -> Settings:
+        if self.agent_max_tool_calls > self.agent_max_steps - 2:
+            raise ValueError("agent tool budget must reserve two model steps for answer and review")
+        for key in ("agent_max_search_calls", "agent_max_page_calls", "agent_max_inspections"):
+            if getattr(self, key) > self.agent_max_tool_calls:
+                raise ValueError(f"{key} cannot exceed agent_max_tool_calls")
+        return self
+
     def runtime_configuration(self) -> dict[str, Any]:
         """Non-secret startup facts, never a benchmark policy."""
         return {
@@ -71,6 +80,15 @@ class Settings(BaseSettings):
                 "wemm_url",
                 "agent_wall_time_s",
                 "chat_timeout_s",
+                "vlm_timeout_s",
+                "vlm_context_tokens",
+                "vlm_generation_profile",
+                "vlm_native_output_budget",
+                "agent_max_steps",
+                "agent_max_tool_calls",
+                "agent_max_search_calls",
+                "agent_max_page_calls",
+                "agent_max_inspections",
                 "face_providers",
                 "retinaface_providers",
             )
@@ -108,7 +126,16 @@ class Settings(BaseSettings):
     text_embedder_timeout_s: float = 10.0
     # 单个 Agent 回合的墙钟上限。180 是 153（GPU）的默认；Mac/CPU 上 4 并发时
     # 一次 inspect_photo 就可能 30-60s，正常回合会被截成 timeout，可放宽到 600。
-    agent_wall_time_s: float = 180.0
+    agent_wall_time_s: float = Field(default=180.0, gt=0)
+    # Explicit execution limits are deployment facts, not answer-quality verdicts.
+    agent_max_steps: int = Field(default=8, ge=3)
+    agent_max_tool_calls: int = Field(default=6, ge=0)
+    agent_max_search_calls: int = Field(default=1, ge=0)
+    agent_max_page_calls: int = Field(default=2, ge=0)
+    agent_max_inspections: int = Field(default=3, ge=0)
+    vlm_generation_profile: Literal["legacy", "qwen35_nonthinking"] = "legacy"
+    # vLLM computes remaining context using its actual tokenizer and chat template.
+    vlm_native_output_budget: bool = False
 
     # **模型名不在这里。** 8100 上跑 llama.cpp 还是 vLLM、名字叫什么，由部署方决定，而且
     # 会在 2.0 运行期间被换掉——2026-09-24 实测：8100 从 llama.cpp 换成 vLLM，2.0 配的

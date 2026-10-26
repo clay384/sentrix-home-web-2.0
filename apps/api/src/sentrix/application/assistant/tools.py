@@ -39,7 +39,7 @@ from sentrix.application.retrieval.retrieve_evidence import EvidenceRequest, Ret
 from sentrix.application.retrieval.retrieve_graph import graph_direction, graph_intent
 from sentrix.domain.assistant.evidence_ledger import EvidenceType
 from sentrix.domain.assistant.models import Attachment
-from sentrix.domain.assistant.ports import PersonDirectory, ResultSetRepository
+from sentrix.domain.assistant.ports import ModelServiceError, PersonDirectory, ResultSetRepository
 from sentrix.domain.assistant.result_set import ResultSet, ResultSetEntry
 from sentrix.domain.assistant.tools import MAX_DELIVERED_PHOTOS
 from sentrix.domain.identity.ports import FaceRepository, PersonCropRenderer
@@ -735,6 +735,27 @@ class AssistantToolbox:
                 faces=[dataclasses.asdict(row) for row in manifest],
                 target_person=target_person,
                 crop=crop_path,
+            )
+        except ModelServiceError as error:
+            code = error.error_code or "provider_unavailable"
+            issue = {
+                "kind": code,
+                "error_code": code,
+                "http_status": error.http_status,
+                "request_policy": dict(error.request_policy),
+                "request_outcome_unknown": error.request_policy.get("request_outcome_unknown"),
+                "finish_reason": error.finish_reason,
+                "prompt_tokens": error.prompt_tokens,
+                "completion_tokens": error.completion_tokens,
+            }
+            return ToolOutcome(
+                observation={"asset_id": asset_id, "operational_issue": issue, "failure_reason": code},
+                model_visible={
+                    "error": code,
+                    "message": "图片模型调用受到运行限制，本次没有获得可用的复核结果。",
+                },
+                failure_reason=code,
+                blocks=EvidenceType.VISUAL_OBSERVATION,
             )
         finally:
             # 临时件由调用方删（``render_person_crop`` 的契约）。

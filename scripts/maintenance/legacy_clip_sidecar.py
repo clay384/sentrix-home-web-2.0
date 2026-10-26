@@ -24,9 +24,15 @@ import argparse
 import contextlib
 import json
 import os
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.maintenance.embedding_identity import clip_identity, implementation_sha, runtime_versions  # noqa: E402
 
 DIMENSION = 768
 DEFAULT_CHECKPOINT = Path.home() / ".cache" / "clip" / "clip_cn_vit-l-14.pt"
@@ -36,6 +42,9 @@ _preprocess = None
 _device = "cpu"
 _error = ""
 _lock = threading.Lock()
+_identity: dict[str, object] | None = None
+_identity_error = ""
+_identity_runtime: dict[str, object] = {}
 
 
 def _pick_device() -> str:
@@ -51,9 +60,22 @@ def _pick_device() -> str:
     return "cpu"
 
 
+def _current_identity(checkpoint: Path, model_name: str) -> dict[str, object]:
+    from cn_clip.clip import utils
+
+    spec = {**utils._MODEL_INFO[model_name], "checkpoint_filename": utils._MODELS[model_name][1]}
+    return clip_identity(
+        checkpoint,
+        model_name,
+        Path(utils.__file__).resolve().parents[1],
+        spec,
+        implementation_sha(Path(__file__), ["_normalize", "_embed_image", "_embed_query", "Handler.do_POST"]),
+    )
+
+
 def _load() -> None:
     """启动时加载一次。失败保留 ``_error``，``/health`` 报 error，进程不退出。"""
-    global _model, _preprocess, _device, _error
+    global _model, _preprocess, _device, _error, _identity, _identity_error, _identity_runtime
     checkpoint = Path(os.getenv("CHINESE_CLIP_CHECKPOINT", str(DEFAULT_CHECKPOINT))).expanduser()
     model_name = os.getenv("CHINESE_CLIP_MODEL", "ViT-L-14")
     _device = _pick_device()
@@ -61,7 +83,14 @@ def _load() -> None:
         _error = f"checkpoint missing: {checkpoint}"
         return
     try:
+        import torch
         from cn_clip.clip import load_from_name
+
+        before = None
+        try:
+            before = _current_identity(checkpoint, model_name)
+        except Exception as error:  # noqa: BLE001 - identity failure does not alter embedding behavior
+            _identity_error = f"{type(error).__name__}: {error}"
 
         # cn_clip 按 ``download_root`` 找 ``clip_cn_vit-l-14.pt``。指向已有权重的
         # 目录，避免它尝试联网下载。
@@ -74,6 +103,20 @@ def _load() -> None:
         _model = model
         _preprocess = preprocess
         _error = ""
+        _identity_runtime = {
+            "device": _device,
+            "threads": torch.get_num_threads(),
+            "parameter_dtypes": sorted({str(p.dtype) for p in _model.parameters()}),
+            "versions": runtime_versions(["torch", "torchvision", "Pillow", "cn-clip"]),
+        }
+        try:
+            after = _current_identity(checkpoint, model_name)
+            if before is None or before != after:
+                raise ValueError("embedding artifacts changed or were unidentified during model load")
+            _identity, _identity_error = after, ""
+        except Exception as error:  # noqa: BLE001 - loaded model can serve; capacity identity remains unavailable
+            _identity = None
+            _identity_error = f"{type(error).__name__}: {error}"
     except Exception as error:  # noqa: BLE001 - 启动失败要让 /health 说出来
         _error = f"{type(error).__name__}: {error}"
 
@@ -141,6 +184,12 @@ class Handler(BaseHTTPRequestHandler):
                     "dimension": DIMENSION,
                     "device": _device,
                     "error": _error,
+                    "embedding_identity": _identity,
+                    "embedding_identity_error": _identity_error,
+                    "embedding_runtime": {
+                        **_identity_runtime,
+                        "listen_port": getattr(self.server, "server_port", None),
+                    },
                 },
             )
         elif self.path == "/stats":

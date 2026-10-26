@@ -26,17 +26,40 @@ def config_fixture():
         "embedding_scheme": "legacy",
         "agent_wall_time_s": 600,
         "chat_timeout_s": 180,
+        "text_embedder_url": "http://127.0.0.1:8101",
+        "legacy_clip_url": "http://127.0.0.1:8103",
     }
-    embedding = {
+    connection = {
         "mode": "split_text_image",
         "text_url": "http://127.0.0.1:8101",
         "image_url": "http://127.0.0.1:8103",
     }
+    embedding = {"identity_version": 1, "scheme": "legacy"}
+    health = {}
+    for role, model, dimension in (("text", "BAAI/bge-m3", 1024), ("visual", "ViT-L-14", 768)):
+        body = {
+            "identity_version": 1,
+            "kind": role,
+            "model": model,
+            "dimension": dimension,
+            "weights": {"sha": "weights"},
+            "tokenizer": {"sha": "tokens"},
+            "config": {"sha": "config"},
+            "algorithm": {"revision": "test-v1"},
+        }
+        component = {**body, "semantic_sha256": capacity.embedding_identity.canonical_sha(body)}
+        embedding[role] = component
+        health[role] = {
+            "status": "ok",
+            "model": model,
+            "dimension": dimension,
+            "embedding_identity": component,
+        }
     config = {
         "runtime_config": {
             "sentrix_url": "http://127.0.0.1:18191",
             "model_base_url": "http://192.168.0.100:18104/v1",
-            "embedding": embedding,
+            "embedding": connection,
         }
     }
     diag = {"runtime_configuration": {**runtime, "vlm_base_url": "http://192.168.0.100:18104/v1"}}
@@ -48,6 +71,7 @@ def config_fixture():
         window=262144,
         expected_runtime=runtime,
         embedding=embedding,
+        embedding_health=health,
     )
     return config, diag, models, kw
 
@@ -233,6 +257,10 @@ def test_main_resume_observes_known_run_without_replaying_and_rejects_identity_c
             return json.dumps(diag)
         if url.endswith("/models"):
             return json.dumps(models)
+        if url.endswith(":8101/health"):
+            return json.dumps(kw["embedding_health"]["text"])
+        if url.endswith(":8103/health"):
+            return json.dumps(kw["embedding_health"]["visual"])
         if "/qa-dataset?" in url:
             return json.dumps({"items": rows()})
         if "/runs/known" in url:
@@ -580,3 +608,55 @@ def test_absent_item_trace_keeps_error_count_unknown(tmp_path, monkeypatch):
     assert report["model"]["calls_recorded"] is None
     assert report["model"]["call_outcomes"]["errors"] is None
     assert report["coverage"]["runtime_turns"]["recorded"] is None
+
+
+def test_semantic_identity_allows_new_ports_only_when_real_connections_agree():
+    config, diag, models, kw = config_fixture()
+    original = json.loads(json.dumps(kw["embedding"]))
+    for setting, field, port in (
+        ("text_embedder_url", "text_url", 18101),
+        ("legacy_clip_url", "image_url", 18103),
+    ):
+        url = f"http://127.0.0.1:{port}"
+        kw["expected_runtime"][setting] = url
+        diag["runtime_configuration"][setting] = url
+        config["runtime_config"]["embedding"][field] = url
+    capacity.validate_configuration(config, diag, models, **kw)
+    assert kw["embedding"] == original
+    config["runtime_config"]["embedding"]["text_url"] = "http://127.0.0.1:8101"
+    with pytest.raises(ValueError, match="connection"):
+        capacity.validate_configuration(config, diag, models, **kw)
+
+
+def test_capacity_rejects_legacy_connection_only_and_missing_health_identity():
+    config, diag, models, kw = config_fixture()
+    legacy = {**kw, "embedding": config["runtime_config"]["embedding"]}
+    with pytest.raises(ValueError, match="semantic"):
+        capacity.validate_configuration(config, diag, models, **legacy)
+    kw["embedding_health"]["text"].pop("embedding_identity")
+    with pytest.raises(ValueError, match="missing or incompatible"):
+        capacity.validate_configuration(config, diag, models, **kw)
+
+
+@pytest.mark.parametrize("kind", ["output_limit", "context_limit", "step_limit", "provider_rejected"])
+def test_evidenced_operational_issue_is_not_quality_failure_or_capacity_boundary(kind):
+    observed = state("completed_with_errors")
+    observed["items"] = [
+        {"operational_issue": {"kind": kind, "evidence": {"field": "error_code", "value": kind}}}
+    ]
+    assert capacity.run_problem(observed, 64, 2, 4) == "operational_issue"
+    assert not capacity.resource_failure(observed)
+    counts = capacity.summarize_run(observed)["operational"]
+    assert counts["not_evaluable_count"] == 1
+    assert counts["by_kind"][kind] == 1
+    assert "capacity_boundary_confirmed" not in counts
+
+
+def test_progress_cloud_budget_failure_stops_dispatch_without_marking_agent_resource_failure():
+    observed = state()
+    observed["phases"]["qa_eval"]["progress"]["operational"] = {
+        "not_evaluable_count": 0,
+        "judge_incomplete_count": 1,
+    }
+    assert capacity.run_problem(observed, 64, 2, 4) == "operational_issue"
+    assert not capacity.resource_failure(observed)

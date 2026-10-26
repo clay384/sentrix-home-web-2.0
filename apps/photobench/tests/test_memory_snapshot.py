@@ -300,3 +300,21 @@ def test_restore_cli_publishes_and_offline_verifies_receipt(tmp_path, memory):
         [*command, "verify-restored", *options], check=True, capture_output=True, text=True
     )
     assert json.loads(verified.stdout)["status"] == "verified"
+
+
+def test_legacy_connection_identity_retains_exact_snapshot_verification(tmp_path, memory):
+    data, pid, old = memory
+    legacy = {
+        **old,
+        "embedding": {
+            "mode": "split_text_image",
+            "text_url": "http://localhost:8101",
+            "image_url": "http://localhost:8103",
+        },
+    }
+    frozen = tmp_path / "legacy-v2"
+    snapshot.create(data, frozen, legacy, pid)
+    assert snapshot.verify(frozen, legacy)["identity"] == legacy
+    changed = {**legacy, "embedding": {**legacy["embedding"], "text_url": "http://localhost:18101"}}
+    with pytest.raises(ValueError, match="incompatible"):
+        snapshot.verify(frozen, changed)

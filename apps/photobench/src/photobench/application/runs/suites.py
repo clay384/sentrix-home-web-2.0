@@ -61,6 +61,7 @@ from photobench.domain.results.ports import RunResultWriter, RunStore
 from photobench.domain.runs import analysis
 from photobench.domain.runs.analysis import now_iso
 from photobench.domain.runs.execution import safe_slug
+from photobench.domain.runs.operational import incomplete_judge_issue, operational_issue
 from photobench.domain.runtime.ports import LifecycleProvider, RunRuntimeSnapshot, TelemetryProvider
 from photobench.domain.sentrix.ports import SentrixClient
 
@@ -583,6 +584,8 @@ class RunSuites:
         """
         targets: list[tuple[int, int | None]] = []
         for item_index, item in enumerate(items):
+            if operational_issue(item):
+                continue
             if item.get("question") is None or item.get("reference_answer") is None or "answer" not in item:
                 continue
             turns = item.get("runtime_turns") or []
@@ -647,6 +650,19 @@ class RunSuites:
             }
             for index in sorted({item_index for item_index, _ in targets}):
                 item = state["items"][index]
+                if previous_issue := item.pop("judge_issue", None):
+                    item.setdefault("judge_issue_history", []).append(
+                        {"archived_at": now_iso(), "issue": previous_issue}
+                    )
+                for field in ("task_judge", "evidence_judge"):
+                    previous_observation = item.get(field)
+                    if isinstance(previous_observation, dict) and incomplete_judge_issue(
+                        previous_observation
+                    ):
+                        item.setdefault(f"{field}_history", []).append(
+                            {"archived_at": now_iso(), field: previous_observation}
+                        )
+                        item[field] = {"score": None, "correct": None, "reason": "pending_rejudge"}
                 prior = item.get("judge")
                 if prior:
                     item.setdefault("judge_history", []).append({"archived_at": now_iso(), "judge": prior})
@@ -658,6 +674,8 @@ class RunSuites:
                             turn.setdefault(f"{field}_history", []).append(
                                 {"archived_at": now_iso(), field: prior_turn}
                             )
+                            if isinstance(prior_turn, dict) and incomplete_judge_issue(prior_turn):
+                                turn[field] = {"score": None, "correct": None, "reason": "pending_rejudge"}
                     turn["judge"] = {
                         "score": None,
                         "reason": "",

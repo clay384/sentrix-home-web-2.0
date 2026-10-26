@@ -273,6 +273,16 @@ def _turn_trace(session: _Session, planned: PlannerResult | None) -> Mapping[str
     requirements = [dict(item) for item in ledger.as_payload()]
     return {
         "model_calls": [*(planned.model_calls if planned else ()), *session.model_calls],
+        "tool_calls": [
+            {
+                "tool": item.tool,
+                "call_id": item.call_id,
+                "status": item.status,
+                "failure_reason": item.failure_reason,
+                "observation": dict(item.observation),
+            }
+            for item in state.records
+        ],
         "planner": {
             # ``fallback_reason`` 为空 = 规划器正常答了；非空 = 它退回了规则/失败。
             # ``planned`` 为空 = 压根没走到规划（政策拒答那条提前 return 了）。
@@ -304,6 +314,10 @@ def _turn_trace(session: _Session, planned: PlannerResult | None) -> Mapping[str
             "inspection_calls": state.inspection_calls,
             "max_steps": state.profile.max_steps,
             "max_tool_calls": state.profile.max_tool_calls,
+            "max_search_calls": state.profile.max_search_calls,
+            "max_page_calls": state.profile.max_page_calls,
+            "max_inspections": state.profile.max_inspections,
+            "wall_time_s": state.profile.wall_time_s,
         },
         "delivered": [item.asset_id for item in session.delivered.items],
         "retrieved_candidates": list(state.retrieved_candidates),
@@ -710,12 +724,25 @@ class RunTurn:
                 prompt_tokens=reply.prompt_tokens,
                 completion_tokens=reply.completion_tokens,
                 finish_reason=reply.finish_reason,
+                request_policy=dict(reply.request_policy),
                 tool_calls=[call.name for call in reply.tool_calls],
                 tool_argument_parse_facts=facts,
             )
             return reply
         except Exception as error:
             record.update(error_type=type(error).__name__, error=str(error))
+            if isinstance(error, ModelServiceError):
+                for key in (
+                    "error_code",
+                    "http_status",
+                    "request_policy",
+                    "finish_reason",
+                    "prompt_tokens",
+                    "completion_tokens",
+                ):
+                    value = getattr(error, key)
+                    if value is not None:
+                        record[key] = value
             raise
         finally:
             record["duration_ms"] = round((time.perf_counter() - started) * 1000, 1)
@@ -1217,7 +1244,14 @@ class RunTurn:
             return False
         session.judged = True
         state.model_steps += 1
-        verdict = self._judge.review(query=state.question, answer=answer, transcript=messages)
+        verdict = self._judge.review(
+            query=state.question,
+            answer=answer,
+            transcript=messages,
+            complete=lambda review_messages, specs: self._complete_recorded(
+                session, review_messages, specs, call_type="faithfulness"
+            ),
+        )
         if verdict.faithful or not verdict.truth_problems:
             return False
         # 1.0 ``runtime.py:2786-2788``：判过不实就先把标记落下来。**标记在「判不实」那一刻

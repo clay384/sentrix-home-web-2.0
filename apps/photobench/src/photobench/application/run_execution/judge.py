@@ -51,6 +51,7 @@ from photobench.domain.runs.judge import (
     parse_judge_json,
     thinking_kwargs,
 )
+from photobench.domain.runs.operational import exclude_operational_quality, operational_issue
 
 #: 1.0 的四个模块级常量（``:206-229``），同样由环境变量覆盖。
 JUDGE_RETRY_ATTEMPTS = max(1, int(os.environ.get("PHOTOBENCH_JUDGE_RETRY_ATTEMPTS", "6")))
@@ -70,6 +71,35 @@ JUDGE_REQUEST_INTERVAL_SECONDS = max(
 InlineImages = Callable[
     [str, Sequence[Mapping[str, Any]], Mapping[str, list[dict[str, Any]]]], list[dict[str, Any]]
 ]
+
+
+def _truncated_judge_response(raw: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    choices = raw.get("choices") or []
+    if not choices or not isinstance(choices[0], Mapping) or choices[0].get("finish_reason") != "length":
+        return None
+    # A complete-looking JSON body is still incomplete when the provider reports length.
+    return {
+        "score": None,
+        "correct": None,
+        "actual_action": None,
+        "judge_status": "failed",
+        "reason": "judge_output_limit",
+        "operational_issue": {
+            "version": 1,
+            "scope": "judge",
+            "kind": "output_limit",
+            "evidence": {
+                "source": "judge_response",
+                "field": "finish_reason",
+                "value": "length",
+                "max_tokens": payload.get("max_tokens"),
+            },
+        },
+        "input": dict(payload),
+        "raw_response": dict(raw),
+        "raw_text": str((choices[0].get("message") or {}).get("content") or ""),
+        "attempts": [{"input": dict(payload), "raw_response": dict(raw)}],
+    }
 
 
 class JudgeRunner:
@@ -327,6 +357,12 @@ class JudgeRunner:
             for consistency_attempt in range(2):
                 raw, request_attempts = self._request(payload)
                 retry_attempts += request_attempts
+                if truncated := _truncated_judge_response(raw, payload):
+                    return {
+                        **truncated,
+                        "judge_retry_attempts": retry_attempts,
+                        "attempts": [*attempts, *truncated["attempts"]],
+                    }
                 text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
                 parsed = parse_judge_json(text)
                 normalization = normalize_judge_score(parsed.get("score"))
@@ -439,6 +475,8 @@ class JudgeRunner:
         }
         try:
             raw, _ = self._request(payload)
+            if truncated := _truncated_judge_response(raw, payload):
+                return truncated
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
             parsed = parse_judge_json(text)
             actual = (
@@ -521,6 +559,8 @@ class JudgeRunner:
         }
         try:
             raw, _ = self._request(payload)
+            if truncated := _truncated_judge_response(raw, payload):
+                return truncated
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
             parsed = parse_judge_json(text)
             applicable = parsed.get("applicable") is not False
@@ -582,6 +622,8 @@ class JudgeRunner:
         (b) 2.0 的题目字段已经在 ``_evaluate_one`` 里透传进 item（``PASSTHROUGH_FIELDS``），
         所以 GT 侧只从 ``row`` 取 ``conversation``。
         """
+        if operational_issue(item):
+            return exclude_operational_quality(item)
         started = time.perf_counter()
         conversation = row.get("conversation") or []
         reference = str(item.get("reference_answer") or row.get("answer") or "")
@@ -613,7 +655,9 @@ class JudgeRunner:
                 reference=turn_reference,
                 conversation=conv_ctx,
             )
-            if record["task_judge"].get("judge_status") == "outcome_unknown":
+            if record["task_judge"].get("judge_status") == "outcome_unknown" or record["task_judge"].get(
+                "operational_issue"
+            ):
                 break  # No new sub-requests after an uncertain dispatch for this item.
             # 同一轮的回答质量与图片证据两个调用**并行**（1.0 的注释）。
             should_judge_evidence = (
@@ -659,6 +703,7 @@ class JudgeRunner:
 
             if any(
                 (record.get(key) or {}).get("judge_status") == "outcome_unknown"
+                or (record.get(key) or {}).get("operational_issue")
                 for key in ("judge", "evidence_judge")
             ):
                 break
@@ -690,6 +735,23 @@ class JudgeRunner:
             for value in all_judge_outputs
         ):
             judge_terminal_status = "outcome_unknown"
+        judge_issue = next(
+            (
+                value["operational_issue"]
+                for value in all_judge_outputs
+                if isinstance(value, dict) and value.get("operational_issue")
+            ),
+            None,
+        )
+        if judge_issue:
+            item["judge_issue"] = judge_issue
+            judge = {
+                "score": None,
+                "reason": "judge_output_limit",
+                "judge_status": "failed",
+                "operational_issue": judge_issue,
+                "excluded_observation": judge,
+            }
         item.update(
             {
                 "judge": judge or {"score": None, "reason": "not_applicable"},

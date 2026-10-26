@@ -40,6 +40,25 @@ class ModelServiceError(RuntimeError):
     旁边：实现端口的适配器抛它，用端口的用例 catch 它，两边都只依赖 domain。
     """
 
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        error_code: str | None = None,
+        http_status: int | None = None,
+        request_policy: Mapping[str, Any] | None = None,
+        finish_reason: str | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.http_status = http_status
+        self.request_policy = dict(request_policy or {})
+        self.finish_reason = finish_reason
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+
 
 class PromptTooLongError(ModelServiceError):
     """提示词大到**写不完一次工具调用**，请求根本没有发出去。
