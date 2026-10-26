@@ -57,6 +57,36 @@ export function itemDebugCalls(item: unknown): Dict[] {
   );
 }
 
+/**
+ * 同一个 `step_id` 可能有多条调用：prompt 压缩后会重试，失败的那次也留在
+ * `debug_calls` 里。**优先取最后一次成功（有 response）的那条**——工具动作是它
+ * 产生的；拿失败的那条会显示一个与工具调用对不上的输入。
+ */
+function preferredCall(calls: Dict[], stepId: string, callType: string): Dict | null {
+  let fallback: Dict | null = null;
+  let preferred: Dict | null = null;
+  for (const call of calls) {
+    if (String(call.step_id || "") !== stepId) continue;
+    if (String(call.call_type || "agent") !== callType) continue;
+    fallback = call;
+    if (call.status !== "error" && call.response) preferred = call;
+  }
+  return preferred ?? fallback;
+}
+
+/** 一轮里每个 agent `step_id` 最终生效的那条调用（供工具绑定用）。 */
+function preferredAgentCallMap(calls: Dict[]): Map<string, Dict> {
+  const map = new Map<string, Dict>();
+  for (const call of calls) {
+    if (String(call.call_type || "agent") !== "agent") continue;
+    const stepId = String(call.step_id || "");
+    if (!stepId) continue;
+    const current = map.get(stepId);
+    if (!current || (call.status !== "error" && call.response)) map.set(stepId, call);
+  }
+  return map;
+}
+
 /** 一次 Agent Loop 调用对应的完整模型输入/输出；按轮 + `step_id` 精确匹配。 */
 export function debugCallForCall(item: unknown, call: unknown): Dict | null {
   const c = dict(call);
@@ -66,14 +96,7 @@ export function debugCallForCall(item: unknown, call: unknown): Dict | null {
   const turn =
     runtimeTurns(item).find((entry) => Number(entry.index) === turnIndex) ?? runtimeTurns(item)[turnIndex];
   if (!turn) return null;
-  const wantedType = String(c.call_type || "agent");
-  return (
-    turnDebugCalls(turn).find(
-      (entry) =>
-        String(entry.step_id || "") === stepId &&
-        String(entry.call_type || "agent") === wantedType,
-    ) ?? null
-  );
+  return preferredCall(turnDebugCalls(turn), stepId, String(c.call_type || "agent"));
 }
 
 /**
@@ -98,11 +121,7 @@ export function debugCallForStep(turn: unknown, step: unknown): Dict | null {
   }
   if (type === "model_action") {
     const stepId = String(s.parent_step_id ?? payload.parent_step_id ?? "");
-    return (
-      calls.find(
-        (call) => String(call.call_type) === "agent" && String(call.step_id || "") === stepId,
-      ) ?? null
-    );
+    return preferredCall(calls, stepId, "agent");
   }
   if (type === "judge") {
     const callId = String(s.call_id ?? payload.call_id ?? "");
@@ -146,6 +165,7 @@ export function turnTimeline(item: unknown, turnIndex: number): TraceTimelineEnt
   const calls = turnDebugCalls(turn);
   const entries: TraceTimelineEntry[] = [];
   if (calls.length) {
+    const preferred = preferredAgentCallMap(calls);
     for (const call of calls) {
       const callType = String(call.call_type || "agent");
       const key = `call-${turnIndex}-${String(call.seq ?? entries.length)}-${String(call.step_id || "")}`;
@@ -155,8 +175,12 @@ export function turnTimeline(item: unknown, turnIndex: number): TraceTimelineEnt
         entries.push({ kind: "judge", key, call });
       } else {
         entries.push({ kind: "model", key, call });
-        for (const [toolIndex, tool] of toolsForDebugCall(item, turnIndex, call).entries()) {
-          entries.push({ kind: "tool", key: `${key}-tool-${toolIndex}`, tool });
+        // 工具只挂在「最终生效」的那条调用下；失败的重试也保留输入/输出，
+        // 但不重复显示同一批工具结果。
+        if (preferred.get(String(call.step_id || "")) === call) {
+          for (const [toolIndex, tool] of toolsForDebugCall(item, turnIndex, call).entries()) {
+            entries.push({ kind: "tool", key: `${key}-tool-${toolIndex}`, tool });
+          }
         }
       }
     }
