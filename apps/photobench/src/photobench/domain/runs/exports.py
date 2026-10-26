@@ -249,11 +249,11 @@ def export_sft(
                 if not isinstance(step, Mapping) or step.get("type") != "model":
                     continue
                 prompt = step.get("prompt")
-                response = step.get("raw_full") or step.get("raw")
-                if not prompt or not isinstance(response, str) or not response.strip():
+                legacy_response = step.get("raw_full") or step.get("raw")
+                if not prompt or not isinstance(legacy_response, str) or not legacy_response.strip():
                     continue
                 messages = list(prompt) if isinstance(prompt, list) else []
-                messages.append({"role": "assistant", "content": response})
+                messages.append({"role": "assistant", "content": legacy_response})
                 samples.append(
                     {
                         "qa_id": qa_id,
