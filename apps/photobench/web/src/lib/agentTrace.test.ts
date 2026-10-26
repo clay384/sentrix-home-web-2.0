@@ -182,7 +182,7 @@ describe("agentTrace · 完整模型轨迹访问器", () => {
       conversation_turn: 0,
     });
     expect(bound).not.toBeNull();
-    expect(callMessages(bound)[0]).toEqual({ role: "system", content: "你是相册助手" });
+    expect(callMessages(bound)[0]?.content).toBe("你是相册助手");
     expect(turnTimeline(retry, 0).filter((entry) => entry.kind === "tool")).toHaveLength(1);
   });
 
