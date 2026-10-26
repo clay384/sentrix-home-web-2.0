@@ -1422,11 +1422,25 @@ class RunTurn:
         }:
             for fact in typed:
                 haystacks = [str(fact.value), *[str(value) for value in fact.scope.values()]]
-                if all(any(str(number) in haystack for haystack in haystacks) for number in numbers):
+                if all(
+                    any(
+                        (str(int(number)) if float(number).is_integer() else str(number)) in haystack
+                        for haystack in haystacks
+                    )
+                    for number in numbers
+                ):
                     return True
             return False
         if claim.value_type is RequirementValueType.PLACE:
-            return any(fact.scope.get("place") and fact.scope["place"] in claim.text for fact in typed)
+            claim_text = claim.text.replace(" ", "").lower()
+            return any(
+                bool(fact.scope.get("place"))
+                and (
+                    fact.scope["place"].replace(" ", "").lower() in claim_text
+                    or claim_text in fact.scope["place"].replace(" ", "").lower()
+                )
+                for fact in typed
+            )
         return True
 
     def _review_with_verification(
