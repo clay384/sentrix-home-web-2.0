@@ -374,9 +374,7 @@ def test_include_debug_records_every_planner_attempt():
     """重试的每一次都要留：只留最后一次就看不到模型第一次错在哪。"""
     model = ScriptedPlannerModel(["我不会规划。", declaration("photo_set")])
 
-    result = GoalPlanner(model).declare(
-        "给我看看海边的照片", scope_id=SCOPE, include_debug=True
-    )
+    result = GoalPlanner(model).declare("给我看看海边的照片", scope_id=SCOPE, include_debug=True)
 
     assert result.ok
     assert len(result.debug_calls) == 2
