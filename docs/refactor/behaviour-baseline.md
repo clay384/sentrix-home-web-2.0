@@ -140,7 +140,7 @@
 |---|---|---|---|---|
 | §3.1 | 检索 preview 的字段 | `_RETRIEVAL_PREVIEW_KEEP` 7 个字段 + 复合 `evidence_summary`（caption → activity → place → objects[:8] → clothing[:8] → 文字：…，单段 120 字 / 整串 300 字上限） | **补齐同一套**，另加 `media_kind` / `level` / 顶层 `can_inspect` | 2.0 只暴露了 `caption` 一个列，而 `Observation` 上有八个。`objects` / `clothing` / `ocr_text` 恰恰是模型要调 `inspect_photo` / `read_photo_text` 才拿得到的东西——精读从 0.97 次/题涨到 3.4 次/题，撞上 `max_inspections = 3` 之后成片被拒（拒绝率 1.4% → 26.7%） |
 | §3.1 | preview 的 `level` | `exact` / `strong` / `approximate`，判据是「是不是事件成员」（`tools.py:1770`） | **同三个词，判据换成 `fusion.evidence_class_for`**：`anchor → exact`、`semantic → strong`、`expander → approximate` | 1.0 那个判据在 2.0 没有对应物；而 2.0 的融合层一直在算 `evidence_class`，只是 `RetrieveEvidence` 转 `EvidenceHit` 时把它丢了 |
-| §3.1 | preview 每页条数 | `preview[:5]` | **12**（`ResultSet.PAGE_SIZE`，等于 `MAX_SEARCH_LIMIT`） | 1.0 那个 5 是它自己的上限裁切；2026-10-27 由 6 调到 12：检索上限就是 12，一页给全后模型不再需要翻页（6 张一页时几乎每题多一次 `get_result_page` 模型步，Mac 实测约 16.9s） |
+| §3.1 | preview 每页条数 | `preview[:5]` | **6**（`ResultSet.PAGE_SIZE`，等于 `MAX_SEARCH_LIMIT`） | 1.0 的 5 是它自己的上限裁切。2026-10-27 最终定 6：153 的 30 题扫描（6/8/10/12）时间 15.7→20.1s、质量在噪声内；153 487 验证 judge 0.901→1.058、墙钟 22→16s、翻页 0 |
 | §3.1 | preview 缺失时的键 | 键恒在、值取空 | **同** | 空值的意思是「这张图没记录到」，缺键会让模型以为链路坏了 |
 | §3.2 | 每一转发几份工具契约 | JIT，`LITE_TOOL_SCHEMAS` 每工具 <40 token，单步 150–300 token | **JIT**，`ToolSpec.brief`（≤40 字）+ `jit.select_tools`。实测第一转 863 字符 / 检索后 1839 / 交付题 1246（全量是 5509） | 2.0 原先每转发全量八份完整 schema = 5509 字符 ≈ 2704 token；1.0 的真实 `prompt_tokens` 中位数是 1437 |
 | §3.2 | JIT 剪枝的效力 | **只剪提示词渲染**，准入白名单是 `profile.tools`——模型看不见但仍能调 | **剪掉即不能调**（原生 `tools` 字段既是广告也是约束） | 所以 2.0 的规则一律**比 1.0 保守**：只剪「现在根本用不上」的。`get_result_page` 只要已有结果集就一直在——`photo_set` 销账不等于候选看完了（一页 6 条、结果集最多 12 条） |
@@ -971,7 +971,7 @@ Agent和Judge仍使用独立线程池，协调器等待任一池完成即提交�
 | P2 | 发给视觉模型的图片长边 | 原图，无上限 | **1280**（`vlm_observer.IMAGE_MAX_SIDE`），人物预览先缩再画框 | 3264px 原图观察 4,260 prompt token / 48s，1280 为 1,445 / 24s；精读 ~4,100 → ~1,295；观察/精读语义抽检 8/8 一致 |
 | P3 | 人物瞬间抽取并发 | 串行 | **4**（`settings.album_workers`） | 建库 `person_insights` 418s → 236s；已确认人物的 moments 条数不变 |
 | P4 | 派生索引补写 | `already_indexed` 直接返回 `mirrored=True` | 从权威向量**幂等补写**镜像 | 嵌入式 Qdrant 写失败只记警告；旧路径永远补不回来（158 实测缺 344 条，`_staleness_reason` 全局比较，拖累所有 scope） |
-| P5 | 检索结果集容量 | 12 | **24**（`DEFAULT_SEARCH_LIMIT`/`MAX_SEARCH_LIMIT`）；`total` 进 `model_visible` | 让 RRF 的前 24 名有用武之地；不分页的两页候选只能看到前 12。`total` 明写「这是本次检索的候选数，不是相册真实数量」 |
-| P6 | 翻页语义 | 游标式第 2 页 = 剩余候选，工具随时可调 | **游标式第 2 页（第 13 张起直到结束）**；候选 ≤12 张时工具不出现；**成功翻一次后 JIT 剪掉**；page<2 直接拒绝 | 158 实测 15 次翻页里 14 次要的是第 1 页，每次白花一个约 22s 的模型步。翻页最多只需一次，由代码收口而不是靠模型自觉 |
+| P5 | 检索结果集容量 | 12 | **6**（生产固定：`DEFAULT_SEARCH_LIMIT`/`MAX_SEARCH_LIMIT` = `PAGE_SIZE`）；`total` 进 `model_visible` | 30 题扫描 6/8/10/12：时间随 N 上升、质量在噪声内；153 487 验证 6 张 judge +0.157、墙钟 −27%。`total` 明写「这是本次检索的候选数，不是相册真实数量」 |
+| P6 | 翻页语义 | 游标式第 2 页 = 剩余候选，工具随时可调 | **一次性翻页**：只在「检索 `has_more` 且本回合未成功翻过页」时出现，成功一次后 JIT 剪掉；生产 6/6 下 `has_more` 恒假，工具不出现；page<2 直接拒绝 | 158 实测 15 次翻页里 14 次要的是第 1 页，每次白花一个约 22s 的模型步。153 487：8.10→3.36 agent 步/题，翻页 0 |
 | P7 | 旧 preview 压缩 | 全文保留到回合结束 | **不做压缩**；改由一次性翻页从源头消除重复调用 | 实测压缩会让模型反复重读（单题 4–5 次翻页、254s vs 118s）；两页内容互补，压缩必然丢信息。一次成功翻页后工具消失，重复调用不再可能 |
 | P8 | planner 提示词 | 1,435 tok | **868 tok（−40%）** | 删掉 JSON Schema 已强制的字段形状/scope_id 禁令（合计 ~106 tok），合并证据声明规则 777→287 tok；value_type 判定表 465 tok 原样保留 |

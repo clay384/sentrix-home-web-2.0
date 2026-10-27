@@ -25,7 +25,7 @@ from sentrix.application.retrieval.retrieve_text_ann import RetrieveTextAnn
 from sentrix.application.retrieval.retrieve_visual import RetrieveVisual
 from sentrix.domain.assistant.evidence_ledger import EvidenceType
 from sentrix.domain.assistant.models import PersonProfile, PersonRelationship
-from sentrix.domain.assistant.result_set import ResultSet
+from sentrix.domain.assistant.result_set import PAGE_SIZE, ResultSet
 from sentrix.domain.identity.models import ENTITY_STATUS_CONFIRMED, FACE_VALIDITY_VERIFIED
 from sentrix.domain.media.models import Asset, AssetStatus, GpsPoint, MediaType, Observation
 from sentrix.domain.places.aliases import EMPTY_ALIASES
@@ -306,7 +306,7 @@ def test_paging_requires_a_known_result_set(toolbox):
 
 def test_paging_returns_the_rest_of_the_result_set(toolbox, migrations_ready_db, tmp_path):
     build, result_sets = toolbox
-    filler = _seed_plain_assets(migrations_ready_db, tmp_path, 18)
+    filler = _seed_plain_assets(migrations_ready_db, tmp_path, 2 * PAGE_SIZE - 2)
     result_sets.add(
         ResultSet(
             id="rs_big",
@@ -325,8 +325,8 @@ def test_paging_returns_the_rest_of_the_result_set(toolbox, migrations_ready_db,
     assert outcome.model_visible["page"] == 2
     assert outcome.model_visible["result_set_id"] == "rs_big"
     handles = [item["handle"] for item in outcome.model_visible["preview"]]
-    # 20 张候选：第 2 页从第 13 张开始，到第 20 张结束。
-    assert handles == [f"photo_{i}" for i in range(13, 21)]
+    # 两页候选：第 2 页从第 PAGE_SIZE+1 张开始，到结尾。
+    assert handles == [f"photo_{i}" for i in range(PAGE_SIZE + 1, 2 * PAGE_SIZE + 1)]
 
 
 def test_paging_a_single_page_set_is_refused(toolbox):
@@ -342,7 +342,7 @@ def test_paging_a_single_page_set_is_refused(toolbox):
 
 def test_a_page_past_the_end_is_empty_not_an_error(toolbox, migrations_ready_db, tmp_path):
     build, result_sets = toolbox
-    filler = _seed_plain_assets(migrations_ready_db, tmp_path, 18)
+    filler = _seed_plain_assets(migrations_ready_db, tmp_path, 2 * PAGE_SIZE - 2)
     result_sets.add(
         ResultSet(
             id="rs_big",
@@ -487,7 +487,7 @@ def test_the_preview_carries_the_media_kind(toolbox, migrations_ready_db, tmp_pa
     )
 
     build, result_sets = toolbox
-    filler = _seed_plain_assets(migrations_ready_db, tmp_path, 18)
+    filler = _seed_plain_assets(migrations_ready_db, tmp_path, 2 * PAGE_SIZE - 2)
     result_sets.add(
         ResultSet(
             id="rs_kind",
@@ -558,7 +558,7 @@ def test_the_preview_marks_a_video_keyframe_as_such(toolbox, migrations_ready_db
     )
 
     build, result_sets = toolbox
-    filler = _seed_plain_assets(migrations_ready_db, tmp_path, 18)
+    filler = _seed_plain_assets(migrations_ready_db, tmp_path, 2 * PAGE_SIZE - 2)
     result_sets.add(
         ResultSet(
             id="rs_frame",
@@ -584,7 +584,7 @@ def test_the_preview_carries_the_relevance_level(toolbox, migrations_ready_db, t
     「是不是事件成员」；2.0 的判据在 ``fusion.evidence_class_for``。
     """
     build, result_sets = toolbox
-    filler = _seed_plain_assets(migrations_ready_db, tmp_path, 18)
+    filler = _seed_plain_assets(migrations_ready_db, tmp_path, 2 * PAGE_SIZE - 2)
     result_sets.add(
         ResultSet(
             id="rs_level",

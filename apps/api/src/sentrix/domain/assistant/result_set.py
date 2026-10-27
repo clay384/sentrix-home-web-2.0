@@ -3,7 +3,7 @@
 对应 1.0 ``agent_runtime/result_set.py``。三条不变量原样保留，它们在 1.0 里被证明是
 对的：
 
-1. **每页 12 张、1-based、无游标、``page_size`` 硬顶 12**；
+1. **每页 ``PAGE_SIZE`` 张（生产固定 6）、1-based、无游标、``page_size`` 硬顶 ``PAGE_SIZE``**；
 2. **``handle`` 是全局序号**（第 2 页从 ``photo_13`` 开始），跨页稳定——模型只需要记住
    ``photo_N``，分页不会让同一个 handle 指向不同的图；
 3. **``asset_id`` 只存在于结果集里**，不进模型上下文。模型看到的是 handle，真正可交付
@@ -20,10 +20,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 
-#: 每页 12 张。**结果集上限是 24**（``tools.DEFAULT_SEARCH_LIMIT``）：第 1 页前 12 张，
-#: 第 2 页从第 13 张开始直到结束。翻页工具是一次性的（成功一次后 JIT 剪掉），
-#: 所以两页就是模型能看到的上限。
-PAGE_SIZE = 12
+#: 生产固定 6 张：检索上限（``DEFAULT_SEARCH_LIMIT``）也是 6，一次给全，
+#: ``has_more`` 恒为假，翻页工具不会出现。分页代码保留给未来提高检索上限的场景。
+PAGE_SIZE = 6
 
 
 @dataclass(frozen=True, slots=True)

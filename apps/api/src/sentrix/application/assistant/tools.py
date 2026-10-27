@@ -55,8 +55,8 @@ log = logging.getLogger("sentrix.assistant.tools")
 # 1.0 ``tools.py:2125`` 的 ``arguments.get("question") or "请描述这张照片"``。
 DEFAULT_INSPECT_QUESTION = "请描述这张照片"
 
-DEFAULT_SEARCH_LIMIT = 24
-MAX_SEARCH_LIMIT = 24
+DEFAULT_SEARCH_LIMIT = 6
+MAX_SEARCH_LIMIT = 6
 
 # 复合摘要的三个上限，逐条取自 1.0 ``agent_runtime/tools.py:371-414`` 的
 # ``_observation_summary``（单段文字 120 字、整串 300 字、列表取前 8 项）。
@@ -362,8 +362,8 @@ class AssistantToolbox:
         if page_no < 2:
             return _failure(
                 "first_page_already_shown",
-                "第 1 页就是 search_memories 返回的那 12 张，内容相同。"
-                "翻页请用 page=2（第 13 张起，直到最后）。",
+                "第 1 页就是 search_memories 返回的那 6 张，内容相同。"
+                "翻页请用 page=2（第 7 张起，直到最后）。",
             )
         return self._page_outcome(result_set, page_no=page_no)
 

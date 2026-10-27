@@ -45,17 +45,17 @@ describe("结果集缩略图墙", () => {
     );
 
     const images = screen.getAllByRole("img");
-    expect(images).toHaveLength(12);
+    expect(images).toHaveLength(6);
     expect(images[0].getAttribute("src")).toBe(
       "/api/v1/assistant/result-sets/rs_1/photo?handle=photo_1&scope_id=album1",
     );
-    expect(images[11].getAttribute("src")).toContain("handle=photo_12");
+    expect(images[5].getAttribute("src")).toContain("handle=photo_6");
 
-    fireEvent.click(screen.getByRole("button", { name: "还有 1 张 · 看下一页" }));
+    fireEvent.click(screen.getByRole("button", { name: "还有 7 张 · 看下一页" }));
     expect(onNextPage).toHaveBeenCalledTimes(1);
   });
 
-  it("页号取自 get_result_page 的事件文案，翻到第 2 页只展示 photo_13", () => {
+  it("页号取自 get_result_page 的事件文案，第 2 页从 photo_7 开始", () => {
     render(
       <ResultSetWall
         events={[
@@ -79,8 +79,10 @@ describe("结果集缩略图墙", () => {
     );
 
     const images = screen.getAllByRole("img");
-    expect(images).toHaveLength(1);
-    expect(images[0].getAttribute("src")).toContain("handle=photo_13");
+    // 13 张候选、每页 6 张：第 2 页展示 photo_7..photo_12。
+    expect(images).toHaveLength(6);
+    expect(images[0].getAttribute("src")).toContain("handle=photo_7");
+    expect(images[5].getAttribute("src")).toContain("handle=photo_12");
     expect(screen.queryByRole("button", { name: /看下一页/ })).toBeNull();
   });
 });

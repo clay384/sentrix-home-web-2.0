@@ -97,10 +97,9 @@ def _select_offered(
         offered.update(tools if has_result_set else tools - _PHOTO_LEVEL_TOOLS)
 
     if has_result_set and page_available:
-        # **翻页是一次性能力。** 结果集最多 24 张、第 1 页只给前 12，第 2 页从第 13 张
-        # 开始直到结束——一次就能看完。成功翻过一次后由调用方把 ``page_available``
-        # 置假，工具从表里消失（原生 tools 剪掉 = 物理上不能调）；候选不足一页时它
-        # 从一开始就不出现。
+        # **翻页是一次性能力。** 生产固定「检索 = 页宽 = 6」，一次给全，这个工具
+        # 根本不会出现；若未来提高检索上限，第 2 页从第 ``PAGE_SIZE+1`` 张起直到
+        # 结束，成功翻过一次后由调用方把 ``page_available`` 置假，工具物理消失。
         offered.add("get_result_page")
 
     return tuple(spec for spec in TOOL_SPECS if spec.name in offered)
