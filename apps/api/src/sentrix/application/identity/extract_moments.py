@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,7 @@ class ExtractMoments:
         moments: MomentRepository,
         previews: PersonPreviewRenderer,
         vision: PersonVision,
+        workers: int = 1,
     ) -> None:
         self._assets = assets
         self._faces = faces
@@ -76,6 +78,10 @@ class ExtractMoments:
         self._moments = moments
         self._previews = previews
         self._vision = vision
+        #: 每张资产是一次**独立**的视觉调用 + 一张唯一临时预览，写库也按资产独立，
+        #: 所以并发不改变结果，只把模型等待叠起来。生产由路由按 ``album_workers``
+        #: （与 8100 的 slot 数对齐）传入；默认 1 保持逐张顺序，测试与不关心的调用方不变。
+        self._workers = max(1, int(workers))
 
     def __call__(self, *, scope_id: str, selections: Sequence[Mapping[str, Any]]) -> MomentExtraction:
         by_asset: dict[str, list[Mapping[str, Any]]] = {}
@@ -86,13 +92,28 @@ class ExtractMoments:
 
         created = 0
         failures = 0
-        for asset_id, items in by_asset.items():
-            try:
-                created += self._extract_asset(scope_id, asset_id, items)
-            except (OSError, ValueError):
-                # 图读不了 / 预览渲染失败。都只是**这一张照片**的事，整批继续——
-                # 一个人一次可能入选十几张，一张坏图不该让其余的都不落库。
-                failures += 1
+        if self._workers <= 1 or len(by_asset) <= 1:
+            for asset_id, items in by_asset.items():
+                try:
+                    created += self._extract_asset(scope_id, asset_id, items)
+                except (OSError, ValueError):
+                    # 图读不了 / 预览渲染失败。都只是**这一张照片**的事，整批继续——
+                    # 一个人一次可能入选十几张，一张坏图不该让其余的都不落库。
+                    failures += 1
+            return MomentExtraction(moments=created, failures=failures)
+
+        # 并发只并行「每张资产」这一层；单张内部仍是一次模型调用（interaction_labels
+        # 要的是一张图上多人之间的关系，不能拆成每人一次）。
+        with ThreadPoolExecutor(max_workers=self._workers, thread_name_prefix="sentrix-moments") as pool:
+            futures = {
+                pool.submit(self._extract_asset, scope_id, asset_id, items): asset_id
+                for asset_id, items in by_asset.items()
+            }
+            for future in as_completed(futures):
+                try:
+                    created += future.result()
+                except (OSError, ValueError):
+                    failures += 1
         return MomentExtraction(moments=created, failures=failures)
 
     def _extract_asset(self, scope_id: str, asset_id: str, items: Sequence[Mapping[str, Any]]) -> int:

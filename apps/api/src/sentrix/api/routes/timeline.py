@@ -206,18 +206,39 @@ def _execute_import(
     # 参与者投影的写入者原本只有「用户在簇审阅里确认」这一条路——于是一整册导入之后
     # ``event_participants`` 仍是 0 条，事件摘要也就写不出「王建国、张晓莉」。
     # 刷新会顺带按参与者重写摘要（``participant_summary``），人名因此进入事件。
+    # **ImportAlbum 的 timings 只覆盖导入本身。** 这三步是路由层在它之后同步跑的，
+    # 原先不计时，于是 362 张的整册导入里约 1.2h 落在 ``total_seconds`` 与
+    # ``timings.total`` 的差里，看起来像「导入本体很慢」。分开计时才能判断哪一步值得动。
+    post_started = time.perf_counter()
     if tracker:
         tracker.update(stage="participant_refresh")
+    refresh_started = time.perf_counter()
     observations = container.observation_repository.list_scope(request.scope_id, limit=100000)
     _confirmed_person_events(container).refresh_participants([item.id for item in observations])
+    refresh_seconds = time.perf_counter() - refresh_started
+    memory_graph_started = time.perf_counter()
     refresh_memory_graph(container, request.scope_id)
+    memory_graph_seconds = time.perf_counter() - memory_graph_started
     # **顺序照 1.0**：``pipeline.py:733-734`` 是先 family 后 person-insights。
     if tracker:
         tracker.update(stage="family_graph")
+    family_started = time.perf_counter()
     family_graph = _maybe_run_family_graph(container, request.scope_id)
+    family_seconds = time.perf_counter() - family_started
     if tracker:
         tracker.update(stage="person_insights")
+    insights_started = time.perf_counter()
     insights = _maybe_run_insights(container, request.scope_id, result.imported)
+    insights_seconds = time.perf_counter() - insights_started
+    result.timings.update(
+        {
+            "participant_refresh": round(refresh_seconds, 2),
+            "memory_graph": round(memory_graph_seconds, 2),
+            "family_graph": round(family_seconds, 2),
+            "person_insights": round(insights_seconds, 2),
+            "post_total": round(time.perf_counter() - post_started, 2),
+        }
+    )
     response = ImportBatchResponse(
         scope_id=result.scope_id,
         directory=result.directory,
