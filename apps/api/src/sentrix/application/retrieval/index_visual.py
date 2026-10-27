@@ -77,9 +77,29 @@ class IndexAssetVisual(AssetVisualIndexer):
         **写库只在这一半**，所以它必须留在串行侧（见 ``AssetVisualIndexer``）。
         """
         if prepared.skip_reason:
-            # ``already_indexed`` 是「早就有」，与「刚写上」必须分得开。
-            copied = prepared.skip_reason == "already_indexed"
-            return VisualIndexOutcome(indexed=copied, mirrored=copied, reason=prepared.skip_reason)
+            # ``already_indexed`` 是「权威存储里早就有」，**不等于派生索引里也有**。
+            # Qdrant 是嵌入式单进程实例：镜像写失败（目录被另一个进程占着）只记一条
+            # 警告，权威行照写；下一次导入/回填走到这里时，旧实现直接返回
+            # ``mirrored=True``，于是那条点永远补不回来。158 上实测过：索引 770 /
+            # 权威 1114，缺的 344 条正是这么丢的。
+            #
+            # 这里把已有的权威行再镜像一次：``upsert`` 幂等，正常路径上只是多一次写。
+            if prepared.skip_reason == "already_indexed":
+                existing = self._vectors.get(
+                    space=scheme.VISUAL_SPACE,
+                    source_type=SOURCE_TYPE,
+                    source_id=asset.id,
+                    model_name=self._embedder.model_id,
+                )
+                if existing is not None:
+                    mirrored, reason = self._mirror(existing)
+                    return VisualIndexOutcome(
+                        indexed=True, mirrored=mirrored, reason=reason or "already_indexed"
+                    )
+                # ``has_vector`` 为真但 ``get`` 取不到：竞态。权威行曾存在过，仍是
+                # ``indexed``；没有向量可镜像，只能如实报未镜像。
+                return VisualIndexOutcome(indexed=True, mirrored=False, reason="already_indexed")
+            return VisualIndexOutcome(indexed=False, reason=prepared.skip_reason)
         if len(prepared.vector) != self._embedder.dimension:
             return VisualIndexOutcome(
                 indexed=False,
