@@ -25,6 +25,7 @@ from sentrix.infrastructure.media.person_vision_model import (
     APPEARANCE_CONFIDENCE,
     OpenAIPersonVision,
 )
+from sentrix.infrastructure.media.vlm_observer import IMAGE_MAX_SIDE
 
 # 1.0 ``backend/model_clients.py:1337-1340`` 的提示词原文。**逐字节抄的**，不是转述：
 # 提示词是产品行为，改一个字都要重新验一遍真实模型的输出。
@@ -269,3 +270,24 @@ def test_an_unreadable_image_returns_none_without_calling_the_model(tmp_path: Pa
     assert vision.analyze_person_appearance(str(tmp_path / "missing.jpg")) is None
     assert vision.analyze_person_moments(str(tmp_path / "missing.jpg"), ["P1"]) is None
     assert vision.prompts == []
+
+
+def test_person_vision_passes_the_configured_max_side(monkeypatch) -> None:
+    """接线断言：moments/外观都必须走 1280 上限。
+
+    158 上 album3-14 的 ``person_insights`` 418s 就是因为这里发的是**整张原图**
+    （4,034 个图片 token）；1.0 用的是 896。少了这条接线，``IMAGE_MAX_SIDE`` 只是死代码。
+    """
+    seen: list[int | None] = []
+
+    def fake_encode(path, *, max_side=None):
+        seen.append(max_side)
+        return "data:image/jpeg;base64,eA=="
+
+    monkeypatch.setattr("sentrix.infrastructure.media.person_vision_model._encode_image", fake_encode)
+    vision = ScriptedVision([FULL_MOMENT, FULL_APPEARANCE])
+
+    vision.analyze_person_moments("p.jpg", ["P1"])
+    vision.analyze_person_appearance("crop.jpg")
+
+    assert seen == [IMAGE_MAX_SIDE, IMAGE_MAX_SIDE]

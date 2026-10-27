@@ -35,7 +35,7 @@ from typing import Any
 
 from sentrix.domain.media.inspection import build_inspect_prompt
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
-from sentrix.infrastructure.media.vlm_observer import _encode_image, chat_json
+from sentrix.infrastructure.media.vlm_observer import IMAGE_MAX_SIDE, _encode_image, chat_json
 
 
 class OpenAIPhotoInspector:
@@ -60,13 +60,13 @@ class OpenAIPhotoInspector:
         target_person: str = "",
         crop: str | Path | None = None,
     ) -> dict[str, object] | None:
-        image = _encode_image(Path(path))
+        image = _encode_image(Path(path), max_side=IMAGE_MAX_SIDE)
         if image is None:
             return None
 
         images = [image]
         if crop is not None:
-            located = _encode_image(Path(crop))
+            located = _encode_image(Path(crop), max_side=IMAGE_MAX_SIDE)
             if located is not None:
                 images.insert(0, located)
 

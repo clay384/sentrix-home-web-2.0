@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from sentrix.domain.identity.appearance import expanded_person_crop
+from sentrix.infrastructure.media.vlm_observer import IMAGE_MAX_SIDE
 
 # 1.0 ``person_moments.py:100-113`` 的原值。红框、线宽 3、标签画在框上方 14px。
 BOX_OUTLINE = "red"
@@ -61,13 +62,24 @@ def render_numbered_preview(
         # EXIF 旋转必须在这一步做掉：手机照片的 bbox 是在**转正之后**的坐标系里算的，
         # 不转的话框会整体错位——而那种错看起来像「模型认错人」。
         image = ImageOps.exif_transpose(source).convert("RGB")
+
+    # **先缩到模型上限，再画框与标签。** 反过来（先画后缩）会让默认字体（约 11px）
+    # 跟着图片一起缩：3264px 的原图缩到 1280 时标签只剩 ~4px，模型读不到 P1/P2，
+    # 就认不出这张图上的 moment 属于谁——158 实测两轮都因此稳定少 1 条 moments。
+    scale = min(1.0, IMAGE_MAX_SIDE / max(image.size))
+    if scale < 1.0:
+        image = image.resize(
+            (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+            Image.LANCZOS,
+        )
     draw = ImageDraw.Draw(image)
     label_map: dict[str, dict[str, Any]] = {}
     for index, face in enumerate(faces, start=1):
         label = f"P{index}"
         bbox = list(face.get("bbox") or [])
         if len(bbox) >= 4:
-            left, top, right, bottom = (float(value) for value in bbox[:4])
+            # bbox 来自**转正后的原图**坐标系，画之前要与图片一起缩。
+            left, top, right, bottom = (float(value) * scale for value in bbox[:4])
             draw.rectangle([left, top, right, bottom], outline=BOX_OUTLINE, width=BOX_WIDTH)
             draw.text((left, max(0.0, top - LABEL_DY)), label, fill=BOX_OUTLINE)
         else:

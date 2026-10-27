@@ -37,7 +37,7 @@ from sentrix.domain.media.inspection import (
 )
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
 from sentrix.infrastructure.media.photo_inspector import OpenAIPhotoInspector
-from sentrix.infrastructure.media.vlm_observer import _OBSERVE_PROMPT
+from sentrix.infrastructure.media.vlm_observer import _OBSERVE_PROMPT, IMAGE_MAX_SIDE
 
 # ---- 1.0 原文（逐字节抄的，不是转述）------------------------------------------------
 #
@@ -363,3 +363,25 @@ def test_the_observer_has_no_question_slot_which_is_why_this_port_exists() -> No
     """
     assert "{question}" not in _OBSERVE_PROMPT
     assert "{question}" in INSPECT_PROMPT
+
+
+# ---- 送图前的缩放：精读与观察共用同一档 ------------------------------------------
+
+
+def test_the_inspector_downscales_both_the_photo_and_the_crop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, photo: Path, crop: Path
+) -> None:
+    """精读的 36s 里绝大部分是 4,034 个图片 token；原图与裁剪件都要过同一个缩放。"""
+    seen: list[tuple[str, int | None]] = []
+
+    def fake_encode(path: Path, *, max_side: int | None = None) -> str:
+        seen.append((path.name, max_side))
+        return "data:image/jpeg;base64,eA=="
+
+    monkeypatch.setattr("sentrix.infrastructure.media.photo_inspector._encode_image", fake_encode)
+    ScriptedInspector({"observation": "戴了", "certainty": "supported"}).inspect(
+        str(photo), QUESTION, crop=str(crop)
+    )
+
+    assert [name for name, _ in seen] == [photo.name, crop.name]
+    assert [max_side for _, max_side in seen] == [IMAGE_MAX_SIDE, IMAGE_MAX_SIDE]

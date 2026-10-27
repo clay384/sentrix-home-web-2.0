@@ -284,3 +284,33 @@ def test_the_temporary_file_is_left_for_the_caller_to_delete(scratch: Path, tmp_
 
     assert Path(path).is_file()
     assert Path(path).parent == scratch, "落点跟着 tempfile 走，不写死在 DATA_DIR"
+
+
+def test_a_large_photo_is_downscaled_before_labels_are_drawn(tmp_path: Path) -> None:
+    """先缩到 ``IMAGE_MAX_SIDE`` 再画：否则默认字体的 P 标签会跟着图一起缩到 ~4px。
+
+    158 实测：先画后缩时 moments 两轮都少 1 条（模型读不到 P 编号，无法归属）。
+    这条钉住「预览图不超过上限」这一半；另一半（标签保持可读）靠真实导入的 moments
+    条数验证。
+    """
+    from sentrix.infrastructure.media.vlm_observer import IMAGE_MAX_SIDE
+
+    path = tmp_path / "big.jpg"
+    Image.new("RGB", (2000, 1500), "white").save(path, format="JPEG", quality=100)
+    face = {
+        "bbox": [100, 100, 300, 400],
+        "face_instance_id": "f1",
+        "person_id": "p1",
+        "cluster_id": "c1",
+        "observation_id": "o1",
+        "event_id": "e1",
+    }
+
+    preview, labels = render_numbered_preview(path, [face])
+    try:
+        with Image.open(preview) as image:
+            assert max(image.size) == IMAGE_MAX_SIDE
+            assert image.size == (1280, 960)
+    finally:
+        os.unlink(preview)
+    assert list(labels) == ["P1"]

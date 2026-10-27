@@ -10,18 +10,23 @@ http 那一层不在这里打真端点（8100 是 1.0 的服务，生命周期�
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
+from PIL import Image
 
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
 from sentrix.infrastructure.media.vlm_observer import (
+    IMAGE_MAX_SIDE,
     MAX_MODEL_CALLS,
     OBSERVATION_CONFIDENCE,
     OpenAIVlmObserver,
+    _encode_image,
     parse_json_object,
     semantics_from_payload,
 )
@@ -349,3 +354,72 @@ def test_prompt_budget_constant_is_shared_with_the_chat_client(endpoint, image):
 
     assert _Endpoint.received, "观察器必须真的发出了请求，否则这条断言什么也没验"
     assert _Endpoint.received[0]["max_tokens"] == MAX_ANSWER_TOKENS
+
+
+# ---- 送图前的缩放：观察与精读共用 ----------------------------------------------
+
+
+def _write_jpeg(path, size):
+    Image.new("RGB", size, (200, 30, 30)).save(path, format="JPEG", quality=90)
+    return path
+
+
+def test_a_large_image_is_downscaled_to_the_configured_long_side(tmp_path):
+    """158 实测：3264×2448 是 4,034 token，1024 长边只有 787——缩放直接决定 prefill。"""
+    path = _write_jpeg(tmp_path / "big.jpg", (2000, 1500))
+
+    uri = _encode_image(path, max_side=1024)
+
+    assert uri is not None
+    mime, encoded = uri.split(",", 1)
+    assert mime == "data:image/jpeg;base64"
+    with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
+        assert image.size == (1024, 768)
+
+
+def test_an_image_that_already_fits_is_sent_byte_for_byte(tmp_path):
+    """重新编码只会掉画质，不会更省——装得下就原样发。"""
+    path = _write_jpeg(tmp_path / "small.jpg", (800, 600))
+    raw = path.read_bytes()
+
+    uri = _encode_image(path, max_side=1024)
+
+    assert uri is not None
+    assert base64.b64decode(uri.split(",", 1)[1]) == raw
+
+
+def test_no_max_side_keeps_the_original_bytes(tmp_path):
+    """人物识别那条通道调用时不传 ``max_side``，默认行为必须原样保留。"""
+    path = _write_jpeg(tmp_path / "big.jpg", (2000, 1500))
+    raw = path.read_bytes()
+
+    uri = _encode_image(path)
+
+    assert uri is not None
+    assert base64.b64decode(uri.split(",", 1)[1]) == raw
+
+
+def test_a_broken_image_falls_back_to_the_original_bytes(tmp_path):
+    """坏图不该让观察失败：退回原图，模型那头照样能收到字节。"""
+    path = tmp_path / "broken.jpg"
+    path.write_bytes(b"not-an-image")
+
+    uri = _encode_image(path, max_side=1024)
+
+    assert uri is not None
+    assert base64.b64decode(uri.split(",", 1)[1]) == b"not-an-image"
+
+
+def test_the_observer_passes_the_configured_max_side(monkeypatch, image):
+    """接线断言：缩放常量必须真的从观察器传进 ``_encode_image``，否则只是死代码。"""
+    seen = {}
+
+    def fake_encode(path, *, max_side=None):
+        seen["max_side"] = max_side
+        return "data:image/jpeg;base64,eA=="
+
+    monkeypatch.setattr("sentrix.infrastructure.media.vlm_observer._encode_image", fake_encode)
+    observer = ScriptedObserver([{"caption": "海边"}])
+
+    assert observer.observe(image) is not None
+    assert seen["max_side"] == IMAGE_MAX_SIDE

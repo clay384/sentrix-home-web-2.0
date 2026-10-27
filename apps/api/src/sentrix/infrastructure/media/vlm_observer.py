@@ -35,6 +35,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import re
@@ -43,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from PIL import Image, ImageOps
 
 from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.media.models import MODEL_FACT_CONFIDENCE, ObservationFact
@@ -58,6 +60,21 @@ MAX_MODEL_CALLS = 3
 # 1.0 ``normalize_confidence(parsed.get("confidence"), 0.65)``——提示词不要求模型给
 # confidence，所以它是一个常数而不是模型输出。
 OBSERVATION_CONFIDENCE = 0.65
+
+#: 送进视觉模型前把长边压到这个尺寸。**只用于「看图理解」的两条调用**（导入观察与
+#: ``inspect_photo``）；人物识别保持原图，理由见 ``person_vision_model`` 的模块注释。
+#:
+#: 依据是 158 上的实测（3264×2448 的家庭照片，同一套提示词）：
+#: 观察：原图 4,260 prompt token / 48s，1280 长边 1,445 / 24s，1024 长边 1,013 / 22s；
+#: 精读：原图 ~4,100 token / 30–33s，1280 长边 ~1,295 / 7.6–8.8s，1024 长边 ~865 / 5.2–6.7s。
+#: 1024 与 1280 的观察/精读语义一致（certainty 8/8 一致），选 1280 是保守档：
+#: 多花约 1–2s/次，换小字与小物件的余量。全景图（9852×2936）原图出现过解析失败，
+#: 两档缩放都能正常输出。
+#:
+#: 8100 的视觉编码按原图分辨率出 token；服务器侧的 ``--image-max-tokens`` 只截
+#: LLM token，省不掉编码与上传。Mac 的 prefill 只有约 250 tok/s，这一项是导入与
+#: 精读的主要成本。
+IMAGE_MAX_SIDE = 1280
 
 _LANGUAGE_FIELDS = ("caption", "activity", "place", "event_type")
 _TEXT_FIELDS = ("caption", "activity", "place", "event_type", "ocr_text")
@@ -91,13 +108,48 @@ objects、clothing、ocr_text、facts（每项仍只含 subject、predicate、ob
 \n原始观察："""
 
 
-def _encode_image(path: Path) -> str | None:
+def _shrink_image(payload: bytes, mime: str, path: Path, max_side: int) -> tuple[bytes, str]:
+    """把长边压到 ``max_side`` 以内，返回（字节, mime）。
+
+    **已经装得下就原样返回**——重新编码一次只会掉画质，不会更省。
+    缩放失败（坏图、不支持的格式）时也退回原图：观察是增强，不是导入的前置条件。
+    """
+    try:
+        with Image.open(io.BytesIO(payload)) as image:
+            image = ImageOps.exif_transpose(image)
+            if max(image.size) <= max_side:
+                return payload, mime
+            if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+                # JPEG 没有 alpha；透明区按白底合成，而不是变成黑块。
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, (255, 255, 255))
+                background.paste(rgba, mask=rgba.split()[-1])
+                image = background
+            else:
+                image = image.convert("RGB")
+            image.thumbnail((max_side, max_side), Image.LANCZOS)
+            out = io.BytesIO()
+            image.save(out, format="JPEG", quality=85, optimize=True)
+            return out.getvalue(), "image/jpeg"
+    except Exception:  # noqa: BLE001 —— 坏图不该让导入或精读变成失败
+        log.warning("图片缩放失败，按原图发送: %s", path, exc_info=True)
+        return payload, mime
+
+
+def _encode_image(path: Path, *, max_side: int | None = None) -> str | None:
+    """把图片编码成 data URL；给了 ``max_side`` 就先把长边压到它以内。
+
+    ``max_side=None`` 保持原图字节与按后缀定的 mime——人物识别那条通道依赖这个
+    默认值（它的模块注释里写着「图像不再下采样」是照 1.0 的）。
+    """
     try:
         payload = path.read_bytes()
     except OSError as error:
         log.warning("观察用的图片读不了: %s (%s)", path, error)
         return None
     mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+    if max_side is not None:
+        payload, mime = _shrink_image(payload, mime, path, max_side)
     return f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
 
 
@@ -231,7 +283,7 @@ class OpenAIVlmObserver:
         return self._model.current()
 
     def observe(self, path: Path) -> ObservationSemantics | None:
-        image = _encode_image(Path(path))
+        image = _encode_image(Path(path), max_side=IMAGE_MAX_SIDE)
         if image is None:
             return None
 
