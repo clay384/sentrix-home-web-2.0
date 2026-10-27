@@ -13,9 +13,14 @@
 「控制台面板」混成一张接口。``ReadRuns._hydrate_legacy_gt_images`` 已经开了同一个
 先例——它也是直接打 ``/api/v1/assets``。
 
-**刻意不复用 ``ReadRuns`` 的状态 LRU 缓存。** 那两个分析每次都要打 Sentrix（一次
-资产清单 + 每个视频一次），run.json 的解析不是瓶颈；而面板是按需打开的，没有翻页
-那种「同一个 run 反复读」的模式。多一份缓存只会多一处要失效的东西。
+**缓存的是「同一份 run 状态」下两个面板的结果。** 原先这里刻意不做缓存，前提是
+「面板按需打开，没有同一个 run 反复读的模式」。158 的实测推翻了这个前提：面板开着时
+浏览器以约 0.55 次/秒轮询 ``/memory-effectiveness``（``/keyframe-analysis`` 也有
+0.27 次/秒），而每次都要解析 45MB 的 run.json、再打一次 Sentrix 资产清单，单次
+0.6–1.2s CPU——一个空转的标签页就能吃掉一个核。
+缓存键是 ``(run_id, store.revision(run_id))``：run.json 一变 revision 就变，缓存
+自然失效；30s TTL 兜住「run.json 没变但 scope 的资产清单变了」这种 revision 看不见
+的情况。
 
 **路径前缀是 ``/api/v1``**（1.0 是 ``/api``），与 ``infrastructure.sentrix.client``
 的 ``API_PREFIX`` 同一条。``limit`` 的差异见下面的常量。
@@ -23,7 +28,11 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import threading
+import time
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from typing import Any
 from urllib.parse import quote
@@ -46,6 +55,11 @@ ASSET_LIMIT = 1000
 
 #: 逐视频取元数据的超时。它是本地调用，但视频多的时候是 N 次串行。
 VIDEO_TIMEOUT_S = 30
+
+#: 记忆有效性结果的缓存。见模块 docstring：浏览器会以约 0.55 次/秒轮询这个面板。
+#: 条目小（几十 KB），留 8 条足够覆盖「刚看过的那几个 run」。
+MEMO_TTL_S = 30.0
+MEMO_MAX_ENTRIES = 8
 
 
 def _quote(value: str) -> str:
@@ -70,6 +84,24 @@ class RunReports:
         self._http = http
         self._sentrix_url = sentrix_url
         self._albums = albums
+        self._memo_lock = threading.Lock()
+        self._memo: OrderedDict[tuple[str, ...], tuple[float, dict[str, Any]]] = OrderedDict()
+
+    def _memo_get(self, key: tuple[str, ...]) -> dict[str, Any] | None:
+        now = time.monotonic()
+        with self._memo_lock:
+            cached = self._memo.get(key)
+            if cached is None or now - cached[0] > MEMO_TTL_S:
+                return None
+            self._memo.move_to_end(key)
+            return copy.deepcopy(cached[1])
+
+    def _memo_put(self, key: tuple[str, ...], value: dict[str, Any]) -> None:
+        now = time.monotonic()
+        with self._memo_lock:
+            self._memo[key] = (now, copy.deepcopy(value))
+            while len(self._memo) > MEMO_MAX_ENTRIES:
+                self._memo.popitem(last=False)
 
     def _base(self) -> str:
         return self._sentrix_url().rstrip("/")
@@ -133,16 +165,30 @@ class RunReports:
         return facts
 
     def keyframe_analysis(self, run_id: str) -> dict[str, Any]:
+        # 先取 revision：不存在时与 ``_state`` 同一个出口抛 ``KeyError``（HTTP 404）。
+        cache_key = ("keyframe", run_id, self._store.revision(run_id))
+        cached = self._memo_get(cache_key)
+        if cached is not None:
+            return cached
+
         state = self._state(run_id)
         scope_id = str(state.get("scope_id") or "").strip()
         if not scope_id:
             # 没 scope 就不用打 Sentrix 了——纯函数那边会回 ``pending``。
-            return keyframe_analysis.keyframe_analysis(state, [])
-        assets, error = self._assets(scope_id)
-        facts = self._video_facts(assets) if assets else {}
-        return keyframe_analysis.keyframe_analysis(state, assets, error=error, video_facts=facts)
+            result = keyframe_analysis.keyframe_analysis(state, [])
+        else:
+            assets, error = self._assets(scope_id)
+            facts = self._video_facts(assets) if assets else {}
+            result = keyframe_analysis.keyframe_analysis(state, assets, error=error, video_facts=facts)
+        self._memo_put(cache_key, result)
+        return result
 
     def memory_effectiveness(self, run_id: str) -> dict[str, Any]:
+        cache_key = ("memory", run_id, self._store.revision(run_id))
+        cached = self._memo_get(cache_key)
+        if cached is not None:
+            return cached
+
         state = self._state(run_id)
         scope_id = str(state.get("scope_id") or "").strip()
         # 1.0 在 ``:6005`` 用 ``except Exception: assets = []`` 把失败吞掉，让命中匹配
@@ -151,7 +197,9 @@ class RunReports:
         if scope_id:
             fetched, _ = self._assets(scope_id)
             assets = fetched or []
-        return memory_effectiveness.memory_effectiveness(state, assets)
+        result = memory_effectiveness.memory_effectiveness(state, assets)
+        self._memo_put(cache_key, result)
+        return result
 
     def _graph_snapshot(self, scope_id: str) -> dict[str, Any]:
         try:
