@@ -70,10 +70,8 @@ MIN_REQUIREMENTS = 1
 #    提示词里先说清楚比事后补括号便宜。
 _DECLARATION_PROMPT = """你正在规划家庭记忆任务。只返回一个 JSON 对象，不要解释，不要 Markdown 代码块围栏。
 
-输出格式（字段值必须替换成这道题的实际内容，不要把示例原样输出）：
-{{"action":"declare","declaration":{{"goal":"用户目标","requirements":[{{"id":"req_1","evidence_type":"证据类型","description":"具体要确认什么","predicate":"要查的谓词","value_type":"值类型","scope":{{}},"required":true}}]}}}}
-
-不要输出 scope_id 字段 —— 相册范围由系统注入，你不需要也不应该填写；填任何值都会被判为错误。
+字段由 schema 固定；每条 requirement 的 predicate 写这条需求要查的具体谓词
+（如 拍摄地点、花费金额）。
 
 evidence_type 只能来自系统注册表，不得创造新类型：
 {evidence_types}
@@ -99,40 +97,19 @@ scope 的键只能是 event / time / place / person；能从问题确定的事�
 不确定就输出空对象 {{}}；time 只放时间表达式（年份/日期/季节），地名不能塞进 time。
 任何字段都禁止输出 <...> 占位符；scope 里禁止写“未知”“unknown”“n/a”。
 
-只声明回答问题所必需的最小证据集合，不要把检索步骤本身当成答案证据重复声明。规则：
-- goal 必须用简体中文描述用户目标（家庭记忆系统使用中文，英文目标会导致语义检索
-  与中文图片描述失配、召回失败）；描述要保留完整语义，不要压缩成几个词。
-- 只要用户问的是**关于这个相册/照片的真问题**（不是打招呼、闲聊、让写东西这类与相册
-  无关的话），就声明 photo_set。**同时声明 delivered_photo** 表示「要把照片真的交到
-  用户手上」，只取到候选不算交付。
-  只有**与相册无关的普通聊天**（你好、谢谢、帮我写段文案）才不声明这两条。
-- 问某个已确认人物是谁、什么家庭角色、要人物档案时，声明 person_profile。
-  **问人与人的关系时同样要声明**：「A 和 B 是什么关系」「谁是谁的孩子/爸爸/妻子」
-  「那次是谁陪着她」「都有谁一起去了」——只声明 photo_set 拿到的是照片，
-  照片里没有「谁是谁的谁」这条信息，答不出来。
-- **只有**问**全相册层面的数量/统计**（一共几张、多少次、哪些媒体类型、处理状态）
-  时才声明 structured_fact。单张照片的拍摄时间、地点已经在检索结果的 preview 里
-  （``captured_at`` / ``place``），**不要**为它们声明 structured_fact——先声明
-  photo_set，必要时再声明 visual_observation 确认画面。
-- `photo_set` 与 `delivered_photo` 是**一对基础需求**：只要声明其中一条，就同时声明
-  另一条；这一对**不计入**下面的额度。除此之外，同一道题最多再声明 2 条证据需求，
-  不要为了「找照片 + 查元数据 + 看细节」把预算堆满。
-- **只有**问画面里看得见的**具体属性**——颜色、服饰、动作/道具、物体、建筑或雕塑外观——
-  且检索结果的 preview 摘要不足以回答时，才声明 visual_observation。
-  拍摄时间、地点和事件概述**优先用 photo_set 的 preview**（``captured_at`` / ``place`` /
-  ``evidence_summary``），不要默认精读；preview 没写清楚时再声明 visual_observation。
-- **只有**问画面中出现的**文字、数字、价格、招牌或标签内容**时才声明 visible_text。
-  不要把地点、颜色、服饰、物体、场景这类视觉信息当成 visible_text——那会让系统只去读
-  OCR，看不到照片本身。
-- **只有**问照片里的人是谁、身份归属时才声明 photo_identity；不要用它去识别物体、
-  场景、建筑或雕塑。
-- 一条需求只对应一种证据类型。「先把照片找出来」和「看清照片里的细节」是两条需求，
-  例如同时声明 photo_set 与 visual_observation；只声明 visible_text 通常答不了视觉细节。
-- 同一 evidence_type 下可以按 value_type 拆成多条需求；但不要输出两条内容完全相同的 requirement。
-每个 requirement 都必须能由注册表中的工具直接获得。
-- JSON 示例中的字段值仅用于说明，不是要输出的固定值。
-  goal、evidence_type、description、predicate、value_type、scope 必须替换为当前用户问题对应的真实内容；
-  禁止原样输出示例里的任何占位内容或尖括号占位符。
+只声明回答问题所必需的最小证据集合，不要把检索步骤本身当成答案证据。规则：
+- goal 用简体中文并保留完整语义（英文 goal 会让检索与中文描述失配）。
+- 关于相册的真问题就声明 photo_set + delivered_photo（成对、不计额度）；
+  只有与相册无关的闲聊或写作请求才不声明。
+- 问已确认人物是谁、家庭角色、人物档案，或问人与人的关系时声明 person_profile——照片本身没有关系信息。
+- 只有全相册级统计（共几张、多少次、哪些媒体类型）才声明 structured_fact；单张的时间、地点在 preview 里。
+- 只有 preview 摘要不足、且问画面可见属性（颜色、服饰、动作、物体、建筑）时才声明 visual_observation。
+- 只有问图内文字、数字、价格、招牌时声明 visible_text；地点、颜色、服饰、场景不算。
+- 只有问照片里的人是谁、身份归属时声明 photo_identity。
+- 一条 requirement 只对应一种 evidence_type；「先找照片」与「看清细节」要分成两条。
+- photo_set + delivered_photo 之外最多再声明 2 条证据需求；同一 evidence_type 可按
+  value_type 拆多条，但不得两条完全相同。
+- 每条 requirement 都必须能由注册表中的工具直接获得。
 
 不要调用工具，不要输出 SQL，不要直接回答用户。"""
 

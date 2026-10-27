@@ -109,10 +109,11 @@ def test_delivered_photo_is_declared_by_default_for_real_album_questions():
     """
     prompt = build_prompt()
 
-    assert "关于这个相册/照片的真问题" in prompt
-    assert "同时声明 delivered_photo" in prompt
-    # 唯一的不声明条件是与相册无关的闲聊。
-    assert "普通聊天" in prompt
+    assert "关于相册的真问题" in prompt
+    assert "photo_set + delivered_photo" in prompt
+    assert "成对" in prompt
+    # 唯一的不声明条件是与相册无关的闲聊（裁剪后文案用的是「闲聊」）。
+    assert "闲聊" in prompt
 
 
 def test_the_prompt_declares_the_value_type_contract():
@@ -132,14 +133,21 @@ def test_the_prompt_declares_the_value_type_contract():
     ):
         assert value_type in prompt
     assert "scope" in prompt
-    assert "required" in prompt
     assert "哪几类" in prompt
+    # ``required`` 由 JSON Schema 强制（``type: boolean`` + required 列表），
+    # 提示词不再复述字段形状——2026-10-27 裁剪掉的那一段。
 
 
 def test_the_prompt_never_shows_a_real_scope_id():
-    """1.0 的教训：示例里出现真实 scope_id 会被小模型整段照抄，抄错一位就 scope_mismatch。"""
-    assert SCOPE not in build_prompt()
-    assert "scope_id" in build_prompt()  # 提示词要明确说「不要输出 scope_id」
+    """1.0 的教训：示例里出现真实 scope_id 会被小模型整段照抄，抄错一位就 scope_mismatch。
+
+    2026-10-27 起连 ``scope_id`` 这个词都不再出现：JSON Schema 的
+    ``additionalProperties: false`` 已经让它物理上输出不了，提示词里那条禁令是纯冗余。
+    被拒时的修正话术仍提到它（``correction_hint``），那条保留。
+    """
+    prompt = build_prompt()
+    assert SCOPE not in prompt
+    assert "scope_id" not in prompt
 
 
 def test_history_is_folded_into_the_system_text_not_a_second_system_message():
