@@ -148,7 +148,7 @@ def test_the_first_page_holds_twelve_photos():
 
 
 def test_a_ten_photo_result_set_fits_on_one_page():
-    """真实检索最多 12 张：10 张的集合一页看完，``has_more`` 必须是假。"""
+    """候选不足一页时 ``has_more`` 必须是假——工具层据此拒绝翻页。"""
     page = make_result_set(10).first_page()
 
     assert len(page.entries) == 10
@@ -161,6 +161,25 @@ def test_handles_are_global_ordinals_not_page_ordinals():
     result_set = make_result_set(20)
 
     assert [entry.handle for entry in result_set.page(2).entries] == [f"photo_{i}" for i in range(13, 21)]
+
+
+def test_the_second_page_starts_at_thirteen_and_runs_to_the_end():
+    """18 张候选：第 1 页 photo_1..12，第 2 页 photo_13..18（只到结尾，不补齐）。"""
+    result_set = make_result_set(18)
+
+    first = result_set.page(1)
+    assert [entry.handle for entry in first.entries] == [f"photo_{i}" for i in range(1, 13)]
+    assert first.has_more is True
+    assert first.remaining == 6
+
+    second = result_set.page(2)
+    assert [entry.handle for entry in second.entries] == [f"photo_{i}" for i in range(13, 19)]
+    assert second.has_more is False
+    assert second.remaining == 0
+
+
+def test_a_single_page_result_set_has_no_second_page():
+    assert make_result_set(PAGE_SIZE).page(2).entries == ()
 
 
 def test_page_size_is_capped_at_twelve():

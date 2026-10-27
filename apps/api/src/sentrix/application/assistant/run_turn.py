@@ -378,7 +378,7 @@ MODEL_SERVICE_ANSWER = "模型服务当前不可用，因此这一轮没有开�
 
 
 #: 「一张照片集」的两种工具：``search_memories`` 的首页预览与
-#: ``get_result_page`` 的翻页预览。模型回答问题时必须**至少能看到最新的一份六图描述**
+#: ``get_result_page`` 的翻页预览。模型回答问题时必须**至少能看到最新的一页描述**
 #: ——它包含 handle、时间、地点、人物与摘要，是后续 ``inspect_photo`` / 回答的入口。
 #: 把这一轮丢掉，模型就只剩「有结果集但看不见候选」的状态，整道题无法继续。
 _PROTECTED_PREVIEW_TOOLS = frozenset({"search_memories", "get_result_page"})
@@ -433,6 +433,24 @@ def _drop_oldest_tool_round_trip(messages: Sequence[ChatMessage]) -> list[ChatMe
             continue
         return list(messages[:start]) + list(messages[end:])
     return None
+
+
+def _page_available(state: TaskState) -> bool:
+    """翻页工具最多出现一次：结果集超过一页，且本回合还没有成功翻过页。
+
+    **由代码收口，不靠模型自觉。** 158 实测：模型会把翻页当成“重读结果集”，
+    15 次翻页里 14 次要的是第 1 页。2.0 走原生 ``tools`` 字段，剪掉 = 物理上
+    不能调；一次成功后它就从工具表里消失，模型只能基于已经看到的内容作答。
+
+    候选不超过一页（``has_more`` 为假）时它从一开始就不出现——这正是
+    “没有满 12 张就别给翻页工具”的那条。
+    """
+    searches = [
+        record for record in state.records if record.tool == "search_memories" and record.status == "ok"
+    ]
+    if not searches or not bool(searches[-1].observation.get("has_more")):
+        return False
+    return not any(record.tool == "get_result_page" and record.status == "ok" for record in state.records)
 
 
 def _planner_failure_answer(planned: PlannerResult) -> str:
@@ -862,6 +880,7 @@ class RunTurn:
                 session.ledger,
                 has_result_set=state.current_result_set_id is not None,
                 tools_exhausted=not state.can_call_tool(),
+                page_available=_page_available(state),
             )
             try:
                 reply = self._complete_recorded(session, messages, specs)
@@ -1315,6 +1334,7 @@ class RunTurn:
             session.ledger,
             has_result_set=state.current_result_set_id is not None,
             tools_exhausted=not state.can_call_tool(),
+            page_available=_page_available(state),
         )
         if unattempted and available and state.block_guard_code("required_evidence_missing"):
             self._reminder_event(session, "required_evidence_missing", [item.id for item in unattempted])

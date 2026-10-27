@@ -20,8 +20,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 
-#: 2026-10-26：6 → 12。检索上限就是 12，一页给全后模型不再需要翻页；
-#: 6 张一页会让几乎每题都多一个 `get_result_page` 模型步（Mac 上约 16.9s）。
+#: 每页 12 张。**结果集上限是 24**（``tools.DEFAULT_SEARCH_LIMIT``）：第 1 页前 12 张，
+#: 第 2 页从第 13 张开始直到结束。翻页工具是一次性的（成功一次后 JIT 剪掉），
+#: 所以两页就是模型能看到的上限。
 PAGE_SIZE = 12
 
 
@@ -65,10 +66,15 @@ class ResultSet:
 
         1.0 也是这个行为（``tools.py:2073``）：越界不是错误，是「没有更多了」。抛异常
         只会让模型把一次正常的翻到底当成系统故障。
+
+        游标分页：第 ``n`` 页从 ``(n-1)*size`` 开始，越界页为空。候选不超过一页时
+        第 2 页为空——工具层会直接拒绝这种请求（``single_page_only``）。
         """
         size = min(PAGE_SIZE, max(1, page_size))
-        start = max(0, (max(1, page_no) - 1) * size)
-        end = start + size
+        page_no = max(1, page_no)
+        total = len(self.asset_ids)
+        start = max(0, (page_no - 1) * size)
+        end = min(total, start + size)
         entries = tuple(
             ResultSetEntry(
                 handle=f"photo_{start + index + 1}",
@@ -78,11 +84,11 @@ class ResultSet:
             for index, asset_id in enumerate(self.asset_ids[start:end])
         )
         return ResultSetPage(
-            page=max(1, page_no),
+            page=page_no,
             page_size=size,
-            total=len(self.asset_ids),
-            has_more=end < len(self.asset_ids),
-            remaining=max(0, len(self.asset_ids) - end),
+            total=total,
+            has_more=end < total,
+            remaining=max(0, total - end),
             entries=entries,
         )
 

@@ -207,6 +207,35 @@ def run(toolbox, name: str, **arguments: object):
     return build.execute(name, arguments, scope_id=SCOPE, now=NOW)
 
 
+def _seed_plain_assets(db, tmp_path, count: int) -> list[str]:
+    """补一批只用来“凑满两页”的普通照片。preview 只读资产表，不需要向量。"""
+    assets = SqliteAssetRepository(db)
+    seeded: list[str] = []
+    for offset in range(count):
+        index = 100 + offset
+        path = tmp_path / f"filler_{index}.jpg"
+        path.write_bytes(f"filler {index}".encode())
+        assets.add(
+            Asset(
+                id=f"asset_f{index}",
+                scope_id=SCOPE,
+                file_name=path.name,
+                media_type=MediaType.IMAGE,
+                path=str(path),
+                mime_type="image/jpeg",
+                size_bytes=path.stat().st_size,
+                status=AssetStatus.PROCESSED,
+                content_sha256=f"hashf{index}",
+                captured_at=datetime(2019, 9, 1, tzinfo=UTC),
+                captured_location=GpsPoint(30.0, 120.0),
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        seeded.append(f"asset_f{index}")
+    return seeded
+
+
 # ---- search_memories --------------------------------------------------------
 
 
@@ -222,18 +251,17 @@ def test_search_returns_a_result_set_with_a_preview(toolbox):
     assert preview[0]["file_name"] == "海边.jpg"
 
 
-def test_the_model_never_sees_asset_ids_or_the_candidate_total(toolbox):
-    """两份投影的差集就是这个工具的信息边界。
+def test_the_model_sees_the_candidate_total_but_never_asset_ids(toolbox):
+    """``total`` 从 2026-10-27 起进 model_visible：模型据此判断还有没有第二页。
 
-    ``total`` 只进 ``observation``：1.0 实测过模型会把候选池的数量直接当成答案里的统计
-    数字（``runtime.py:116``）。``asset_id`` 同理——模型只需要 handle，真正可交付的资产
-    由运行时解引用。
+    代价是 1.0 实测过模型会把候选池数量直接当成答案里的统计数字（``runtime.py:116``）；
+    工具描述里因此明写「total 是本次检索的候选数，不是相册里的真实数量，不要拿来回答
+    数量题」。``asset_id`` 仍然只在内部投影里——模型只需要 handle。
     """
     outcome = run(toolbox, "search_memories", query="海边")
 
-    assert "total" in outcome.observation
+    assert outcome.model_visible["total"] == outcome.observation["total"]
     assert "asset_ids" in outcome.observation
-    assert "total" not in outcome.model_visible
     assert "asset_ids" not in outcome.model_visible
     assert "photo_1" not in str(outcome.observation.get("asset_ids"))
 
@@ -276,22 +304,58 @@ def test_paging_requires_a_known_result_set(toolbox):
     assert outcome.failure_reason == "unknown_result_set"
 
 
-def test_paging_returns_the_requested_page(toolbox):
-    search = run(toolbox, "search_memories", query="海边")
-    result_set_id = search.model_visible["result_set_id"]
+def test_paging_returns_the_rest_of_the_result_set(toolbox, migrations_ready_db, tmp_path):
+    build, result_sets = toolbox
+    filler = _seed_plain_assets(migrations_ready_db, tmp_path, 18)
+    result_sets.add(
+        ResultSet(
+            id="rs_big",
+            scope_id=SCOPE,
+            query="海边",
+            asset_ids=tuple(filler) + ("asset_0", "asset_1"),
+            created_at=NOW,
+        )
+    )
 
-    outcome = run(toolbox, "get_result_page", result_set_id=result_set_id, page=1)
+    outcome = build.execute(
+        "get_result_page", {"result_set_id": "rs_big", "page": 2}, scope_id=SCOPE, now=NOW
+    )
 
     assert outcome.ok
-    assert outcome.model_visible["page"] == 1
-    assert outcome.model_visible["result_set_id"] == result_set_id
+    assert outcome.model_visible["page"] == 2
+    assert outcome.model_visible["result_set_id"] == "rs_big"
+    handles = [item["handle"] for item in outcome.model_visible["preview"]]
+    # 20 张候选：第 2 页从第 13 张开始，到第 20 张结束。
+    assert handles == [f"photo_{i}" for i in range(13, 21)]
 
 
-def test_a_page_past_the_end_is_empty_not_an_error(toolbox):
+def test_paging_a_single_page_set_is_refused(toolbox):
+    """候选不超过 12 张时没有第二页可翻——直接拒绝，并说清“已经全部给过”。"""
     search = run(toolbox, "search_memories", query="海边")
     result_set_id = search.model_visible["result_set_id"]
 
-    outcome = run(toolbox, "get_result_page", result_set_id=result_set_id, page=99)
+    outcome = run(toolbox, "get_result_page", result_set_id=result_set_id, page=2)
+
+    assert not outcome.ok
+    assert outcome.failure_reason == "single_page_only"
+
+
+def test_a_page_past_the_end_is_empty_not_an_error(toolbox, migrations_ready_db, tmp_path):
+    build, result_sets = toolbox
+    filler = _seed_plain_assets(migrations_ready_db, tmp_path, 18)
+    result_sets.add(
+        ResultSet(
+            id="rs_big",
+            scope_id=SCOPE,
+            query="海边",
+            asset_ids=tuple(filler) + ("asset_0", "asset_1"),
+            created_at=NOW,
+        )
+    )
+
+    outcome = build.execute(
+        "get_result_page", {"result_set_id": "rs_big", "page": 99}, scope_id=SCOPE, now=NOW
+    )
 
     assert outcome.ok
     assert outcome.model_visible["preview"] == []
@@ -423,21 +487,22 @@ def test_the_preview_carries_the_media_kind(toolbox, migrations_ready_db, tmp_pa
     )
 
     build, result_sets = toolbox
+    filler = _seed_plain_assets(migrations_ready_db, tmp_path, 18)
     result_sets.add(
         ResultSet(
             id="rs_kind",
             scope_id=SCOPE,
             query="婚礼",
-            asset_ids=("asset_0", "asset_video"),
+            asset_ids=tuple(filler) + ("asset_0", "asset_video"),
             created_at=NOW,
         )
     )
     outcome = build.execute(
-        "get_result_page", {"result_set_id": "rs_kind", "page": 1}, scope_id=SCOPE, now=NOW
+        "get_result_page", {"result_set_id": "rs_kind", "page": 2}, scope_id=SCOPE, now=NOW
     )
 
     kinds = [item["media_kind"] for item in outcome.model_visible["preview"]]
-    assert kinds == ["image", "video"]
+    assert kinds[-2:] == ["image", "video"]
 
 
 def test_the_preview_marks_a_video_keyframe_as_such(toolbox, migrations_ready_db, tmp_path):
@@ -493,24 +558,25 @@ def test_the_preview_marks_a_video_keyframe_as_such(toolbox, migrations_ready_db
     )
 
     build, result_sets = toolbox
+    filler = _seed_plain_assets(migrations_ready_db, tmp_path, 18)
     result_sets.add(
         ResultSet(
             id="rs_frame",
             scope_id=SCOPE,
             query="婚礼",
-            asset_ids=("asset_0", "asset_frame"),
+            asset_ids=tuple(filler) + ("asset_0", "asset_frame"),
             created_at=NOW,
         )
     )
     outcome = build.execute(
-        "get_result_page", {"result_set_id": "rs_frame", "page": 1}, scope_id=SCOPE, now=NOW
+        "get_result_page", {"result_set_id": "rs_frame", "page": 2}, scope_id=SCOPE, now=NOW
     )
 
     kinds = [item["source_kind"] for item in outcome.model_visible["preview"]]
-    assert kinds == ["photo", "video_keyframe"]
+    assert kinds[-2:] == ["photo", "video_keyframe"]
 
 
-def test_the_preview_carries_the_relevance_level(toolbox, migrations_ready_db):
+def test_the_preview_carries_the_relevance_level(toolbox, migrations_ready_db, tmp_path):
     """``level`` 取**这条候选被哪一类通道召回**，不是名次。
 
     ``anchor``（metadata / entity）是确定性锚点，``semantic`` 是相似度命中。
@@ -518,23 +584,24 @@ def test_the_preview_carries_the_relevance_level(toolbox, migrations_ready_db):
     「是不是事件成员」；2.0 的判据在 ``fusion.evidence_class_for``。
     """
     build, result_sets = toolbox
+    filler = _seed_plain_assets(migrations_ready_db, tmp_path, 18)
     result_sets.add(
         ResultSet(
             id="rs_level",
             scope_id=SCOPE,
             query="海边",
-            asset_ids=("asset_0", "asset_1"),
+            asset_ids=tuple(filler) + ("asset_0", "asset_1"),
             created_at=NOW,
             evidence_classes={"asset_0": "anchor", "asset_1": "semantic"},
         )
     )
 
     outcome = build.execute(
-        "get_result_page", {"result_set_id": "rs_level", "page": 1}, scope_id=SCOPE, now=NOW
+        "get_result_page", {"result_set_id": "rs_level", "page": 2}, scope_id=SCOPE, now=NOW
     )
 
     levels = [item["level"] for item in outcome.model_visible["preview"]]
-    assert levels == ["exact", "strong"]
+    assert levels[-2:] == ["exact", "strong"]
 
 
 def test_the_fused_evidence_class_survives_retrieval(toolbox):

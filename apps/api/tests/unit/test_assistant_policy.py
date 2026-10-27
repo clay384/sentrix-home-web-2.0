@@ -599,8 +599,8 @@ def test_paging_is_capped_by_the_size_of_the_result_set(make_state):
 
     assert decision.action is ToolAction.DENY
     assert decision.code == "page_call_limit"
-    # 文案要说清「你已經看完了」，不是只说「到上限了」——后者会让模型以为再等等就能翻。
-    assert "每页 12 张" in decision.reason
+    # 文案要说清「你已经看完了」，不是只说「到上限了」——后者会让模型以为再等等就能翻。
+    assert "第 2 页从第 13 张开始" in decision.reason
     assert "已经看完" in decision.reason
 
 
