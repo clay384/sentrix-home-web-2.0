@@ -3,8 +3,8 @@
 对应 1.0 ``agent_runtime/result_set.py``。三条不变量原样保留，它们在 1.0 里被证明是
 对的：
 
-1. **每页 6 张、1-based、无游标、``page_size`` 硬顶 6**；
-2. **``handle`` 是全局序号**（第 2 页从 ``photo_7`` 开始），跨页稳定——模型只需要记住
+1. **每页 12 张、1-based、无游标、``page_size`` 硬顶 12**；
+2. **``handle`` 是全局序号**（第 2 页从 ``photo_13`` 开始），跨页稳定——模型只需要记住
    ``photo_N``，分页不会让同一个 handle 指向不同的图；
 3. **``asset_id`` 只存在于结果集里**，不进模型上下文。模型看到的是 handle，真正可交付
    的资产由运行时解引用。1.0 为此在 ``runtime.py:177-179`` 专门把 ``asset_id`` 从模型
@@ -20,7 +20,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 
-PAGE_SIZE = 6
+#: 2026-10-26：6 → 12。检索上限就是 12，一页给全后模型不再需要翻页；
+#: 6 张一页会让几乎每题都多一个 `get_result_page` 模型步（Mac 上约 16.9s）。
+PAGE_SIZE = 12
 
 
 @dataclass(frozen=True, slots=True)

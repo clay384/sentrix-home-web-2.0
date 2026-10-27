@@ -29,8 +29,9 @@ class TurnProfile:
     #
     # 数是照着**结果集本身的容量**定的，不是拍的：``search_memories`` 的 ``limit``
     # 上限是 12（``application/assistant/tools.py`` 的 ``MAX_SEARCH_LIMIT``），每页
-    # 6 张（``result_set.PAGE_SIZE``）——**最多两页**。而第 1 页 ``search_memories``
-    # 已经返回过了，所以看完整个结果集再来 1 次就够，2 是余量。
+    # 12 张（``result_set.PAGE_SIZE``）——**一页看完**。正常路径根本不需要翻页；
+    # 2 次是「一次失败重试 + 一次保险」的余量（见
+    # ``test_a_single_failure_does_not_block_the_retry``），不是给两页用的。
     #
     # **为什么需要它。** 实测 20261009 那一轮：56 个以 ``step_budget_exhausted`` 收尾的
     # 回合里 **53 个最后动作都是 ``get_result_page``**——模型被 L2 打回之后不知道说什么，
@@ -60,8 +61,8 @@ DEFAULT_PROFILE = TurnProfile(
     # 1.0 runtime.py:1895 的硬收敛。实测小模型会反复改 query 重搜，把工具预算耗光后
     # 以空答案收场（e8c9d4 的 35 题里 52%）；收敛到 1 次后逼它翻页或直接作答。
     max_search_calls=1,
-    # 见 ``max_page_calls`` 的注释：结果集最多 12 张、每页 6 张 → 最多 2 页，
-    # 而第 1 页 search 已经给过。
+    # 见 ``max_page_calls`` 的注释：结果集最多 12 张、每页 12 张 → 一页看完；
+    # 2 次是失败重试的余量。
     max_page_calls=2,
     # 1.0 生产 profile 的值：``PROFILES["goal_driven_candidate"].max_inspections = 3``
     # （``backend/agent_runtime/profile.py``）。**不是** ``budget_manager.py:17`` 的

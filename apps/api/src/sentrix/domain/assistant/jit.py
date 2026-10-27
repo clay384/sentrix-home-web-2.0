@@ -91,7 +91,7 @@ def _select_offered(
 
     if has_result_set:
         # 翻页**不按需求剪**：``photo_set`` 被满足只说明检索成功过，不说明候选看完了
-        # （``search_memories`` 一页 6 条、结果集最多 12 条）。1.0 的模型在任何时候都能
+        # （``search_memories`` 一次最多 12 条，结果集也只有 12 条）。1.0 的模型在任何时候都能
         # 调它；在 2.0 剪掉它就等于把「看第 7–12 张」这个能力整个拿掉。
         offered.add("get_result_page")
 

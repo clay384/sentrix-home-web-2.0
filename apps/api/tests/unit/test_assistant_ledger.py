@@ -135,26 +135,36 @@ def make_result_set(count: int) -> ResultSet:
     )
 
 
-def test_the_first_page_holds_six_photos():
+def test_the_first_page_holds_twelve_photos():
+    """2026-10-26：6 → 12。检索上限就是 12，一页给全后模型不再需要翻页。"""
+    page = make_result_set(20).first_page()
+
+    assert PAGE_SIZE == 12
+    assert page.page == 1
+    assert [entry.handle for entry in page.entries] == [f"photo_{i}" for i in range(1, 13)]
+    assert page.total == 20
+    assert page.has_more is True
+    assert page.remaining == 8
+
+
+def test_a_ten_photo_result_set_fits_on_one_page():
+    """真实检索最多 12 张：10 张的集合一页看完，``has_more`` 必须是假。"""
     page = make_result_set(10).first_page()
 
-    assert PAGE_SIZE == 6
-    assert page.page == 1
-    assert [entry.handle for entry in page.entries] == [f"photo_{i}" for i in range(1, 7)]
-    assert page.total == 10
-    assert page.has_more is True
-    assert page.remaining == 4
+    assert len(page.entries) == 10
+    assert page.has_more is False
+    assert page.remaining == 0
 
 
 def test_handles_are_global_ordinals_not_page_ordinals():
-    """第 2 页从 ``photo_7`` 开始。模型只需要记住 ``photo_N``，跨页稳定。"""
-    result_set = make_result_set(10)
+    """第 2 页从 ``photo_13`` 开始。模型只需要记住 ``photo_N``，跨页稳定。"""
+    result_set = make_result_set(20)
 
-    assert [entry.handle for entry in result_set.page(2).entries] == [f"photo_{i}" for i in range(7, 11)]
+    assert [entry.handle for entry in result_set.page(2).entries] == [f"photo_{i}" for i in range(13, 21)]
 
 
-def test_page_size_is_capped_at_six():
-    """``page_size`` 传多大都只给 6 张——1.0 的 ``min(_RESULT_PAGE_SIZE, ...)``。"""
+def test_page_size_is_capped_at_twelve():
+    """``page_size`` 传多大都只给 12 张——与 ``min(_RESULT_PAGE_SIZE, ...)`` 同一条。"""
     page = make_result_set(20).page(1, page_size=100)
 
     assert page.page_size == PAGE_SIZE

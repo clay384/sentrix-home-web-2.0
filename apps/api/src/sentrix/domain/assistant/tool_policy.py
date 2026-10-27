@@ -144,13 +144,14 @@ class ToolPolicy:
             return ToolDecision(
                 action=ToolAction.DENY,
                 code="page_call_limit",
-                # 文案要说清**为什么够了**：结果集最多 12 张、每页 6 张，第 1 页 search
-                # 已经给过。只说「到上限了」的话，模型会以为再等等就能翻——实测它正是
-                # 这么一直翻到模型步耗尽的（56 个 step_budget_exhausted 里 53 个以
+                # 文案要说清**为什么够了**：结果集最多 12 张、每页 12 张，search 已经把
+                # 全部候选给过。只说「到上限了」的话，模型会以为再等等就能翻——实测它
+                # 正是这么一直翻到模型步耗尽的（56 个 step_budget_exhausted 里 53 个以
                 # get_result_page 收尾）。
                 reason=(
                     f"翻页额度已经用完（每轮最多 {state.profile.max_page_calls} 次）。"
-                    "结果集最多 12 张、每页 6 张，最多两页，这一份候选你已经看完了。"
+                    "结果集最多 12 张、每页 12 张，search 已经把所有候选给过你，"
+                    "这一份候选你已经看完了。"
                     "请基于已经看到的内容作答；确实需要别的照片就说明拿不到，不要继续翻页。"
                 ),
             )

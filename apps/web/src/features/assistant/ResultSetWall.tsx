@@ -14,14 +14,14 @@ import { Lightbox } from "../../shared/ui/Lightbox";
  * **前端不重新检索、不重排**，只负责把 handle 映射成授权图片 URL
  * （`resultSetPhotoUrl` → `GET /assistant/result-sets/{id}/photo`）。
  *
- * 分页：后端每页 6 张、handle 是全局序号（第 2 页从 `photo_7` 开始，
+ * 分页：后端每页 12 张、handle 是全局序号（第 2 页从 `photo_13` 开始，
  * `domain/assistant/result_set.py`）。observation 里**没有** `page` 这一格，
  * 所以页号优先读结构化的 `result.page`（后端以后加就直接用），否则 `search_memories`
  * 固定是第 1 页，`get_result_page` 从它自己那句进度文案
  * 「已翻到第 N 页…」里取——那是这一格里唯一存在的页号。
  */
 
-const DEFAULT_PAGE_SIZE = 6;
+const DEFAULT_PAGE_SIZE = 12;
 
 export interface ResultSetView {
   resultSetId: string;

@@ -252,7 +252,7 @@ SEARCH_OK = ToolOutcome(
         "result_set_id": "rs_1",
         "query": "海边",
         "page": 1,
-        "page_size": 6,
+        "page_size": 12,
         "has_more": False,
         "preview": [
             {"handle": "photo_1", "file_name": "a.jpg", "captured_at": "2017-11-05T16:44:57"},
@@ -261,22 +261,22 @@ SEARCH_OK = ToolOutcome(
     },
 )
 
-#: 第二页预览。压缩测试用它证明**最新的一份六图集**被保留、更老的检索轮被丢掉。
+#: 第二页预览。压缩测试用它证明**最新的一份结果集页**被保留、更老的检索轮被丢掉。
 PAGE_OK = ToolOutcome(
     observation={
         "result_set_id": "rs_1",
         "page": 2,
         "has_more": False,
-        "asset_ids": [f"asset_{index}" for index in range(1, 9)],
+        "asset_ids": [f"asset_{index}" for index in range(1, 15)],
     },
     model_visible={
         "result_set_id": "rs_1",
         "page": 2,
-        "page_size": 6,
+        "page_size": 12,
         "has_more": False,
         "preview": [
-            {"handle": "photo_7", "file_name": "g.jpg", "captured_at": "2019-01-01T00:00:00"},
-            {"handle": "photo_8", "file_name": "h.jpg", "captured_at": "2019-01-02T00:00:00"},
+            {"handle": "photo_13", "file_name": "g.jpg", "captured_at": "2019-01-01T00:00:00"},
+            {"handle": "photo_14", "file_name": "h.jpg", "captured_at": "2019-01-02T00:00:00"},
         ],
     },
 )
@@ -1013,7 +1013,7 @@ def assert_tool_messages_are_paired(messages: Sequence[ChatMessage]) -> None:
 def test_compaction_drops_oldest_round_but_keeps_latest_preview(env):
     """压缩丢**整轮**，但**最新一次检索/翻页的六图 preview 必须留下**。
 
-    丢一半会留下没有配对结果的 ``tool_calls``，端点直接 400。丢最新那份六图集则更糟：
+    丢一半会留下没有配对结果的 ``tool_calls``，端点直接 400。丢最新那份结果集页则更糟：
     模型知道「有结果集」却看不见任何候选，整道题只能猜。所以这里先 search 再 page，
     压缩时丢更老的 search 轮，保留 page 轮。
     """
@@ -1039,7 +1039,7 @@ def test_compaction_drops_oldest_round_but_keeps_latest_preview(env):
     assert len(model.calls) == 4, "第四次是压缩之后的那次重试"
     # 压缩前：两轮工具结果都在。
     assert sum(1 for m in model.calls[2] if m.role is ChatRole.TOOL) == 2
-    # 压缩后：只剩最新的 page 轮（六图集），更老的 search 轮被丢。
+    # 压缩后：只剩最新的 page 轮（结果集页），更老的 search 轮被丢。
     remaining = [m for m in model.calls[3] if m.role is ChatRole.TOOL]
     assert len(remaining) == 1
     assert '"page": 2' in remaining[0].content
@@ -1048,9 +1048,9 @@ def test_compaction_drops_oldest_round_but_keeps_latest_preview(env):
 
 
 def test_a_prompt_that_still_does_not_fit_ends_the_turn_honestly(env):
-    """只剩受保护的六图集时**不再往下丢**，如实收尾。
+    """只剩受保护的结果集页时**不再往下丢**，如实收尾。
 
-    再压就只能删掉六图集本身——那会让模型看不见任何候选，继续跑也只是猜。宁可
+    再压就只能删掉结果集页本身——那会让模型看不见任何候选，继续跑也只是猜。宁可
     以 ``MODEL_ERROR`` 收尾，也不产出无依据的答案。
     """
     _conversations, _turns, conversation, _db = env
