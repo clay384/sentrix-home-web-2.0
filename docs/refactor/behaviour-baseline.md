@@ -140,7 +140,7 @@
 |---|---|---|---|---|
 | §3.1 | 检索 preview 的字段 | `_RETRIEVAL_PREVIEW_KEEP` 7 个字段 + 复合 `evidence_summary`（caption → activity → place → objects[:8] → clothing[:8] → 文字：…，单段 120 字 / 整串 300 字上限） | **补齐同一套**，另加 `media_kind` / `level` / 顶层 `can_inspect` | 2.0 只暴露了 `caption` 一个列，而 `Observation` 上有八个。`objects` / `clothing` / `ocr_text` 恰恰是模型要调 `inspect_photo` / `read_photo_text` 才拿得到的东西——精读从 0.97 次/题涨到 3.4 次/题，撞上 `max_inspections = 3` 之后成片被拒（拒绝率 1.4% → 26.7%） |
 | §3.1 | preview 的 `level` | `exact` / `strong` / `approximate`，判据是「是不是事件成员」（`tools.py:1770`） | **同三个词，判据换成 `fusion.evidence_class_for`**：`anchor → exact`、`semantic → strong`、`expander → approximate` | 1.0 那个判据在 2.0 没有对应物；而 2.0 的融合层一直在算 `evidence_class`，只是 `RetrieveEvidence` 转 `EvidenceHit` 时把它丢了 |
-| §3.1 | preview 每页条数 | `preview[:5]` | **6**（`ResultSet.page_size`） | 1.0 那个 5 是它自己的上限裁切，没有证据说 5 比 6 好 |
+| §3.1 | preview 每页条数 | `preview[:5]` | **12**（`ResultSet.PAGE_SIZE`，等于 `MAX_SEARCH_LIMIT`） | 1.0 那个 5 是它自己的上限裁切；2026-10-27 由 6 调到 12：检索上限就是 12，一页给全后模型不再需要翻页（6 张一页时几乎每题多一次 `get_result_page` 模型步，Mac 实测约 16.9s） |
 | §3.1 | preview 缺失时的键 | 键恒在、值取空 | **同** | 空值的意思是「这张图没记录到」，缺键会让模型以为链路坏了 |
 | §3.2 | 每一转发几份工具契约 | JIT，`LITE_TOOL_SCHEMAS` 每工具 <40 token，单步 150–300 token | **JIT**，`ToolSpec.brief`（≤40 字）+ `jit.select_tools`。实测第一转 863 字符 / 检索后 1839 / 交付题 1246（全量是 5509） | 2.0 原先每转发全量八份完整 schema = 5509 字符 ≈ 2704 token；1.0 的真实 `prompt_tokens` 中位数是 1437 |
 | §3.2 | JIT 剪枝的效力 | **只剪提示词渲染**，准入白名单是 `profile.tools`——模型看不见但仍能调 | **剪掉即不能调**（原生 `tools` 字段既是广告也是约束） | 所以 2.0 的规则一律**比 1.0 保守**：只剪「现在根本用不上」的。`get_result_page` 只要已有结果集就一直在——`photo_set` 销账不等于候选看完了（一页 6 条、结果集最多 12 条） |
@@ -959,3 +959,15 @@ QA阶段的规范进度存于`phases.qa_eval.progress`：`agent_completed`为已
 Agent和Judge仍使用独立线程池，协调器等待任一池完成即提交结果，不再等全部Agent结束才回收Judge。恢复运行从已有明确Judge终态初始化计数，跳过事实单列，不重新请求既有评分。Agent阶段墙钟在最后Agent结果返回时结束，不包含等待Judge尾部。前端阶段卡和列表共用同一读取函数，优先内层、缺失时兼容外层；没有记录显示?，不以0替代未知。历史原文不改写，旧运行自身未更新的计数仍属于旧检查点事实，不能据有效评分数补造完整Judge终态。
 
 复现测试覆盖一题Agent阻塞时另一题Judge的合法0分、返回失败和抛异常及时可见；resume既有评分、失败/跳过、取消未开始题不假报完成、可空投影及历史外层字段UI。仅本地验证，未触碰四机或启动真实测评；后续发布按公共执行路径影响验证。
+
+## 2026-10-27 158 性能修正（页面容量 / 图像上限 / 建库并发 / 索引自愈）
+
+依据 `~/Downloads/sentrix-158-性能调查.md`（158 Mac 全链路实测）。四下改动的共同点是
+**只改被实测证明的路径，不引入可选档位**：数值全部落成常量。
+
+| # | 项 | 旧行为 | 现在 | 为什么 |
+|---|---|---|---|---|
+| P1 | 结果集每页条数 | 6 | **12**（`ResultSet.PAGE_SIZE`，与 `MAX_SEARCH_LIMIT` 相同） | 检索上限就是 12，一页给全；6 张一页让几乎每题多一次 `get_result_page` 模型步（Mac 实测约 16.9s） |
+| P2 | 发给视觉模型的图片长边 | 原图，无上限 | **1280**（`vlm_observer.IMAGE_MAX_SIDE`），人物预览先缩再画框 | 3264px 原图观察 4,260 prompt token / 48s，1280 为 1,445 / 24s；精读 ~4,100 → ~1,295；观察/精读语义抽检 8/8 一致 |
+| P3 | 人物瞬间抽取并发 | 串行 | **4**（`settings.album_workers`） | 建库 `person_insights` 418s → 236s；已确认人物的 moments 条数不变 |
+| P4 | 派生索引补写 | `already_indexed` 直接返回 `mirrored=True` | 从权威向量**幂等补写**镜像 | 嵌入式 Qdrant 写失败只记警告；旧路径永远补不回来（158 实测缺 344 条，`_staleness_reason` 全局比较，拖累所有 scope） |
