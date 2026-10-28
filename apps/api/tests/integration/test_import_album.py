@@ -137,7 +137,24 @@ def test_commits_follow_path_order_even_when_preparation_finishes_out_of_order(t
     root.mkdir()
     for name in ("a.jpg", "b.jpg", "c.jpg"):
         (root / name).write_bytes(b"x")
-    importer = StubImporter(slow={"a.jpg": 0.3})
+    b_prepared = threading.Event()
+    c_prepared = threading.Event()
+
+    class OrderedPreparationImporter(StubImporter):
+        def prepare_image(self, asset):
+            if asset.file_name == "a.jpg":
+                assert c_prepared.wait(timeout=5), "parallel preparation never reached c"
+            elif asset.file_name == "c.jpg":
+                assert b_prepared.wait(timeout=5), "parallel preparation never reached b"
+            prepared = super().prepare_image(asset)
+            if asset.file_name == "b.jpg":
+                b_prepared.set()
+            elif asset.file_name == "c.jpg":
+                c_prepared.set()
+            return prepared
+
+    # Explicitly order b -> c -> a; two zero-delay threads have no relative order.
+    importer = OrderedPreparationImporter()
 
     result = ImportAlbum(importer=importer, workers=3).execute(
         AlbumImportRequest(scope_id="album1", directory=str(root))
