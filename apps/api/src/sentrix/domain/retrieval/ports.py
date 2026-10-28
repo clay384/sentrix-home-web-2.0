@@ -57,6 +57,7 @@ class VectorIndexStatus:
     available: bool
     degraded: bool = False
     reason: str = ""
+    operational_issue: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +166,39 @@ class VectorIndexUnavailable(RuntimeError):
     """
 
 
+def retrieval_operational_issue(error: BaseException) -> dict[str, Any] | None:
+    """Classify only typed resource failures, without retaining SQL or exception text.
+
+    SQLite exposes stable numeric error codes on its exceptions. Checking the
+    standard exception's MRO keeps this domain helper independent of adapters and
+    accepts subclasses without treating a similarly worded application error as a lock.
+    """
+    code, failure = "", ""
+    sqlite_code = getattr(error, "sqlite_errorcode", None)
+    is_sqlite = any(
+        cls.__module__ == "sqlite3" and cls.__name__ == "OperationalError" for cls in type(error).__mro__
+    )
+    if is_sqlite and isinstance(sqlite_code, int) and (sqlite_code & 0xFF) in (5, 6):
+        code = "resource_error"
+        failure = "database_busy" if (sqlite_code & 0xFF) == 5 else "database_locked"
+    elif isinstance(error, MemoryError):
+        code, failure = "resource_error", "out_of_memory"
+    elif isinstance(error, TimeoutError):
+        code, failure = "time_limit", "retrieval_timeout"
+    elif isinstance(error, VectorIndexUnavailable):
+        code, failure = "resource_error", "vector_index_unavailable"
+    if not code:
+        return None
+    result: dict[str, Any] = {
+        "error_code": code,
+        "failure_code": failure,
+        "error_type": type(error).__name__,
+    }
+    if is_sqlite:
+        result["sqlite_errorcode"] = sqlite_code
+    return result
+
+
 class VectorIndex(Protocol):
     """派生向量索引。缺席不是错误，但必须被看见。
 
@@ -229,6 +263,18 @@ class AssetVisualIndexer(Protocol):
     def commit(self, asset: Asset, prepared: PreparedVisual) -> VisualIndexOutcome: ...
 
     def index(self, asset: Asset) -> VisualIndexOutcome: ...
+
+
+@runtime_checkable
+class EmbeddingDiagnostics(Protocol):
+    """Optional request-local diagnostics; reading must not perform IO.
+
+    Cleared before each embedding attempt, including empty input. A shared
+    adapter must isolate this value between caller threads.
+    """
+
+    @property
+    def last_operational_issue(self) -> Mapping[str, Any] | None: ...
 
 
 class VisualEmbedder(Protocol):

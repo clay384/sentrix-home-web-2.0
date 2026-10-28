@@ -240,3 +240,73 @@ def test_the_trace_is_what_makes_a_silent_channel_visible():
     assert (text_trace(silent).status, text_trace(silent).reason) == ("ok", "")
     assert text_trace(broken).status == "error"
     assert text_trace(broken).reason == "bge sidecar 不可达"
+
+
+@pytest.mark.parametrize("channel", ["text_ann", "graph"])
+@pytest.mark.parametrize(
+    "failure,expected_kind,expected_code",
+    [
+        ("busy", "resource_error", "database_busy"),
+        ("locked", "resource_error", "database_locked"),
+        ("timeout", "time_limit", "retrieval_timeout"),
+        ("memory", "resource_error", "out_of_memory"),
+        ("vector", "resource_error", "vector_index_unavailable"),
+    ],
+)
+def test_typed_resource_failure_keeps_other_hits_and_sanitized_evidence(
+    channel, failure, expected_kind, expected_code
+):
+    import sqlite3
+
+    from sentrix.domain.retrieval.ports import VectorIndexUnavailable
+
+    error = {
+        "busy": sqlite3.OperationalError("private SQL and path"),
+        "locked": sqlite3.OperationalError("private SQL and path"),
+        "timeout": TimeoutError("private SQL and path"),
+        "memory": MemoryError("private SQL and path"),
+        "vector": VectorIndexUnavailable("private SQL and path"),
+    }[failure]
+    if failure in ("busy", "locked"):
+        error.sqlite_errorcode = 5 if failure == "busy" else 262  # SQLITE_LOCKED_SHAREDCACHE
+
+    class Broken:
+        def execute(self, *_args, **_kwargs):
+            raise error
+
+    use_case = build(text_channel=Broken() if channel == "text_ann" else None)
+    if channel == "graph":
+        use_case._graph = Broken()
+    result = use_case.execute(request_())
+    trace = next(row for row in result.channel_trace if row.channel == channel)
+    assert trace.status == "error" and trace.reason == expected_code
+    assert trace.operational_issue["error_code"] == expected_kind
+    assert trace.operational_issue["failure_code"] == expected_code
+    assert trace.operational_issue["error_type"] == type(error).__name__
+    assert "private" not in repr(trace)
+    assert any(row.asset_id == "asset_a" for row in result.hits)
+
+
+def test_real_sqlite_busy_is_classified_without_relying_on_exception_message(tmp_path):
+    import sqlite3
+
+    from sentrix.domain.retrieval.ports import retrieval_operational_issue
+
+    with (
+        sqlite3.connect(tmp_path / "locked.sqlite3", timeout=0) as first,
+        sqlite3.connect(tmp_path / "locked.sqlite3", timeout=0) as second,
+    ):
+        first.execute("create table test (value text)")
+        first.execute("begin exclusive")
+        with pytest.raises(sqlite3.OperationalError) as raised:
+            second.execute("insert into test values ('private content')")
+    issue = retrieval_operational_issue(raised.value)
+    assert issue == {
+        "error_code": "resource_error",
+        "failure_code": "database_busy",
+        "error_type": "OperationalError",
+        "sqlite_errorcode": sqlite3.SQLITE_BUSY,
+    }
+    assert retrieval_operational_issue(RuntimeError("database is locked")) is None
+    # SQL bugs are not silently reclassified as resource shortages.
+    assert retrieval_operational_issue(sqlite3.OperationalError("no such table")) is None

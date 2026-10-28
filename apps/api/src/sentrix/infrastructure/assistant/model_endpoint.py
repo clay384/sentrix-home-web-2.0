@@ -34,6 +34,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 import httpx
 
@@ -67,7 +68,25 @@ class ServedModel:
         timeout_s: float = PROBE_TIMEOUT_S,
         ttl_s: float = PROBE_TTL_S,
         monotonic: Callable[[], float] = time.monotonic,
+        generation_profile: str = "legacy",
+        native_output_budget: bool = False,
+        json_streaming: bool = False,
+        json_output_mode: str = "json_object",
+        json_evidence_dir: Path | None = None,
+        json_private_content: bool = False,
     ) -> None:
+        if generation_profile not in {"legacy", "qwen35_nonthinking"}:
+            raise ValueError("unknown generation profile")
+        self._generation_profile = generation_profile
+        self.native_output_budget = native_output_budget
+        if json_private_content and (not json_streaming or json_evidence_dir is None):
+            raise ValueError("private JSON evidence requires streaming and a local evidence directory")
+        if json_output_mode not in {"json_object", "prompt_only", "json_schema"}:
+            raise ValueError("unknown JSON output mode")
+        self.json_output_mode = json_output_mode
+        self.json_streaming = json_streaming
+        self.json_evidence_dir = json_evidence_dir
+        self.json_private_content = json_private_content
         self._base_url = base_url.rstrip("/")
         self._timeout_s = timeout_s
         self._ttl_s = ttl_s
@@ -75,6 +94,20 @@ class ServedModel:
         self._lock = threading.Lock()
         self._name = ""
         self._expires_at = 0.0
+
+    def generation_parameters(self) -> dict[str, object]:
+        """Explicit sampling policy shared by every local model adapter."""
+        if self._generation_profile == "qwen35_nonthinking":
+            return {
+                "temperature": 0.7,
+                "seed": 42,
+                "top_p": 0.8,
+                "top_k": 20,
+                "min_p": 0.0,
+                "presence_penalty": 1.5,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+        return {"temperature": 0.0}
 
     @property
     def base_url(self) -> str:
@@ -103,29 +136,54 @@ class ServedModel:
             self._expires_at = 0.0
 
     def _probe(self) -> str:
+        policy = {
+            "request_phase": "model_discovery",
+            "request_timeout_s": self._timeout_s,
+            # A failed GET does not imply a completion was dispatched.
+            "request_outcome_unknown": False,
+        }
         try:
             response = httpx.get(f"{self._base_url}/models", timeout=self._timeout_s)
         except httpx.HTTPError as error:
-            raise ModelServiceError(f"模型端点 {self._base_url} 不可达：{error}") from error
+            raise ModelServiceError(
+                f"模型端点 {self._base_url} 不可达：{type(error).__name__}",
+                error_code="time_limit"
+                if isinstance(error, httpx.TimeoutException)
+                else "provider_unavailable",
+                request_policy=policy,
+            ) from error
 
         if response.status_code != 200:
             raise ModelServiceError(
-                f"模型端点 {self._base_url} 的 /models 返回 {response.status_code}：{response.text[:200]}"
+                f"模型端点 {self._base_url} 的 /models 返回 {response.status_code}",
+                error_code="provider_rejected",
+                http_status=response.status_code,
+                request_policy=policy,
             )
         try:
             body = response.json()
         except ValueError as error:
             raise ModelServiceError(
-                f"模型端点 {self._base_url} 的 /models 不是 JSON：{response.text[:200]}"
+                f"模型端点 {self._base_url} 的 /models 不是 JSON",
+                error_code="provider_rejected",
+                http_status=response.status_code,
+                request_policy=policy,
             ) from error
 
         names = served_names(body)
         if not names:
-            raise ModelServiceError(f"模型端点 {self._base_url} 上没有任何模型在服务")
-        if len(names) > 1:
-            # 不挑一个「看起来对」的：挑错了就是 404，而且没有任何依据说该挑哪个。
             raise ModelServiceError(
-                f"模型端点 {self._base_url} 同时服务多个模型（{'、'.join(names)}），无法判断该用哪一个"
+                f"模型端点 {self._base_url} 上没有任何模型在服务",
+                error_code="provider_unavailable",
+                http_status=response.status_code,
+                request_policy=policy,
+            )
+        if len(names) > 1:
+            raise ModelServiceError(
+                f"模型端点 {self._base_url} 同时服务多个模型（{'、'.join(names)}），无法判断该用哪一个",
+                error_code="provider_rejected",
+                http_status=response.status_code,
+                request_policy=policy,
             )
         return names[0]
 

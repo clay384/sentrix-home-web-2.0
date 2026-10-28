@@ -61,6 +61,7 @@ from photobench.domain.results.ports import RunResultWriter, RunStore
 from photobench.domain.runs import analysis
 from photobench.domain.runs.analysis import now_iso
 from photobench.domain.runs.execution import safe_slug
+from photobench.domain.runs.operational import incomplete_judge_issue, operational_issue
 from photobench.domain.runtime.ports import LifecycleProvider, RunRuntimeSnapshot, TelemetryProvider
 from photobench.domain.sentrix.ports import SentrixClient
 
@@ -364,10 +365,9 @@ class RunSuites:
         **与 ``reuse`` 共用同一块地基**：两者都是「绑到一个已经存在的 scope 上、
         不重新导入」。差别只在题目集——``reuse`` 从头跑全部，``resume`` 跳过已跑完的。
 
-        **只续跑「没跑过」的题**，判据逐条照 1.0 ``:3414-3417``：
-        ``execution_status not in {"scheduled", "running"}`` 的算已完成。
-        这也正是取消掉的题必须标 ``scheduled`` 而不能标 ``failed`` 的原因——
-        标 failed 的话它们会被当成「已跑完」，续跑时永远跳过（2026-10-15 改的）。
+        只续跑从未派发的题，保留已完成题及结果未知的在途题。
+        QA 已完成且 Judge 明确 not_started 时仅补评分；旧 pending 无派发证据时
+        保守标记 outcome_unknown。显式 rejudge 仍按原语义重新评分全部目标。
 
         2.0 此前直接回 501（``api/routes/suites.py``），理由是「scope 由导入内部 ensure，
         没有复用已存在 scope 这条路」。那条理由随 ``mode=reuse`` 一起消失了。
@@ -393,10 +393,9 @@ class RunSuites:
             raise InvalidRequestError(f"manifest not found for album: {album_id}") from exc
 
         prior_items = tuple(
-            item
+            RunExecution.resume_item(item)
             for item in (saved.get("items") or [])
-            if isinstance(item, dict)
-            and str(item.get("execution_status") or "") not in {"scheduled", "running"}
+            if isinstance(item, dict) and str(item.get("execution_status") or "") != "scheduled"
         )
         model_profile = str(saved.get("model_profile") or "")
         new_run_id = (
@@ -585,6 +584,8 @@ class RunSuites:
         """
         targets: list[tuple[int, int | None]] = []
         for item_index, item in enumerate(items):
+            if operational_issue(item):
+                continue
             if item.get("question") is None or item.get("reference_answer") is None or "answer" not in item:
                 continue
             turns = item.get("runtime_turns") or []
@@ -649,6 +650,19 @@ class RunSuites:
             }
             for index in sorted({item_index for item_index, _ in targets}):
                 item = state["items"][index]
+                if previous_issue := item.pop("judge_issue", None):
+                    item.setdefault("judge_issue_history", []).append(
+                        {"archived_at": now_iso(), "issue": previous_issue}
+                    )
+                for field in ("task_judge", "evidence_judge"):
+                    previous_observation = item.get(field)
+                    if isinstance(previous_observation, dict) and incomplete_judge_issue(
+                        previous_observation
+                    ):
+                        item.setdefault(f"{field}_history", []).append(
+                            {"archived_at": now_iso(), field: previous_observation}
+                        )
+                        item[field] = {"score": None, "correct": None, "reason": "pending_rejudge"}
                 prior = item.get("judge")
                 if prior:
                     item.setdefault("judge_history", []).append({"archived_at": now_iso(), "judge": prior})
@@ -660,6 +674,8 @@ class RunSuites:
                             turn.setdefault(f"{field}_history", []).append(
                                 {"archived_at": now_iso(), field: prior_turn}
                             )
+                            if isinstance(prior_turn, dict) and incomplete_judge_issue(prior_turn):
+                                turn[field] = {"score": None, "correct": None, "reason": "pending_rejudge"}
                     turn["judge"] = {
                         "score": None,
                         "reason": "",

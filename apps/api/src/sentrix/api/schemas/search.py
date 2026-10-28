@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel
 
 from sentrix.api.schemas.media import AssetSummary
@@ -31,6 +33,7 @@ class ChannelTrace(BaseModel):
     latency_ms: float
     backend: str = ""
     reason: str = ""
+    operational_issue: dict[str, Any] | None = None
 
 
 class SearchResponse(BaseModel):

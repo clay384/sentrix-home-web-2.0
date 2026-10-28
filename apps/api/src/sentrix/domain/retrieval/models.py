@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,3 +78,4 @@ class ChannelTrace:
     # ``getattr(retriever, "backend_used", None)``，取不到就是 None）。
     backend: str = ""
     reason: str = ""
+    operational_issue: Mapping[str, Any] | None = None

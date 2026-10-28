@@ -35,6 +35,7 @@ from typing import Any
 
 from sentrix.domain.media.inspection import build_inspect_prompt
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
+from sentrix.infrastructure.media.json_output_contracts import INSPECTION_SCHEMA
 from sentrix.infrastructure.media.vlm_observer import IMAGE_MAX_SIDE, _encode_image, chat_json
 
 
@@ -78,4 +79,12 @@ class OpenAIPhotoInspector:
         和 ``OpenAIPersonVision._chat`` 同一个手法，用例据此断言发出去的提示词与图的次序，
         而不必起 HTTP 服务。
         """
-        return chat_json(self._endpoint, self._model, prompt, images, self._timeout)
+        return chat_json(
+            self._endpoint,
+            self._model,
+            prompt,
+            images,
+            self._timeout,
+            output_schema=INSPECTION_SCHEMA,
+            schema_name="sentrix_photo_inspection_v1",
+        )

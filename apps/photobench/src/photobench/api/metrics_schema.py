@@ -2,9 +2,41 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
+
+
+class OperationalIssue(BaseModel):
+    """Versioned execution evidence, separate from answer/architecture quality."""
+
+    model_config = ConfigDict(extra="allow")
+    version: Literal[1]
+    kind: Literal[
+        "output_limit",
+        "context_limit",
+        "step_limit",
+        "time_limit",
+        "provider_rejected",
+        "resource_error",
+        "model_output_invalid",
+        "configuration_error",
+    ]
+    evidence: dict[str, Any]
+    scope: Literal["judge"] | None = None
+
+
+class OperationalCounts(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    not_evaluable_count: int
+    by_kind: dict[str, int]
+    judge_incomplete_count: int | None = None
+    judge_by_kind: dict[str, int] | None = None
+
+
+class RunSummaryProjection(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    operational: OperationalCounts | None = None
 
 
 class MemoryObservation(BaseModel):
@@ -58,12 +90,30 @@ class ImportObservationProjection(BaseModel):
     error: str | None = None
 
 
+class JudgeRequestMetrics(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    version: int | None = None
+    requests_started: int | None = None
+    responses_received: int | None = None
+    request_errors: int | None = None
+    http_429: int | None = None
+    in_flight: int | None = None
+    rate_waiting: int | None = None
+    rate_wait_ms: float | None = None
+
+
 class PhaseProgressProjection(BaseModel):
     model_config = ConfigDict(extra="allow")
+    operational: OperationalCounts | None = None
     total: int | None = None
     completed: int | None = None
     agent_completed: int | None = None
     agent_total: int | None = None
+    agent_waiting: int | None = None
+    agent_running: int | None = None
+    judge_waiting: int | None = None
+    judge_running: int | None = None
+    outcome_unknown: int | None = None
     judge_completed: int | None = None
     judge_total: int | None = None
     judge_skipped: int | None = None
@@ -82,6 +132,8 @@ class PhaseProgressProjection(BaseModel):
 
 class PhaseMetricsProjection(BaseModel):
     model_config = ConfigDict(extra="allow")
+    operational: OperationalCounts | None = None
+    judge_requests: JudgeRequestMetrics | None = None
     agent_completed: int | None = None
     agent_total: int | None = None
     judge_completed: int | None = None
@@ -93,6 +145,7 @@ class PhaseMetricsProjection(BaseModel):
 
 class RunMetricsResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
+    summary: RunSummaryProjection | None = None
     read_revision: str | None = None
     history_mode: str | None = None
     persistence: dict[str, Any] | None = None
@@ -110,6 +163,7 @@ class RunMetricsResponse(BaseModel):
 
 class JudgeObservation(BaseModel):
     model_config = ConfigDict(extra="allow")
+    operational_issue: OperationalIssue | None = None
     # Preserve legacy raw values; validation belongs to the versioned domain rule.
     score: Any = None
     score_normalization_version: int | None = None
@@ -122,6 +176,12 @@ class JudgeObservation(BaseModel):
 
 class RunItemObservation(BaseModel):
     model_config = ConfigDict(extra="allow")
+    operational_issue: OperationalIssue | None = None
+    judge_issue: OperationalIssue | None = None
+    evaluation_status: str | None = None
+    execution_status: str | None = None
+    judge_status: str | None = None
+    judge_dispatch_status: str | None = None
     judge: JudgeObservation | None = None
 
 

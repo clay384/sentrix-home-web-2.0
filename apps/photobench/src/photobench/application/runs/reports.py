@@ -39,7 +39,7 @@ from urllib.parse import quote
 
 from photobench.domain.datasets.ports import AlbumSource
 from photobench.domain.http.ports import JsonHttpClient
-from photobench.domain.results.ports import RunStore
+from photobench.domain.results.ports import RunRevisions, RunStore
 from photobench.domain.runs import exports, graph_quality, keyframe_analysis, memory_effectiveness
 
 #: 2.0 的 REST 前缀。1.0 是 ``/api``。
@@ -81,6 +81,7 @@ class RunReports:
         albums: AlbumSource | None = None,
     ) -> None:
         self._store = store
+        self._versions = store if isinstance(store, RunRevisions) else None
         self._http = http
         self._sentrix_url = sentrix_url
         self._albums = albums
@@ -88,6 +89,8 @@ class RunReports:
         self._memo: OrderedDict[tuple[str, ...], tuple[float, dict[str, Any]]] = OrderedDict()
 
     def _memo_get(self, key: tuple[str, ...]) -> dict[str, Any] | None:
+        if not key[-1]:
+            return None
         now = time.monotonic()
         with self._memo_lock:
             cached = self._memo.get(key)
@@ -97,6 +100,8 @@ class RunReports:
             return copy.deepcopy(cached[1])
 
     def _memo_put(self, key: tuple[str, ...], value: dict[str, Any]) -> None:
+        if not key[-1]:
+            return  # Legacy readers have no reliable revision; never cache stale results.
         now = time.monotonic()
         with self._memo_lock:
             self._memo[key] = (now, copy.deepcopy(value))
@@ -166,7 +171,11 @@ class RunReports:
 
     def keyframe_analysis(self, run_id: str) -> dict[str, Any]:
         # 先取 revision：不存在时与 ``_state`` 同一个出口抛 ``KeyError``（HTTP 404）。
-        cache_key = ("keyframe", run_id, self._store.revision(run_id))
+        cache_key = (
+            "keyframe",
+            run_id,
+            self._versions.revision(run_id) if self._versions is not None else "",
+        )
         cached = self._memo_get(cache_key)
         if cached is not None:
             return cached
@@ -184,7 +193,7 @@ class RunReports:
         return result
 
     def memory_effectiveness(self, run_id: str) -> dict[str, Any]:
-        cache_key = ("memory", run_id, self._store.revision(run_id))
+        cache_key = ("memory", run_id, self._versions.revision(run_id) if self._versions is not None else "")
         cached = self._memo_get(cache_key)
         if cached is not None:
             return cached

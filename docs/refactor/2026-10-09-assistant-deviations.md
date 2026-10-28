@@ -126,3 +126,21 @@
 **理由**：见计划文档 §7.4。要点是 1.0 的判据与 §4 已经否掉的 `recommended_resolution`
 同类（硬编码题型词），而它服务的只有 487 道题里的 1 道；`people_count` 还顺带补掉另一个
 洞——`people` 只有已确认的人名，只看它会把「四个人合影、认出来一个」读成「一个人」。
+
+### 2026-10-26：显式 native 实验预算与操作证据
+
+在 native 模式允许四项工具次数预算以准确环境字符串 `null` 关闭，仍执行显式模型步和墙钟；不更改 legacy 默认。Planner单独记录，native主循环/L2/上下文恢复/forced final共用30步，强制收尾不再获得预算外第31次调用。工具帽/收尾时间预留实际限制执行时记录budget_events，末尾已超墙钟也记录；PhotoBench排除这些题的质量评分并保留真实答案及轨迹。模型发现失败不再仅有泛型ModelServiceError，供应商内容过滤/无效响应也保留操作类型。此偏离遵循用户“所有限额或供应商故障必须明确，不得当架构回答质量0”要求；并不修改正常错误答案、合法模型拒答和不合法tool arguments的评分规则。
+
+### 2026-10-27：显式 JSON 输出模式与格式失败
+
+`SENTRIX_VLM_JSON_OUTPUT_MODE=json_object|prompt_only` 独立于 native 输出预算和流式传输，默认 `json_object` 保持兼容；`prompt_only` 只省略 `response_format`，不自动降级、不修补 JSON、不增加 token/字符帽。Settings 的运行诊断、请求 policy 和流式状态均记录实际模式。观察、图片复核、人物视觉共用此配置。完整 `stop` 响应无法解析 JSON 对象时抛 `model_output_invalid`，明确结果已知但格式不可用；流水线失败、QA 不可评估，不能把缺语义作为答案错误。合法 `{}` 与不可读本地图片的既有缺席语义保留。
+
+
+### 2026-10-27：流式请求实际生成参数证据
+
+每条 VLM SSE 状态增加 `generation_parameters`，从最终请求 body 提取 temperature/top_p/top_k/min_p/presence_penalty/repetition_penalty/seed、chat_template_kwargs.enable_thinking，以及显式 max_tokens/max_completion_tokens；不从 profile 声明推断。`generation_parameters_omitted` 明确缺省字段，显式 null 仍保留在参数内；非预期类型仅在 `generation_parameters_invalid` 记字段名，不记录其内容、不改请求。安全参数、排序后的缺省/无效字段清单共同以 sorted-key、紧凑 ASCII JSON 计算 SHA256，格式为 `whitelisted_parameters_omitted_invalid_sorted_json_v1`。该指纹只覆盖列明的生成参数，不是完整请求或服务端默认值的认证；正文/图片/密钥不进入参数记录。所有派发、进度和终态继承同一指纹，正常结束不能掩盖诊断 presence_penalty=0 与产品1.5的差异。此补充仅观测，不改变采样、解析、默认JSON模式、重试或原生预算。验证：`apps/api/tests/integration/test_vlm_json_stream.py`。
+
+
+### 2026-10-27：按业务显式约束 JSON 结构
+
+`json_schema` 是第三种显式视觉输出模式，默认不变；各调用方提供已有业务契约，不能给人物/复核任务套观察八字段。缺失配置在任何模型发现/生成前报 `request_configuration_invalid`，是已知配置故障；完整但不符合契约的回复报已知 `model_output_invalid`。保留原提示、native无输出帽与官方采样；不增加maxLength，人物瞬间/衣物不新增maxItems。实际schema名/排序JSON SHA进入安全policy/流式状态，不记录schema原文。旧json_object基线仍按原生产者身份复用，未来schema建库单独绑定契约源码与模式。验证为 `test_json_output_contracts.py`、`test_vlm_json_stream.py` 的五业务HTTP与三观察阶段回归、API typed错误契约。

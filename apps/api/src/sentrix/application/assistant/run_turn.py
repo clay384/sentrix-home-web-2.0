@@ -291,6 +291,16 @@ def _turn_trace(session: _Session, planned: PlannerResult | None) -> Mapping[str
     requirements = [dict(item) for item in ledger.as_payload()]
     return {
         "model_calls": [*(planned.model_calls if planned else ()), *session.model_calls],
+        "tool_calls": [
+            {
+                "tool": item.tool,
+                "call_id": item.call_id,
+                "status": item.status,
+                "failure_reason": item.failure_reason,
+                "observation": dict(item.observation),
+            }
+            for item in state.records
+        ],
         "planner": {
             # ``fallback_reason`` 为空 = 规划器正常答了；非空 = 它退回了规则/失败。
             # ``planned`` 为空 = 压根没走到规划（政策拒答那条提前 return 了）。
@@ -317,6 +327,15 @@ def _turn_trace(session: _Session, planned: PlannerResult | None) -> Mapping[str
             for event in state.progress
             if event.kind == "guard"
         ],
+        "budget_events": [dict(event) for event in state.budget_events],
+        "faithfulness_review": {
+            "attempted": session.judged,
+            "skipped_for_model_step_budget": session.l2_skipped_for_step_budget,
+        },
+        "claim_verification_review": {
+            "attempted": session.l3_judged,
+            "skipped_for_model_step_budget": session.l3_skipped_for_step_budget,
+        },
         "budget": {
             "model_steps": state.model_steps,
             "tool_round_trips": state.tool_round_trips,
@@ -324,7 +343,12 @@ def _turn_trace(session: _Session, planned: PlannerResult | None) -> Mapping[str
             "page_calls": state.page_calls,
             "inspection_calls": state.inspection_calls,
             "max_steps": state.profile.max_steps,
+            "strict_model_step_budget": state.profile.strict_model_step_budget,
             "max_tool_calls": state.profile.max_tool_calls,
+            "max_search_calls": state.profile.max_search_calls,
+            "max_page_calls": state.profile.max_page_calls,
+            "max_inspections": state.profile.max_inspections,
+            "wall_time_s": state.profile.wall_time_s,
         },
         "delivered": [item.asset_id for item in session.delivered.items],
         "answer_coverage": session.best_coverage,
@@ -517,6 +541,7 @@ class _Session:
     search_returned_nothing: bool = False
     # 1.0 ``runtime.py:2759`` 的 ``l2_faithfulness_checked``：每问只评审一次。
     judged: bool = False
+    l2_skipped_for_step_budget: bool = False
     # 1.0 ``runtime.py:2786-2788`` 的 ``turn.l2_unverified`` / ``l2_unverified_reason``：
     # 这一次 final 曾被 L2 判过不实。**它是「放行时打标」那一半的依据**——见
     # ``_judge_answer`` 里发 ``l2_soft_release`` 的那一处。
@@ -557,6 +582,7 @@ class _Session:
     #: L3 每回合最多一次；这张表进轨迹，用来对比旧 L2 的触发率与命中的 claim。
     claim_reviews: list[dict[str, Any]] = field(default_factory=list)
     l3_judged: bool = False
+    l3_skipped_for_step_budget: bool = False
 
     def add_debug_call(self, call: Mapping[str, Any]) -> None:
         """按发生顺序编号后追加一次模型调用。``seq`` 只在回合内唯一。"""
@@ -724,6 +750,13 @@ class RunTurn:
         # 必须在最后一次 ``as_payload()`` 之前——它同时喂给落库与返回值。
         session.ledger.mark_unmet(attempted=_attempted_evidence_types(session.state))
 
+        if session.state.wall_remaining() <= 0:
+            session.state.record_budget_limit(
+                "time_limit",
+                budget_name="wall_time_s",
+                used=session.state.profile.wall_time_s - session.state.wall_remaining(),
+                limit=session.state.profile.wall_time_s,
+            )
         reason = session.state.termination_reason or session.state.finish(TerminationReason.MODEL_ERROR)
         status = _status_for(reason)
         self._publish(
@@ -794,7 +827,10 @@ class RunTurn:
         if session.include_debug:
             debug_call = {
                 "step_id": step_id,
-                "call_type": call_type,
+                "call_type": {
+                    "faithfulness": "faithfulness_judge",
+                    "claim_verification": "claim_verifier",
+                }.get(call_type, call_type),
                 "attempt": record["attempt"],
                 "started_at": datetime.now(UTC).isoformat(),
                 "status": "error",
@@ -818,6 +854,7 @@ class RunTurn:
                 prompt_tokens=reply.prompt_tokens,
                 completion_tokens=reply.completion_tokens,
                 finish_reason=reply.finish_reason,
+                request_policy=dict(reply.request_policy),
                 tool_calls=[call.name for call in reply.tool_calls],
                 tool_argument_parse_facts=facts,
             )
@@ -836,6 +873,18 @@ class RunTurn:
             record.update(error_type=type(error).__name__, error=str(error))
             if debug_call is not None:
                 debug_call.update(error_type=type(error).__name__, error=str(error))
+            if isinstance(error, ModelServiceError):
+                for key in (
+                    "error_code",
+                    "http_status",
+                    "request_policy",
+                    "finish_reason",
+                    "prompt_tokens",
+                    "completion_tokens",
+                ):
+                    value = getattr(error, key)
+                    if value is not None:
+                        record[key] = value
             raise
         finally:
             duration_ms = round((time.perf_counter() - started) * 1000, 1)
@@ -859,6 +908,9 @@ class RunTurn:
                 state.finish(reason)
                 return self._stop(session, reason)
 
+            if state.needs_reserved_final():
+                return self._finalize_reserved_step(session, messages)
+
             state.model_steps += 1
             state.phase = ACTING
             self._publish(
@@ -876,6 +928,21 @@ class RunTurn:
             # 「这一转不该再调工具了」，而 ``select_tools`` 对它的处置是**一个工具都不发**：
             # 模型于是别无选择，只能说话。实测 ``step_budget_exhausted`` 的 123 道里
             # 102 道判 0，根子就是模型到最后几步仍然只在撞墙、从没被逼着开口。
+            if not state.can_call_tool():
+                if not state.has_final_reserve():
+                    state.record_budget_limit(
+                        "time_limit",
+                        budget_name="final_reserve_s",
+                        used=state.profile.wall_time_s - state.wall_remaining(),
+                        limit=state.profile.wall_time_s - state.profile.final_reserve_s,
+                    )
+                elif state.profile.max_tool_calls is not None:
+                    state.record_budget_limit(
+                        "tool_budget_exhausted",
+                        budget_name="max_tool_calls",
+                        used=state.tool_round_trips,
+                        limit=state.profile.max_tool_calls,
+                    )
             specs = select_tools(
                 session.ledger,
                 has_result_set=state.current_result_set_id is not None,
@@ -893,6 +960,8 @@ class RunTurn:
                 # 「压缩就能救回来」的回合判成了模型故障。每次丢一整轮，所以这个循环
                 # 的步数上界就是历史里的往返数。
                 while True:
+                    if state.needs_reserved_final():
+                        return self._finalize_reserved_step(session, messages)
                     compacted = _drop_oldest_tool_round_trip(messages)
                     if compacted is None:
                         log.warning("提示词超预算，而历史里已经没有可压缩的工具往返: %s", error)
@@ -908,6 +977,16 @@ class RunTurn:
                             payload={"code": "prompt_too_long"},
                         ),
                     )
+                    if state.profile.strict_model_step_budget:
+                        if not state.can_step():
+                            reason = (
+                                TerminationReason.TIMEOUT
+                                if state.wall_remaining() <= 0
+                                else TerminationReason.STEP_BUDGET_EXHAUSTED
+                            )
+                            state.finish(reason)
+                            return self._stop(session, reason)
+                        state.model_steps += 1
                     try:
                         reply = self._complete_recorded(session, messages, specs)
                         break
@@ -1492,7 +1571,12 @@ class RunTurn:
                 return self._review_with_l2(session, messages, answer)
             unbound = [claims[0]]
 
-        if session.l3_judged or not state.can_step():
+        if session.l3_judged:
+            return False
+        if not state.can_step():
+            # This is an unreviewed answer at the shared limit, never a passed L3.
+            if state.profile.strict_model_step_budget:
+                session.l3_skipped_for_step_budget = True
             return False
         session.l3_judged = True
         state.model_steps += 1
@@ -1503,8 +1587,9 @@ class RunTurn:
             claim=claim,
             facts=facts,
             requirement=claim_requirement(claim, session.ledger.requirements),
-            include_debug=session.include_debug,
-            step_id=step_id,
+            complete=lambda review_messages, specs: self._complete_recorded(
+                session, review_messages, specs, call_type="claim_verification"
+            ),
         )
         session.claim_reviews.append(
             {
@@ -1537,7 +1622,16 @@ class RunTurn:
             f"（{review.reason or review.verdict.value}）。"
             "请核对工具观察后重新给出回答；如果确实无法确认，请如实说明。"
         )
-        return state.can_step()
+        can_rewrite = state.can_step()
+        if not can_rewrite:
+            timed_out = state.wall_remaining() <= 0
+            state.record_budget_limit(
+                "time_limit" if timed_out else "step_budget_exhausted",
+                budget_name="wall_time_s" if timed_out else "max_steps",
+                used=(state.profile.wall_time_s - state.wall_remaining()) if timed_out else state.model_steps,
+                limit=state.profile.wall_time_s if timed_out else state.profile.max_steps,
+            )
+        return can_rewrite
 
     def _review_with_l2(self, session: _Session, messages: Sequence[ChatMessage], answer: str) -> bool:
         """L2 语义评审。返回 ``True`` 表示「继续循环，重新作答」。
@@ -1565,7 +1659,13 @@ class RunTurn:
         observations = [
             record for record in state.records if record.tool != FINAL_ANSWER_TOOL and record.status == "ok"
         ]
-        if session.judged or not observations or not state.can_step():
+        if session.judged or not observations:
+            return False
+        if not state.can_step():
+            # Observational evidence, not an invented budget failure or a passed
+            # review. Existing L2 eligibility still requires an available step.
+            if state.profile.strict_model_step_budget:
+                session.l2_skipped_for_step_budget = True
             return False
         session.judged = True
         state.model_steps += 1
@@ -1574,11 +1674,10 @@ class RunTurn:
             query=state.question,
             answer=answer,
             transcript=messages,
-            include_debug=session.include_debug,
-            step_id=judge_step_id,
+            complete=lambda review_messages, specs: self._complete_recorded(
+                session, review_messages, specs, call_type="faithfulness"
+            ),
         )
-        if session.include_debug and verdict.debug_call is not None:
-            session.add_debug_call(verdict.debug_call)
         if verdict.faithful or not verdict.truth_problems:
             return False
         # 1.0 ``runtime.py:2786-2788``：判过不实就先把标记落下来。**标记在「判不实」那一刻
@@ -1615,8 +1714,17 @@ class RunTurn:
         # 步了，提醒只会换来一次『预算用尽』的收尾」），L2 这条路当时没跟上。
         #
         # 写成 ``return state.can_step()``：走到这里已经确定判了不实，唯一还剩的问题就是
-        # **还能不能重答**——不能就落回收尾路径。
-        return state.can_step()
+        # **还能不能重答**——不能就落回收尾路径，但不能把预算阻止重答隐藏成质量失败。
+        can_rewrite = state.can_step()
+        if not can_rewrite:
+            timed_out = state.wall_remaining() <= 0
+            state.record_budget_limit(
+                "time_limit" if timed_out else "step_budget_exhausted",
+                budget_name="wall_time_s" if timed_out else "max_steps",
+                used=(state.profile.wall_time_s - state.wall_remaining()) if timed_out else state.model_steps,
+                limit=state.profile.wall_time_s if timed_out else state.profile.max_steps,
+            )
+        return can_rewrite
 
     def _run_tool(self, session: _Session, call: ToolCall) -> tuple[str, tuple[Attachment, ...], bool, bool]:
         """执行一次工具调用，返回 ``(发回模型的 JSON, 本次交付, 检索是否为空, 有没有拿到东西)``。
@@ -1628,6 +1736,31 @@ class RunTurn:
         decision = self._policy.decide(call, state)
 
         if decision.action is ToolAction.DENY:
+            budget_codes = {
+                "tool_budget_exhausted": (
+                    "max_tool_calls",
+                    state.tool_round_trips,
+                    state.profile.max_tool_calls,
+                ),
+                "search_call_limit": ("max_search_calls", state.search_calls, state.profile.max_search_calls),
+                "page_call_limit": ("max_page_calls", state.page_calls, state.profile.max_page_calls),
+                "inspection_budget_exhausted": (
+                    "max_inspections",
+                    state.inspection_calls,
+                    state.profile.max_inspections,
+                ),
+            }
+            if decision.code == "tool_budget_exhausted" and not state.has_final_reserve():
+                state.record_budget_limit(
+                    "time_limit",
+                    budget_name="final_reserve_s",
+                    used=state.profile.wall_time_s - state.wall_remaining(),
+                    limit=state.profile.wall_time_s - state.profile.final_reserve_s,
+                )
+            elif decision.code in budget_codes:
+                name, used, limit = budget_codes[decision.code]
+                if limit is not None:
+                    state.record_budget_limit(decision.code, budget_name=name, used=used, limit=limit)
             state.record(
                 ToolCallRecord(
                     call_id=call.call_id,
@@ -1789,19 +1922,74 @@ class RunTurn:
             detail=detail,
         )
 
-    def _force_final_once(self, session: _Session) -> str:
-        """**额外一次纯 final 调用**：让模型明确给出结论。失败返回空串。
+    def _finalize_reserved_step(self, session: _Session, messages: Sequence[ChatMessage]) -> str:
+        """Use the existing tool-free recovery request inside the shared limit.
+
+        No exhaustion event is emitted merely for reserving a final step. The
+        authored reply still goes through the ordinary answer gates; this does
+        not certify its content or create an extra model/review allowance.
+        """
+        state = session.state
+        state.phase = FINALIZING
+        try:
+            answer = self._force_final_once(session, require_reply=True)
+        except Exception as error:
+            return self._model_error_stop(session, error)
+        if not answer:
+            reason = (
+                TerminationReason.TIMEOUT
+                if not state.has_final_reserve()
+                else TerminationReason.STEP_BUDGET_EXHAUSTED
+            )
+            state.finish(reason)
+            return self._stop(session, reason, retry_final=False)
+        session.last_answer = answer
+        accepted = self._judge_answer(session, messages, answer)
+        if accepted is not None:
+            return accepted
+        # A real gate requested another answer after the final slot. Keep the
+        # original budget diagnosis rather than silently adding a 31st call.
+        state.record_budget_limit(
+            "step_budget_exhausted",
+            budget_name="max_steps",
+            used=state.model_steps,
+            limit=state.profile.max_steps,
+        )
+        state.finish(TerminationReason.STEP_BUDGET_EXHAUSTED)
+        return self._stop(session, TerminationReason.STEP_BUDGET_EXHAUSTED, retry_final=False)
+
+    def _force_final_once(self, session: _Session, *, require_reply: bool = False) -> str:
+        """复用纯文本 final 请求：native 计入共享预算，legacy 保留额外恢复。
+
+        ``require_reply`` 用于预算内收尾；传输或协议错误必须保留，不能吞成空回答。
 
         1.0 ``runtime.py:1590-1623``（定义）与 ``:2379-2387``（步数耗尽处调用）。
 
-        **它不计 ``model_steps``**（那正是它的用处：预算已经用完了），只受墙钟的
-        ``final_reserve`` 约束——一个跑飞的生成不该拖过收尾预算。
+        Legacy 保持历史额外收尾；native 的 recovery 也计入同一份模型步预算，
+        不能在 30 步之外再偷偷派发。Planner 独立记录，主循环、L2 和 recovery 共用预算。
+        两种模式都检查墙钟的 ``final_reserve``。
 
         **只在 ``last_answer`` 为空时才走这里**：模型已经说过话的时候再问一次，是把
         一轮注定要收尾的对话又拖长一次，而用户等的是那句已经写好的答案。
         """
         if not session.state.has_final_reserve():
+            session.state.record_budget_limit(
+                "time_limit",
+                budget_name="final_reserve_s",
+                used=session.state.profile.wall_time_s - session.state.wall_remaining(),
+                limit=session.state.profile.wall_time_s - session.state.profile.final_reserve_s,
+            )
             return ""
+        if session.state.profile.strict_model_step_budget:
+            if not session.state.can_step():
+                session.state.record_budget_limit(
+                    "step_budget_exhausted",
+                    budget_name="max_steps",
+                    used=session.state.model_steps,
+                    limit=session.state.profile.max_steps,
+                )
+                return ""
+            session.state.model_steps += 1
         # **不带任何工具**：这一问的目的就是让模型把话说出来，不是让它再查一轮
         # （``specs`` 传空元组，模型没有可调的东西）。也不重放历史——走到这里说明
         # 前面已经塌了，把塌掉的过程再喂一遍只会让它重蹈覆辙。
@@ -1812,10 +2000,28 @@ class RunTurn:
         ]
         try:
             reply = self._complete_recorded(session, messages, (), call_type="recovery")
-        except Exception:  # noqa: BLE001 —— 兜底里的兜底：它失败就落回固定文案
+        except Exception:  # noqa: BLE001 —— legacy recovery preserves its fallback behavior
+            if require_reply:
+                raise
             log.warning("强制收尾的模型调用失败，落回确定性兜底", exc_info=True)
             return ""
         text = (reply.content or "").strip()
+        if require_reply and (
+            not text or reply.wants_tools or reply.finish_reason != "stop" or _TEXTUAL_TOOL_CALL.search(text)
+        ):
+            error = ModelServiceError(
+                "模型没有返回可用的纯文本收尾（model_output_invalid）；未重试。",
+                error_code="model_output_invalid",
+                finish_reason=reply.finish_reason,
+                request_policy={**reply.request_policy, "request_outcome_unknown": False},
+            )
+            session.model_calls[-1].update(
+                status="error",
+                error_type=type(error).__name__,
+                error_code=error.error_code,
+                request_policy=dict(error.request_policy),
+            )
+            raise error
         # 这一问不带工具，模型本不该有理由写工具调用标记；真写了就当没答出来，
         # 落回 ``_stop`` 里那版已经存下的答案或确定性兜底。
         if not text or _TEXTUAL_TOOL_CALL.search(text):

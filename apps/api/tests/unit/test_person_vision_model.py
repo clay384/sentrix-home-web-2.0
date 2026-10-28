@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
+from PIL import Image
 
 from sentrix.domain.identity.moments import PERSON_MOMENT_PROMPT
 from sentrix.domain.identity.portrait import PERSON_PORTRAIT_PROMPT
@@ -72,7 +74,7 @@ class ScriptedVision(OpenAIPersonVision):
         self.prompts: list[str] = []
         self.images: list[str | None] = []
 
-    def _chat(self, prompt: str, image: str | None) -> dict | None:
+    def _chat(self, prompt: str, image: str | None, **_contract: Any) -> dict | None:
         self.prompts.append(prompt)
         self.images.append(image)
         return self.replies[min(len(self.prompts) - 1, len(self.replies) - 1)]
@@ -81,7 +83,7 @@ class ScriptedVision(OpenAIPersonVision):
 @pytest.fixture
 def image(tmp_path: Path) -> Path:
     path = tmp_path / "p.jpg"
-    path.write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
+    Image.new("RGB", (12, 8), "red").save(path, format="JPEG")
     return path
 
 

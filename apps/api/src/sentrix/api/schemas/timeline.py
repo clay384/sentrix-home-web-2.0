@@ -141,6 +141,7 @@ class MemoryGraphBuildResponse(BaseModel):
     causal_candidate_pairs: int = 0
     causal_edges: int = 0
     causal_status: str = "not_configured"
+    causal_issues: list[dict[str, object]] = Field(default_factory=list)
     causal_seconds: float = 0.0
     keyframe_count: int = 0
     keyframe_temporal_edges: int = 0

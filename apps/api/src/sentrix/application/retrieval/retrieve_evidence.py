@@ -38,6 +38,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 from sentrix.application.retrieval.evaluate_conditions import EvaluateConditions
 from sentrix.application.retrieval.retrieve_entity import RetrieveEntity
@@ -58,6 +59,7 @@ from sentrix.domain.media.models import MediaType
 from sentrix.domain.retrieval.conditions import Condition
 from sentrix.domain.retrieval.fusion import DEFAULT_CHANNEL_WEIGHTS, fuse
 from sentrix.domain.retrieval.models import CandidateHit, ChannelTrace, FusedCandidate
+from sentrix.domain.retrieval.ports import retrieval_operational_issue
 
 log = logging.getLogger("sentrix.retrieval.evidence")
 
@@ -155,15 +157,27 @@ class EvidenceResult:
 
 def _visual_candidates_health(
     result: VisualSearchResult,
-) -> tuple[tuple[CandidateHit, ...], str, bool, str]:
+) -> tuple[tuple[CandidateHit, ...], str, bool, str, Mapping[str, Any] | None]:
     """视觉通道的候选 + 它的健康度。**两个一起取**，理由见 ``record`` 的 docstring。"""
-    return _visual_candidates(result), result.backend, result.degraded, result.degraded_reason
+    return (
+        _visual_candidates(result),
+        result.backend,
+        result.degraded,
+        result.degraded_reason,
+        result.operational_issue,
+    )
 
 
 def _text_candidates_health(
     result: TextSearchResult,
-) -> tuple[tuple[CandidateHit, ...], str, bool, str]:
-    return _text_candidates(result), result.backend, result.degraded, result.degraded_reason
+) -> tuple[tuple[CandidateHit, ...], str, bool, str, Mapping[str, Any] | None]:
+    return (
+        _text_candidates(result),
+        result.backend,
+        result.degraded,
+        result.degraded_reason,
+        result.operational_issue,
+    )
 
 
 def _visual_candidates(result: VisualSearchResult) -> tuple[CandidateHit, ...]:
@@ -242,11 +256,12 @@ class RetrieveEvidence:
         traces: list[ChannelTrace] = []
 
         def record(
-            name: str, run: Callable[[], tuple[Sequence[CandidateHit], str, bool, str]]
+            name: str,
+            run: Callable[[], tuple[Sequence[CandidateHit], str, bool, str, Mapping[str, Any] | None]],
         ) -> Sequence[CandidateHit]:
             """跑一个通道并记下它的轨迹。
 
-            ``run`` **把调用本身包在里面**，返回 ``(候选, backend, 是否降级, 原因)``。
+            ``run`` **把调用本身包在里面**，返回 ``(候选, backend, 是否降级, 原因, 故障证据)``。
             健康度必须在**跑完之后**才拿得到，所以不能像早先那样当参数先算出来——
             那样两个向量通道的调用会落在 try 之外，它们抛异常时整次检索就挂了
             （定点变异抓到过这一版）。**一个通道挂了不该让整次检索挂掉**，
@@ -254,16 +269,19 @@ class RetrieveEvidence:
             """
             started = time.monotonic()
             try:
-                hits, backend, degraded, degraded_reason = run()
+                hits, backend, degraded, degraded_reason, operational_issue = run()
             except Exception as error:  # noqa: BLE001 - 见 docstring
-                log.warning("召回通道 %s 抛异常，本次按空结果继续: %s", name, error)
+                issue = retrieval_operational_issue(error)
+                reason = str(issue["failure_code"]) if issue else str(error)
+                log.warning("召回通道 %s 抛异常，本次按空结果继续: %s", name, reason)
                 traces.append(
                     ChannelTrace(
                         channel=name,
                         status="error",
                         candidate_count=0,
                         latency_ms=round((time.monotonic() - started) * 1000, 1),
-                        reason=str(error),
+                        reason=reason,
+                        operational_issue=issue,
                     )
                 )
                 return ()
@@ -277,13 +295,16 @@ class RetrieveEvidence:
                     latency_ms=round((time.monotonic() - started) * 1000, 1),
                     backend=backend,
                     reason=degraded_reason if degraded else "",
+                    operational_issue=operational_issue,
                 )
             )
             return hits
 
-        def plain(hits: Sequence[CandidateHit]) -> tuple[Sequence[CandidateHit], str, bool, str]:
+        def plain(
+            hits: Sequence[CandidateHit],
+        ) -> tuple[Sequence[CandidateHit], str, bool, str, Mapping[str, Any] | None]:
             """三条没有健康度的通道（metadata / entity / lexical）用这个包一下。"""
-            return hits, "", False, ""
+            return hits, "", False, "", None
 
         # 视觉通道的健康度**还要往上报一层**（``EvidenceResult.backend`` / ``degraded``
         # 是响应顶层的字段），而它的调用现在在 ``record`` 里面。用一个一格盒子把它带出来。
@@ -291,7 +312,7 @@ class RetrieveEvidence:
         # 默认值，也是实情。
         visual_box: list[VisualSearchResult] = []
 
-        def run_visual() -> tuple[Sequence[CandidateHit], str, bool, str]:
+        def run_visual() -> tuple[Sequence[CandidateHit], str, bool, str, Mapping[str, Any] | None]:
             result = self._visual.execute(
                 VisualSearchRequest(text=text, scope_id=request.scope_id, limit=recall_limit)
             )
@@ -376,7 +397,9 @@ class RetrieveEvidence:
                     )
                 )
             except Exception as error:  # noqa: BLE001 - 图是可降级的派生通道
-                log.warning("图记忆拓展抛异常，本次按空结果继续: %s", error)
+                issue = retrieval_operational_issue(error)
+                reason = str(issue["failure_code"]) if issue else str(error)
+                log.warning("图记忆拓展抛异常，本次按空结果继续: %s", reason)
                 channel_hits[GRAPH_CHANNEL] = ()
                 traces.append(
                     ChannelTrace(
@@ -384,7 +407,8 @@ class RetrieveEvidence:
                         status="error",
                         candidate_count=0,
                         latency_ms=round((time.monotonic() - graph_started) * 1000, 1),
-                        reason=str(error),
+                        reason=reason,
+                        operational_issue=issue,
                     )
                 )
 

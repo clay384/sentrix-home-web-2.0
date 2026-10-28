@@ -341,9 +341,10 @@ QUERY_PHOTO_PEOPLE = ToolSpec(
 
 INSPECT_PHOTO = ToolSpec(
     name="inspect_photo",
-    brief="复核单张照片的视觉细节（物体/衣着/颜色/场景）。昂贵。",
+    brief="复核照片或视频采样帧，多帧需选择。昂贵。",
     description=(
         "复核已检索照片的视觉细节（物体/衣着/颜色/场景）。"
+        "视频仅检查已有采样帧；多帧时按返回的 keyframe_asset_id 选择，不代表整段视频。"
         "asset_handle 使用 search_memories preview 里的 handle（photo_1…），可省略（默认用预览第一张）。"
         "当前 handle 不含目标时换下一张（photo_2、photo_3…）复核，同一张图最多复核一次，不要反复检查同一张。"
         # **这里刻意不写具体次数。** 1.0（与本文件此前）写的是「默认每轮最多 1 次」，
@@ -366,6 +367,10 @@ INSPECT_PHOTO = ToolSpec(
             "asset_handle": {
                 "type": "string",
                 "description": "要复核的那张照片的 handle（photo_1…）。省略则用结果集第一张。",
+            },
+            "keyframe_asset_id": {
+                "type": "string",
+                "description": "视频有多张采样帧时，从 available_keyframes 选择的一帧 id；图片省略。",
             },
             "target_person": {
                 "type": "string",

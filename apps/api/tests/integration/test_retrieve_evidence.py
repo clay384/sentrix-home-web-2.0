@@ -421,3 +421,23 @@ def test_a_real_silent_channel_is_distinguishable_from_a_degraded_one(library):
     assert by_channel["metadata"].candidate_count == 0
     assert by_channel["visual_ann"].status == "degraded"
     assert by_channel["visual_ann"].candidate_count > 0
+
+
+def test_explicit_embedding_failure_reaches_channel_without_changing_fallback(library):
+    import httpx
+
+    from sentrix.infrastructure.models.legacy import ChineseClipSidecarEmbedder
+
+    adapter = ChineseClipSidecarEmbedder(
+        "http://sidecar.invalid",
+        client=httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(429))),
+    )
+    result = build({**library, "embedder": adapter}).execute(EvidenceRequest(text="海边", scope_id=SCOPE))
+    visual = next(trace for trace in result.channel_trace if trace.channel == "visual_ann")
+    assert visual.status == "degraded" and visual.reason == "embedder_unavailable"
+    assert visual.operational_issue["http_status"] == 429
+    assert visual.operational_issue["error_code"] == "provider_rejected"
+    assert result.hits  # lexical fallback still serves the product
+    assert all(
+        trace.operational_issue is None for trace in result.channel_trace if trace.channel != "visual_ann"
+    )

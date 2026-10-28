@@ -11,10 +11,16 @@ import argparse
 import contextlib
 import json
 import os
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.maintenance.embedding_identity import bge_identity, implementation_sha, runtime_versions  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL_PATH = REPO_ROOT / "data" / "models" / "bge-m3"
@@ -26,14 +32,25 @@ _tokenizer = None
 _device = "cpu"
 _error = ""
 _lock = threading.Lock()
+_identity: dict[str, object] | None = None
+_identity_error = ""
+_identity_runtime: dict[str, object] = {}
 
 
 def _model_path() -> Path:
     return Path(os.getenv("BGE_MODEL_PATH", str(DEFAULT_MODEL_PATH))).expanduser().resolve()
 
 
+def _current_identity() -> dict[str, object]:
+    return bge_identity(
+        _model_path(),
+        implementation_sha(Path(__file__), ["_embed", "Handler.do_POST"]),
+        max_length=int(os.getenv("SENTRIX_BGE_MAX_LENGTH", "512")),
+    )
+
+
 def _load() -> None:
-    global _model, _tokenizer, _error
+    global _model, _tokenizer, _error, _identity, _identity_error, _identity_runtime
     try:
         import torch
         from transformers import AutoModel, AutoTokenizer
@@ -42,7 +59,12 @@ def _load() -> None:
         if threads > 0:
             torch.set_num_threads(threads)
         path = _model_path()
-        _tokenizer = AutoTokenizer.from_pretrained(  # type: ignore[no-untyped-call]
+        before = None
+        try:
+            before = _current_identity()
+        except Exception as error:  # noqa: BLE001 - identity failure does not alter embedding behavior
+            _identity_error = f"{type(error).__name__}: {error}"
+        _tokenizer = AutoTokenizer.from_pretrained(  # type: ignore[no-untyped-call, unused-ignore]
             str(path), local_files_only=True
         )
         _model = AutoModel.from_pretrained(
@@ -52,6 +74,20 @@ def _load() -> None:
         )
         _model.eval()
         _error = ""
+        _identity_runtime = {
+            "device": _device,
+            "threads": torch.get_num_threads(),
+            "parameter_dtypes": sorted({str(p.dtype) for p in _model.parameters()}),
+            "versions": runtime_versions(["torch", "transformers", "tokenizers", "safetensors"]),
+        }
+        try:
+            after = _current_identity()
+            if before is None or before != after:
+                raise ValueError("embedding artifacts changed or were unidentified during model load")
+            _identity, _identity_error = after, ""
+        except Exception as error:  # noqa: BLE001 - loaded model can serve; capacity identity remains unavailable
+            _identity = None
+            _identity_error = f"{type(error).__name__}: {error}"
     except Exception as error:  # noqa: BLE001 - health endpoint reports startup failure
         _error = f"{type(error).__name__}: {error}"
 
@@ -108,6 +144,12 @@ class Handler(BaseHTTPRequestHandler):
                     "dimension": DIMENSION,
                     "device": _device,
                     "error": _error,
+                    "embedding_identity": _identity,
+                    "embedding_identity_error": _identity_error,
+                    "embedding_runtime": {
+                        **_identity_runtime,
+                        "listen_port": getattr(self.server, "server_port", None),
+                    },
                 },
             )
         elif self.path == "/stats":

@@ -48,6 +48,7 @@ from sentrix.application.media.import_assets import (
     PreparedImage,
     StagedImport,
 )
+from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.media.models import Asset, AssetStatus
 from sentrix.domain.media.ports import AssetRepository
 
@@ -378,7 +379,9 @@ class ImportAlbum:
         for event_id in event_ids:
             try:
                 self._summarize_event(event_id)
-            except Exception as error:  # noqa: BLE001 - 一个事件总结失败不该让整个相册归零
+            except ModelServiceError:
+                raise
+            except Exception as error:  # noqa: BLE001 - 非服务错误保留既有逐事件降级
                 log.warning("事件总结失败，事件保留占位内容: %s: %s", event_id, error)
                 continue
             summarized += 1
@@ -500,7 +503,9 @@ class ProcessAlbumPipeline:
         for event_id in event_ids:
             try:
                 self._summarize_event(event_id)
-            except Exception as error:  # noqa: BLE001 - 总结失败不回滚已构建记忆
+            except ModelServiceError:
+                raise
+            except Exception as error:  # noqa: BLE001 - 非服务错误不回滚已构建记忆
                 log.warning("流水线事件总结失败，保留占位内容: %s: %s", event_id, error)
                 continue
             summarized += 1

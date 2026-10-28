@@ -20,7 +20,7 @@ import pytest
 from fakes_read import FakeJsonHttpClient
 
 from photobench.application.runs.reports import RunReports
-from photobench.infrastructure.results.store import FileRunStore
+from photobench.infrastructure.results.store import FileResultWriter, FileRunStore
 
 SENTRIX = "http://sentrix.test"
 
@@ -28,7 +28,8 @@ SENTRIX = "http://sentrix.test"
 def _write(tmp_path: Path, run_id: str, state: dict) -> FileRunStore:
     run_dir = tmp_path / run_id
     run_dir.mkdir(parents=True)
-    (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
+    # Exercise the production immutable generation/revision contract.
+    FileResultWriter(tmp_path).write_snapshot(run_id, state)
     return FileRunStore(tmp_path)
 
 
@@ -230,9 +231,7 @@ def test_memory_effectiveness_is_cached_until_the_run_changes(tmp_path: Path) ->
     assert reports.memory_effectiveness("run-1")["data_quality"]["hit_match_source"] != "被调用方改脏"
 
     # run.json 变了 → revision 变 → 必须重算，资产清单要再取一次。
-    (tmp_path / "run-1" / "run.json").write_text(
-        json.dumps(_state(items=[{"qa_id": "q0"}, {"qa_id": "q1"}])), encoding="utf-8"
-    )
+    FileResultWriter(tmp_path).write_snapshot("run-1", _state(items=[{"qa_id": "q0"}, {"qa_id": "q1"}]))
     reports.memory_effectiveness("run-1")
     assert len(http.calls) == 2
 
@@ -276,4 +275,34 @@ def test_keyframe_analysis_uses_the_same_memo(tmp_path: Path) -> None:
 
     # 两个面板的缓存键必须分开：同一次修订下，记忆有效性不能把关键帧的结果顶掉。
     reports.memory_effectiveness("run-1")
+    assert len(http.calls) == 2
+
+
+def test_legacy_store_without_revision_is_supported_without_caching():
+    class LegacyReader:
+        def load_state(self, run_id):
+            assert run_id == "run-1"
+            return _state(run_id)
+
+    http = FakeJsonHttpClient({"/assets?": {"items": []}})
+    reports = RunReports(store=LegacyReader(), http=http, sentrix_url=lambda: SENTRIX)
+
+    reports.memory_effectiveness("run-1")
+    reports.memory_effectiveness("run-1")
+
+    assert len(http.calls) == 2  # No revision means no stale memoized projection.
+
+
+def test_unversioned_legacy_run_json_is_read_fresh_instead_of_cached(tmp_path):
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps(_state()), encoding="utf-8")
+    store = FileRunStore(tmp_path)
+    assert store.revision("run-1") == ""
+    http = FakeJsonHttpClient({"/assets?": {"items": []}})
+    reports = _reports(store, http)
+
+    reports.memory_effectiveness("run-1")
+    reports.memory_effectiveness("run-1")
+
     assert len(http.calls) == 2

@@ -1,0 +1,21 @@
+# 合并上游后的评测版本边界
+
+本分支合入 upstream main 02db6859c48a1e03b092545e897ca129719dc548，原性能运行源码为4944ea791173069012e22ffa732bd44059ee4e73。保留上游结构化规划、证据绑定、L3核验、固定6张检索与翻页可用性、完整调试轨迹和视觉链路的1280长边策略。旧4944的真实QA结果只作为历史实验，不代表本次合并源码；模型服务未改，原生262144窗口的独立组件验证继续按原身份保留。
+
+L2、L3、context恢复与forced-final共用30个Agent模型步；planner沿用独立口径。所有本地文本/VLM在native模式继续省略max_tokens/max_completion_tokens，不从新planner或L3引入输出上限，部署generation_config不改。最后一个可用槽用于已有的无普通工具收尾，不额外发送第31步。评审因预算无法执行时明确记录未评审；已有L2/L3不实裁决与预算阻止重写保留，失败或结果未知不会自动重放，不修改模型质量判定规则。
+
+每次逻辑模型调用的request_policy.http_post_attempts记录本地发起的POST尝试数，不能把逻辑步或题数当HTTP数。结构化字段明确被HTTP400/422拒绝时保留上游普通请求兼容回退，并合计两次POST；供应商429/5xx、连接/读取结果未知或协议错误不会因此重发。模型别名的已知404刷新也计实际POST。planner多次声明尝试独立统计；L3经过统一记录器，使用Agent共享步骤。
+
+## 新的QA图片输入profile
+
+先校验实际图片容器和MIME，视频父资产仅使用已有持久关键帧；不能把MP4当JPEG发送。之后沿上游EXIF转正、长边1280、LANCZOS缩放、JPEG quality85/optimize逻辑处理；已符合尺寸的图片保留原字节。这是新的应用输入profile，原始媒体及模型服务processor参数不改。普通OCR错字、漏识和答错继续按内容质量评分，不构成协议门禁。新运行必须记录最终源码和实际wire图片摘要，不能把旧原字节输入的成绩改标成本profile。
+
+## 复用accepted记忆库
+
+原accepted DATA cache的producer仍为e818be8fc3c12af1b7dbfdc31292e19e05c95aac，不能改成merged源码。02db和4944的全部14份migration SQL文件名、版本及SHA集合与accepted v3合同完全相同；独立恢复仍需逐次认证，并独立使用SQLite/Qdrant副本。复用该既存库不等于证明新上游建库流程已经重跑成功；不要为本轮QA重新导入、回填或刷新画像。
+
+本轮legacy Chinese-CLIP侧车必须显式设置 SENTRIX_CLIP_BACKEND=torch，并保持已核的权重、tokenizer、预处理与semantic identity。现有冻结Torch侧车可继续独立服务，不随API源码合并重启。上游auto/ONNX业务能力保留，但ONNX健康不会暴露Torch容量证书，也不能将ONNX向量与旧Torch库混用。若另行部署新的侧车实现，其实际函数AST身份会变化，必须重新核对，不能伪贴旧fingerprint。
+
+## 后续验收
+
+先完成合并源码的离线回归、完整CI和独立恢复证明，再冻结部署，以新run ID做真实QA梯度、候选重复和30分钟运行。共享测试为200上2/4个逻辑客户端；M4实机本轮未测，不作为验收前置，200资源指标不能冒称M4。最后在推荐配置下执行固定1167题全集。Doubao实际HTTP尝试数、429和评分积压独立记录，一题不等于一次云请求。旧错误、取消和unknown结果保持原样。

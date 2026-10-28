@@ -571,13 +571,8 @@ def test_resume_rejects_a_run_without_a_scope_checkpoint(tmp_path: Path):
     assert "no memory-space checkpoint" in str(excinfo.value)
 
 
-def test_resume_carries_only_the_finished_items_and_reuses_the_scope(tmp_path: Path):
-    """续跑只带**跑完的**题；``scheduled`` / ``running`` 的留给这一轮重跑。
-
-    判据逐条照 1.0 ``:3414-3417`` 的 ``execution_status not in {"scheduled", "running"}``。
-    这也正是取消掉的题必须标 ``scheduled`` 而不能标 ``failed`` 的原因——标 failed
-    会被当成「已跑完」，续跑时永远跳过。
-    """
+def test_resume_preserves_finished_and_unknown_items_and_reuses_the_scope(tmp_path: Path):
+    """Only never-dispatched scheduled items are rerun; running outcomes remain unknown."""
     store = FakeRunStore({"run-1": _cancelled_state()})
 
     result = _suites(tmp_path, store=store, gate=threading.Event()).resume_run("run-1")
@@ -585,8 +580,8 @@ def test_resume_carries_only_the_finished_items_and_reuses_the_scope(tmp_path: P
     assert result["mode"] == "reuse"
     assert result["scope_id"] == "PhotoBench-20260101-000000-album-x-qwen"
     assert result["resumed_from"] == "run-1"
-    # 三题里只有 q1 是 completed；另外两题留给这一轮。
-    assert result["resumed_items"] == 1
+    # Completed q1 and unknown in-flight q3 are kept; only scheduled q2 is eligible.
+    assert result["resumed_items"] == 2
 
 
 def test_queued_requests_freeze_topology_before_configuration_changes(tmp_path):
@@ -681,3 +676,34 @@ def test_unknown_qa_set_is_rejected_before_scheduling(tmp_path):
     suites = _suites(tmp_path)
     with pytest.raises(InvalidRequestError, match="unknown qa_set"):
         suites.start_suite(_payload(qa_set="missing"))
+
+
+def test_explicit_rejudge_archives_and_replaces_old_cloud_budget_issue(tmp_path):
+    state = _judged_state()
+    item = state["items"][0]
+    issue = {
+        "version": 1,
+        "scope": "judge",
+        "kind": "output_limit",
+        "evidence": {"field": "finish_reason", "value": "length"},
+    }
+    item["judge_issue"] = issue
+    item["judge"] = {"score": None, "judge_status": "failed", "operational_issue": issue}
+    item["runtime_turns"][0]["task_judge"] = {"correct": None, "operational_issue": issue}
+    item["runtime_turns"][0]["evidence_judge"] = {"score": None, "operational_issue": issue}
+    http = FakeHttpClient(
+        [
+            judge_reply('{"score":2,"reason":"正确"}'),
+            judge_reply('{"actual_action":"answer","reason":"回答了问题"}'),
+        ]
+    )
+    suites = _suites(tmp_path, store=FakeRunStore({"run-1": state}), writer=FakeResultWriter(), http=http)
+    suites.start_rejudge("run-1", {"system_prompt": "new"})
+    assert _wait_until(lambda: (state.get("rejudge") or {}).get("status") == "completed")
+    assert item["judge"]["score"] == 2
+    assert state["summary"]["judge_valid_count"] == 1
+    assert state["summary"]["operational"]["judge_incomplete_count"] == 0
+    assert item["judge_issue_history"][0]["issue"] == issue
+    assert (
+        item["runtime_turns"][0]["evidence_judge_history"][0]["evidence_judge"]["operational_issue"] == issue
+    )

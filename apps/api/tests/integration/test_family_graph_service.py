@@ -20,6 +20,7 @@ from sentrix.application.identity.family_graph_service import (
     has_explicit_relation_evidence,
 )
 from sentrix.domain.assistant.models import ModelReply
+from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.infrastructure.persistence.database import Database
 from sentrix.infrastructure.persistence.repositories.entities import SqliteEntityRepository
 from sentrix.infrastructure.persistence.repositories.events import SqliteEventRepository
@@ -491,3 +492,22 @@ def test_caption_and_activity_are_not_repeated_inside_the_block(service) -> None
     assert descriptions
     for text in descriptions:
         assert text.count("一家人在公园野餐") == 1
+
+
+def test_typed_model_failure_is_persisted_in_existing_run_stats(service):
+    failure = ModelServiceError(
+        "PRIVATE_PROVIDER_BODY",
+        error_code="time_limit",
+        http_status=504,
+        request_policy={"request_outcome_unknown": True, "timeout_s": 1800},
+    )
+    result = service["build"](FakeModel(error=failure)).run(service["run"].id, HOME)
+    assert result.status == "failed"
+    issue = result.stats["operational_issue"]
+    assert issue["error_code"] == "time_limit"
+    assert issue["http_status"] == 504
+    assert issue["request_policy"]["request_outcome_unknown"] is True
+    assert "event_watermark" not in result.stats
+    assert "PRIVATE" not in result.error
+    stored = service["repo"].get_run(result.id)
+    assert stored.stats["operational_issue"] == issue

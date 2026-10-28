@@ -23,8 +23,8 @@ from dataclasses import dataclass
 class TurnProfile:
     name: str
     max_steps: int
-    max_tool_calls: int
-    max_search_calls: int
+    max_tool_calls: int | None
+    max_search_calls: int | None
     #: 一轮里最多翻几次页（``get_result_page``）。**1.0 没有这条上限。**
     #
     # 生产固定「检索 = 页宽 = 6」（``MAX_SEARCH_LIMIT`` / ``result_set.PAGE_SIZE``）：
@@ -38,7 +38,7 @@ class TurnProfile:
     # 拿不到「已经到底了」这个信号，一直翻到步数耗尽。一次翻页是一个工具往返、一个模型步。
     #
     # 与 ``max_search_calls`` 并列而不是合并：那是「检索几次」，这是「同一份检索看几页」。
-    max_page_calls: int
+    max_page_calls: int | None
     # 一轮里最多几次「精读」（``ToolSpec.cost_class == EXPENSIVE``）。1.0
     # ``budget_manager.py:17`` 的 ``max_inspections = 1``。
     #
@@ -47,9 +47,10 @@ class TurnProfile:
     # 约束是「一轮总共只能精读一张图一次」，不是「每个工具各一次」。
     # 1.0 的工具描述里那句「同一张图最多复核一次，不要反复检查同一张」的**执行机构**
     # 就是它；少了它，那句话只是一句劝告。
-    max_inspections: int
+    max_inspections: int | None
     wall_time_s: float
     final_reserve_s: float
+    strict_model_step_budget: bool = False
 
 
 # goal_driven_candidate：1.0 的生产默认 profile。

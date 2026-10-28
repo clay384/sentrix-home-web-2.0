@@ -32,7 +32,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from sentrix.domain.assistant.models import ChatMessage, ChatRole, ModelReply
-from sentrix.domain.assistant.ports import ChatModel
+from sentrix.domain.assistant.ports import ChatModel, ModelServiceError
 from sentrix.domain.media.models import Observation
 from sentrix.domain.media.ports import AssetRepository, ObservationRepository
 from sentrix.domain.memories.events import EventParticipantRecord, EventRecord
@@ -290,7 +290,11 @@ class SummarizeEvent:
                 ),
                 (),
             )
-        except Exception as error:  # 端点不可用/超时/返回不可解析，一律退回确定性摘要
+        except ModelServiceError:
+            # Provider limits are operational failures, never a successful
+            # deterministic summary. Preserve the typed cause to the API.
+            raise
+        except Exception as error:  # 非服务异常保留既有确定性降级
             log.warning("事件总结的模型调用失败，改用确定性摘要: %s", error)
             return None
         projection = projection_from_reply(reply.content, event=event)

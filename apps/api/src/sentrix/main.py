@@ -20,7 +20,7 @@ from starlette.responses import Response
 from starlette.types import Scope
 
 from sentrix import __version__
-from sentrix.api.errors import domain_error_handler
+from sentrix.api.errors import domain_error_handler, model_service_error_handler
 from sentrix.api.routes import (
     assistant,
     diagnostics,
@@ -40,6 +40,7 @@ from sentrix.api.routes import (
 )
 from sentrix.bootstrap.container import Container
 from sentrix.config import Settings, load_settings
+from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.errors import DomainError
 from sentrix.infrastructure.thread_limits import apply_process_thread_limits
 
@@ -145,6 +146,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Sentrix Home API", version=__version__, docs_url=None, redoc_url=None)
     app.state.container = container
     app.add_exception_handler(DomainError, domain_error_handler)
+    app.add_exception_handler(ModelServiceError, model_service_error_handler)
 
     v1 = APIRouter(prefix="/api/v1")
     v1.include_router(health.router)

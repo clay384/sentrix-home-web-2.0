@@ -210,7 +210,7 @@ def test_native_completion_does_not_require_legacy_turn_outcome() -> None:
     [
         ("answered", "answer", "completed", 4, True),
         ("answered_with_gap", "answer", "completed", 4, True),
-        ("step_budget_exhausted", "answer", "completed", 4, False),
+        ("step_budget_exhausted", "answer", "completed", 4, None),
         ("answered", "", "completed", 4, False),
         ("answered", "answer", "failed", 4, False),
         ("answered", "answer", "completed", 5, False),
@@ -254,7 +254,8 @@ def test_later_answer_does_not_hide_a_failed_earlier_turn() -> None:
             {"termination_reason": "answered", "answer": "answer"},
         ],
     }
-    assert analysis.agent_stability(item)["completed_within_steps"] is False
+    assert analysis.agent_stability(item)["completed_within_steps"] is None
+    assert analysis.capability_summary([item])["operational"]["by_kind"]["time_limit"] == 1
 
 
 def test_endpoint_attribution_tracks_descendants_and_port_reuse() -> None:
@@ -744,3 +745,41 @@ def test_qa_progress_projection_preserves_nested_and_legacy_counters_and_null():
             }
         }
         assert RunMetricsResponse.model_validate(payload).model_dump(exclude_unset=True) == payload
+
+
+def test_capacity_progress_and_unknown_outcome_are_additive_api_facts():
+    from photobench.api.metrics_schema import RunItemObservation, RunMetricsResponse
+    from photobench.domain.runs.analysis import item_summary
+
+    item = {
+        "qa_id": "q",
+        "execution_status": "completed",
+        "judge_status": "outcome_unknown",
+        "judge_dispatch_status": "outcome_unknown",
+    }
+    projected = item_summary(item, 0)
+    assert projected["judge_status"] == "outcome_unknown"
+    assert RunItemObservation.model_validate(projected).judge_dispatch_status == "outcome_unknown"
+    assert "judge_dispatch_status" not in item_summary({"qa_id": "old"}, 0)
+    response = RunMetricsResponse.model_validate(
+        {
+            "phases": {
+                "qa_eval": {
+                    "progress": {
+                        "agent_running": 2,
+                        "judge_waiting": 5,
+                        "judge_running": 4,
+                        "outcome_unknown": 1,
+                    },
+                    "judge_requests": {"version": 1, "requests_started": 17, "http_429": 2, "in_flight": 4},
+                }
+            }
+        }
+    )
+    phase = response.phases["qa_eval"]
+    assert phase.progress.judge_waiting == 5
+    assert phase.judge_requests.requests_started == 17
+    assert (
+        RunMetricsResponse.model_validate({"phases": {"qa_eval": {}}}).phases["qa_eval"].judge_requests
+        is None
+    )

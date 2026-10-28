@@ -90,6 +90,11 @@ from photobench.domain.runs.execution import (
     summarize_progress,
     traces_from_progress,
 )
+from photobench.domain.runs.operational import (
+    exclude_operational_quality,
+    operational_counts,
+    operational_issue,
+)
 from photobench.domain.runtime.ports import (
     InferenceProvider,
     LifecycleProvider,
@@ -1694,7 +1699,9 @@ class RunExecution:
                 }
             )
         graph_result = result.get("memory_graph")
-        if isinstance(graph_result, dict) and graph_result.get("causal_status") == "degraded":
+        if isinstance(graph_result, dict) and (
+            graph_result.get("causal_status") == "degraded" or graph_result.get("causal_issues")
+        ):
             error_details.append(
                 {
                     "sample_id": "causal_graph",
@@ -1716,6 +1723,37 @@ class RunExecution:
                     "reason": "关键帧视觉近邻边不完整；其他记忆图边已保存，请检查视觉向量索引",
                 }
             )
+        family_graph = result.get("family_graph")
+        family_run = family_graph.get("run") if isinstance(family_graph, dict) else None
+        family_issue = (
+            (family_run.get("stats") or {}).get("operational_issue") if isinstance(family_run, dict) else None
+        )
+        family_failed = isinstance(family_run, dict) and (
+            family_run.get("status") == "failed" or family_issue
+        )
+        if family_failed:
+            error_details.append(
+                {
+                    "sample_id": "family_graph",
+                    "status": "failed",
+                    "error_type": "family_graph_error",
+                    "reason": "家庭图谱推断失败；本次记忆构建不可验收",
+                    **({"operational_issue": family_issue} if family_issue else {}),
+                }
+            )
+        # Keep producer evidence: missing legacy counts remain unknown, never zero.
+        insights = result.get("insights")
+        moment_failures = insights.get("moment_failures") if isinstance(insights, dict) else None
+        insights_failed = type(moment_failures) is int and moment_failures > 0
+        if insights_failed:
+            error_details.append(
+                {
+                    "sample_id": "person_insights",
+                    "status": "failed",
+                    "error_type": "person_insights_incomplete",
+                    "reason": f"{moment_failures} 张人物瞬间预览处理失败；本次记忆构建不完整",
+                }
+            )
         final_processed = len([item for item in assets if item.get("status") == "processed"])
         phase_result = {
             "total_seconds": round(float(timings.get("total") or time.perf_counter() - started), 3),
@@ -1735,11 +1773,17 @@ class RunExecution:
             "graph_build_seconds": timings.get("memory_graph", 0.0),
             "causal_graph_seconds": timings.get("causal_graph", 0.0),
             "memory_graph": result.get("memory_graph"),
+            "family_graph": family_graph,
+            "insights": insights if isinstance(insights, dict) else None,
             "error": (
                 f"{failed_count} 个资产流水线处理失败"
                 if failed_count
                 else "记忆图构建未完成"
                 if graph_result is None
+                else "家庭图谱推断失败"
+                if family_failed
+                else "人物瞬间处理不完整"
+                if insights_failed
                 else "因果边判定部分失败"
                 if error_details
                 else None
@@ -1938,6 +1982,28 @@ class RunExecution:
                 pass
         return min(8, max(1, int(qa_concurrency or 1)))
 
+    @staticmethod
+    def resume_item(item: Mapping[str, Any]) -> dict[str, Any]:
+        """Preserve completed work; an interrupted dispatch cannot safely be replayed.
+
+        Historical pending Judge checkpoints predate dispatch journaling and may
+        already have reached the cloud. Only an explicit not_started marker is safe.
+        """
+        restored = copy.deepcopy(dict(item))
+        if restored.get("execution_status") in {"running", "started", "pending"}:
+            restored.update(
+                execution_status="outcome_unknown",
+                judge_status="skipped",
+                error="request_outcome_unknown: interrupted Agent dispatch; not replayed",
+            )
+        if restored.get("judge_status") == "running" or (
+            restored.get("judge_status") == "pending"
+            and restored.get("judge_dispatch_status") != "not_started"
+        ):
+            restored["judge_status"] = "outcome_unknown"
+            restored["judge_dispatch_status"] = "outcome_unknown"
+        return exclude_operational_quality(restored)
+
     def _phase_qa_eval(self, state: RunState, request: RunRequest) -> None:
         """1.0 ``:3103``：Agent 池 + 独立的 Judge 池。**Agent 一完成就立刻排进 Judge**。
 
@@ -1946,13 +2012,6 @@ class RunExecution:
         并发预算会让「评测吞吐」与「打分吞吐」互相拖住。
         """
         started = time.perf_counter()
-        # 1.0 ``:3394-3397``：**入 QA 前先探一次端点**。不健康就抛——487 道题跑在一个
-        # 不回话的端点上，产出的是一份**看起来正常**的废数据，那比直接失败更糟
-        # （2026-10-10 那轮 18:13 起端点连续 13 题 503/Connection refused，
-        #  而整轮照常往下跑、只在每题上留一句「模型服务当前不可用」）。
-        health_error = self._probe_endpoint_health()
-        if health_error:
-            raise RuntimeError(f"model service is unhealthy before QA evaluation: {health_error}")
         scope_id = str(state.get("scope_id"))
         album_id = str(state.get("album_id"))
         assets = self.client.list_assets(scope_id=scope_id, limit=1000)
@@ -1969,6 +2028,7 @@ class RunExecution:
         state.set("qa_concurrency_runtime_limit", resolved.runtime_limit)
         state.set("qa_assets", len(assets))
         state.set("judge_concurrency", judge_concurrency if judge is not None else 0)
+        state.record_phase("qa_eval", "judge_concurrency", judge_concurrency if judge is not None else 0)
         state.record_phase("qa_eval", "agent_total", len(rows))
         state.record_phase("qa_eval", "agent_phase_started_at", now_iso())
         agent_phase_started = time.perf_counter()
@@ -1984,19 +2044,28 @@ class RunExecution:
         # 2.0 只带 items 那一格：**已完成的题不进池、直接当成结果**，于是续跑出来的
         # run.json 仍然是一份完整的 487 题结果，而不是「只剩没跑的那些」——后者会让
         # 汇总里所有的均值都只覆盖续跑的那一段，与上一轮不可比。
-        prior_by_qa = {str(item.get("qa_id")): item for item in request.prior_items}
+        prior_by_qa = {str(item.get("qa_id")): self.resume_item(item) for item in request.prior_items}
         items: dict[int, dict[str, Any]] = {
             index: dict(prior)
             for index, row in enumerate(rows)
             if (prior := prior_by_qa.get(str(row.get("qa_id")))) is not None
+            and prior.get("execution_status") != "scheduled"
         }
         pending_rows = [(index, row) for index, row in enumerate(rows) if index not in items]
+        if pending_rows:
+            health_error = self._probe_endpoint_health()
+            if health_error:
+                raise RuntimeError(f"model service is unhealthy before QA evaluation: {health_error}")
+        pending_judges = [
+            index
+            for index, item in items.items()
+            if item.get("execution_status") == "completed" and item.get("judge_status") == "pending"
+        ]
+        futures: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
         judge_futures: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
         judge_done = sum(item.get("judge_status") in {"completed", "failed"} for item in items.values())
 
         def record_progress() -> None:
-            # One locked checkpoint for items and both counter locations. Legacy readers
-            # still use the phase-level fields; the UI consumes progress.
             terminal_agents = sum(
                 item.get("execution_status") not in {"scheduled", "running", "pending", None}
                 for item in items.values()
@@ -2020,10 +2089,23 @@ class RunExecution:
                         "judge_skipped": sum(
                             item.get("judge_status") == "skipped" for item in items.values()
                         ),
+                        "operational": operational_counts(list(items.values())),
                         "qa_concurrency": concurrency,
                         "judge_concurrency": judge_concurrency if judge is not None else 0,
+                        "agent_waiting": len(pending_rows)
+                        + sum(item.get("execution_status") == "scheduled" for item in items.values()),
+                        "agent_running": len(futures),
+                        "judge_waiting": len(pending_judges) if judge is not None else None,
+                        "judge_running": len(judge_futures) if judge is not None else None,
+                        "outcome_unknown": sum(
+                            item.get("execution_status") == "outcome_unknown"
+                            or item.get("judge_status") == "outcome_unknown"
+                            for item in items.values()
+                        ),
                     },
                 )
+                if isinstance(judge, JudgeRunner):
+                    state.record_phase("qa_eval", "judge_requests", judge.request_metrics())
                 state.data["items"] = [items[i] for i in sorted(items)]
 
         record_progress()
@@ -2034,10 +2116,17 @@ class RunExecution:
             begin, begin_iso = time.perf_counter(), now_iso()
             try:
                 assert judge is not None
+                if state.cancelled:
+                    return {**item, "judge_status": "pending", "judge_dispatch_status": "not_started"}
                 return judge.judge_item(copy.deepcopy(item), row, assets_by_name)
             finally:
                 with judge_bounds_lock:
                     judge_bounds.append((begin, time.perf_counter(), begin_iso, now_iso()))
+
+        def run_agent(row: dict[str, Any]) -> dict[str, Any]:
+            if state.cancelled:
+                raise RunCancelledError("cancelled before Agent dispatch")
+            return self._evaluate_one(row, scope_id, assets_by_name, request)
 
         judge_pool = (
             concurrent.futures.ThreadPoolExecutor(
@@ -2050,73 +2139,110 @@ class RunExecution:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=concurrency, thread_name_prefix="qa-agent"
             ) as executor:
-                futures = {
-                    executor.submit(self._evaluate_one, row, scope_id, assets_by_name, request): index
-                    for index, row in pending_rows
-                }
-                # Drain both pools as work completes. Waiting only on Agent futures
-                # withholds scores for the whole album when one Agent is slow.
-                if not futures:
-                    state.record_phase("qa_eval", "agent_phase_finished_at", now_iso())
-                    state.record_phase("qa_eval", "agent_phase_wall_ms", 0.0)
-                while futures or judge_futures:
+                while pending_rows or futures or judge_futures or (pending_judges and judge_pool is not None):
+                    # Persist intent before any external work. A crash after this checkpoint
+                    # is conservatively unknown, never permission to replay the request.
+                    qa_batch: list[tuple[int, dict[str, Any]]] = []
+                    judge_batch: list[int] = []
+                    if not state.cancelled:
+                        while pending_rows and len(futures) + len(qa_batch) < concurrency:
+                            index, row = pending_rows.pop(0)
+                            items[index] = {
+                                "qa_id": row.get("qa_id"),
+                                "execution_status": "running",
+                                "judge_status": "pending",
+                                "judge_dispatch_status": "not_started",
+                            }
+                            qa_batch.append((index, row))
+                        while (
+                            pending_judges
+                            and judge_pool is not None
+                            and len(judge_futures) + len(judge_batch) < judge_concurrency
+                        ):
+                            index = pending_judges.pop(0)
+                            items[index] = {
+                                **items[index],
+                                "judge_status": "running",
+                                "judge_dispatch_status": "in_flight",
+                            }
+                            judge_batch.append(index)
+                    if qa_batch or judge_batch:
+                        record_progress()
+                        state.persist(wait=True)
+                    for index, row in qa_batch:
+                        futures[executor.submit(run_agent, row)] = index
+                    for index in judge_batch:
+                        assert judge_pool is not None
+                        if judge_phase_started is None:
+                            judge_phase_started = time.perf_counter()
+                            state.record_phase("qa_eval", "judge_phase_started_at", now_iso())
+                        judge_futures[judge_pool.submit(run_judge, items[index], rows[index])] = index
+                    record_progress()
+                    if (
+                        not futures
+                        and not pending_rows
+                        and not (state.get("phases") or {}).get("qa_eval", {}).get("agent_phase_finished_at")
+                    ):
+                        state.record_phase("qa_eval", "agent_phase_finished_at", now_iso())
+                        state.record_phase(
+                            "qa_eval",
+                            "agent_phase_wall_ms",
+                            round((time.perf_counter() - agent_phase_started) * 1000, 1),
+                        )
+                    if not futures and not judge_futures:
+                        break  # cancelled, judge disabled, or all work complete
                     done, _ = concurrent.futures.wait(
-                        (*futures, *judge_futures), return_when=concurrent.futures.FIRST_COMPLETED
+                        (*futures, *judge_futures),
+                        timeout=0.5,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
                     )
                     for completed_future in done:
                         if completed_future in judge_futures:
                             index = judge_futures.pop(completed_future)
                             try:
-                                judged = completed_future.result()
-                                with state.lock:
-                                    items[index] = judged
+                                items[index] = completed_future.result()
                             except Exception as exc:  # noqa: BLE001
-                                with state.lock:
-                                    items[index]["judge_status"] = "failed"
-                                    items[index]["judge"] = {"score": None, "reason": f"judge_error: {exc}"}
-                            judge_done += 1
+                                items[index] = {
+                                    **items[index],
+                                    "judge_status": "failed",
+                                    "judge": {"score": None, "reason": f"judge_error: {exc}"},
+                                }
+                            if items[index].get("judge_status") in {"completed", "failed"}:
+                                items[index] = {**items[index], "judge_dispatch_status": "finished"}
+                                judge_done += 1
+                            elif items[index].get("judge_status") == "outcome_unknown":
+                                items[index] = {**items[index], "judge_dispatch_status": "outcome_unknown"}
+                            elif items[index].get("judge_status") == "pending":
+                                pending_judges.append(index)
                             record_progress()
                             state.persist()
                             continue
-                        future = completed_future
-                        index = futures.pop(future)
+                        index = futures.pop(completed_future)
                         try:
-                            item = future.result()
+                            item = completed_future.result()
                         except RunCancelledError as exc:
-                            # **被取消的题不是失败的题。** 1.0 的 resume 靠
-                            # ``execution_status not in {"scheduled", "running"}`` 挑出「从没
-                            # 开始过」的题（``:3414-3417``），而取消时还在排队里的题正好是从没
-                            # 开始过的。标成 failed 会让 resume 把它们当成已完成跳过——
-                            # 那正是「取消一次，155 题只能整轮重跑」的成因。
                             item = {
                                 "error": f"cancelled while waiting: {exc}",
                                 "execution_status": "scheduled",
                             }
-                        except Exception as exc:  # noqa: BLE001 —— 1.0 ``:3218``
+                        except Exception as exc:  # noqa: BLE001
                             item = {"error": repr(exc), "failed": True, "execution_status": "failed"}
+                        item = exclude_operational_quality(item)
+                        item.setdefault("qa_id", rows[index].get("qa_id"))
                         item["_index"] = index
-                        # 「没有答案可打分的题」与「还没打分的题」是两件事（1.0 ``:3220``）：
-                        # 前者标 skipped，后者标 pending。跳过判分的 item **绝不**再排进
-                        # Judge 池——它没有答案可评，送进去只会产出一个假的 0 分。
-                        if item.get("failed") or item.get("error"):
+                        item["judge_dispatch_status"] = "not_started"
+                        if item.get("operational_issue") or item.get("failed") or item.get("error"):
                             item["judge_status"] = "skipped"
                         else:
                             item.setdefault("judge_status", "pending")
-                            if judge is not None and judge_pool is not None:
-                                if judge_phase_started is None:
-                                    judge_phase_started = time.perf_counter()
-                                    state.record_phase("qa_eval", "judge_phase_started_at", now_iso())
-                                judge_futures[judge_pool.submit(run_judge, item, rows[index])] = index
+                            if judge is not None:
+                                pending_judges.append(index)
                         items[index] = item
-                        if not futures:
-                            state.record_phase("qa_eval", "agent_phase_finished_at", now_iso())
-                            state.record_phase(
-                                "qa_eval",
-                                "agent_phase_wall_ms",
-                                round((time.perf_counter() - agent_phase_started) * 1000, 1),
-                            )
                         record_progress()
                         state.persist()
+                    # Also publish cloud request counters while all Agents/Judges are busy.
+                    record_progress()
+                    state.persist()
         finally:
             if judge_pool is not None:
                 judge_pool.shutdown(wait=True)
@@ -2126,6 +2252,15 @@ class RunExecution:
                 state.record_phase("qa_eval", "judge_phase_started_at", first[2])
                 state.record_phase("qa_eval", "judge_phase_finished_at", last[3])
                 state.record_phase("qa_eval", "judge_phase_wall_ms", round((last[1] - first[0]) * 1000, 1))
+        if not pending_rows and not futures:
+            phase = (state.get("phases") or {}).get("qa_eval") or {}
+            if not phase.get("agent_phase_finished_at"):
+                state.record_phase("qa_eval", "agent_phase_finished_at", now_iso())
+                state.record_phase(
+                    "qa_eval",
+                    "agent_phase_wall_ms",
+                    round((time.perf_counter() - agent_phase_started) * 1000, 1),
+                )
         with state.lock:
             ordered = [items[i] for i in sorted(items)]
             for item in ordered:
@@ -2135,19 +2270,31 @@ class RunExecution:
             state.data["run_valid"] = bool(len(ordered) == len(rows) and executed == len(rows))
             record_progress()
         failed = [
-            item for item in state.get("items") or [] if item.get("execution_status") in {"failed", "timeout"}
+            item
+            for item in state.get("items") or []
+            if item.get("execution_status") in {"failed", "timeout", "outcome_unknown", "operational_failure"}
+            or item.get("judge_status") == "outcome_unknown"
         ]
         phase_result = {
             "total_seconds": round(time.perf_counter() - started, 1),
             "qa_concurrency": concurrency,
             "failed_count": len(failed),
-            "error": f"{len(failed)} 道题执行失败或超时" if failed else None,
+            "operational": operational_counts(state.get("items") or []),
+            "error": f"{len(failed)} 道题执行异常、预算受限或结果待确认" if failed else None,
             "error_details": [
                 {
                     "sample_id": item.get("qa_id") or "QA",
-                    "status": item.get("execution_status") or "failed",
-                    "error_type": "agent_error",
-                    "reason": str(item.get("error") or "QA execution failed"),
+                    "status": "outcome_unknown"
+                    if item.get("judge_status") == "outcome_unknown"
+                    else item.get("execution_status") or "failed",
+                    "error_type": "judge_outcome_unknown"
+                    if item.get("judge_status") == "outcome_unknown"
+                    else (item.get("operational_issue") or {}).get("kind", "agent_error"),
+                    "reason": str(
+                        item.get("error")
+                        or (item.get("operational_issue") or {}).get("kind")
+                        or "request outcome unknown; not replayed"
+                    ),
                 }
                 for item in failed
             ],
@@ -2198,7 +2345,10 @@ class RunExecution:
         for name in PASSTHROUGH_FIELDS:
             if row.get(name) is not None:
                 item[name] = row[name]
+        active_turn_id: str | None = None
+        turn_records: list[dict[str, Any]] = []
         try:
+            self._cancel_wait(0)
             item["execution_status"] = "started"
             conversation_id = str(
                 self.client.start_conversation(scope_id=scope_id, title=f"{row.get('qa_id') or 'qa'}").get(
@@ -2208,7 +2358,7 @@ class RunExecution:
             )
             if not conversation_id:
                 raise RuntimeError("2.0 建会话没有返回 id")
-            turn_records: list[dict[str, Any]] = []
+            item["conversation_id"] = conversation_id
             last_result: dict[str, Any] = {}
             last_progress: list[Any] = []
             for turn_index, message in enumerate(messages or [query]):
@@ -2220,6 +2370,8 @@ class RunExecution:
                 # **评测必须打开完整轨迹。** 8772 的「模型这一步看到什么/回答什么」
                 # 只能由主 API 在回合终态载荷里带出来；不开这个开关，run.json 里
                 # 永远只有工具入参与摘要，和 1.0 的 debug_trace 对不上。
+                # A completed earlier turn is not permission to dispatch after cancellation.
+                self._cancel_wait(0)
                 started_turn = self.client.start_turn(
                     conversation_id=conversation_id,
                     message=message,
@@ -2229,7 +2381,9 @@ class RunExecution:
                 turn_id = str(started_turn.get("turn_id") or "")
                 if not turn_id:
                     raise RuntimeError(f"2.0 发起回合没有返回 turn_id：{started_turn}")
+                active_turn_id = turn_id
                 polled = self._await_turn(turn_id, request)
+                active_turn_id = None
                 last_result = polled.get("result") or {}
                 last_progress = polled.get("public_progress") or []
                 turn_records.append(
@@ -2281,6 +2435,8 @@ class RunExecution:
                         "trace_bundle": dict(last_result.get("trace") or {}),
                     }
                 )
+                if operational_issue({"runtime_turns": turn_records}):
+                    break  # Do not send later conversation turns after an evidenced execution limit.
             # 轨迹：从**同一条事件流**投影出两条（见 ``traces_from_progress``）。
             # 读侧的 ``bind_tool_calls_to_model_rounds`` 早就在等它们了。
             tool_trace, execution_trace = traces_from_progress(turn_records)
@@ -2389,6 +2545,8 @@ class RunExecution:
             item["attribution"] = derive_attribution(item)
             item["execution_status"] = "completed"
         except Exception as exc:  # noqa: BLE001 —— 1.0 ``:3571``
+            item["runtime_turns"] = turn_records
+            item["error_type"] = type(exc).__name__
             message = str(exc).lower()
             # **判据比 1.0 多一条 ``isinstance``**：1.0 ``:3573`` 只按文案里的
             # ``timed out`` / ``timeout`` 判，而它自己的 ``TimeoutError`` 文案是
@@ -2396,6 +2554,29 @@ class RunExecution:
             # 记成 ``failed``。这是照搬会连带搬过来的缺陷，不是风格差异。
             timed_out = isinstance(exc, TimeoutError) or "timed out" in message or "timeout" in message
             item["execution_status"] = "timeout" if timed_out else "failed"
+            if isinstance(exc, TimeoutError) and active_turn_id:
+                item["execution_status"] = "outcome_unknown"
+                item["request_failure"] = {
+                    "phase": "turn_polling",
+                    "turn_id": active_turn_id,
+                    "cause_type": "TimeoutError",
+                    "automatic_replay": False,
+                }
+            if isinstance(exc, RequestOutcomeUnknownError):
+                item["execution_status"] = "outcome_unknown"
+                item["request_failure"] = exc.facts
+            if isinstance(exc, RunCancelledError):
+                item["execution_status"] = "outcome_unknown" if active_turn_id else "cancelled"
+                item["request_failure"] = {
+                    "phase": "turn_polling" if active_turn_id else "before_turn_dispatch",
+                    "cause_type": "RunCancelledError",
+                    "request_outcome_unknown": active_turn_id is not None,
+                    "automatic_replay": False,
+                    "completed_turn_count": len(turn_records),
+                    **({"turn_id": active_turn_id} if active_turn_id else {}),
+                }
+                item["evaluation_status"] = "not_evaluable"
+                item["judge_status"] = "skipped"
             item.update(
                 {
                     "error": str(exc),
@@ -2410,7 +2591,11 @@ class RunExecution:
                     "wall_clock_ms": round((time.perf_counter() - started) * 1000, 1),
                 }
             )
-        return item
+            if isinstance(exc, RunCancelledError):
+                # Operator/safety cancellation is not an answer-quality zero.
+                item["retrieval_recall"] = None
+                item["media_retrieval_recall"] = None
+        return exclude_operational_quality(item)
 
     def _await_turn(self, turn_id: str, request: RunRequest) -> dict[str, Any]:
         """1.0 ``wait_for_assistant_turn``（``:909``）的 2.0 版。

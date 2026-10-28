@@ -2567,6 +2567,12 @@ components:
           type: string
           title: Reason
           default: ''
+        operational_issue:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Operational Issue
       type: object
       required:
       - channel
@@ -4914,6 +4920,12 @@ components:
           type: string
           title: Causal Status
           default: not_configured
+        causal_issues:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Causal Issues
         causal_seconds:
           type: number
           title: Causal Seconds

@@ -28,6 +28,7 @@ from sentrix.domain.retrieval.ports import (
     VectorIndexStatus,
     VectorIndexUnavailable,
     VectorRecord,
+    retrieval_operational_issue,
 )
 
 DEFAULT_PREFIX = "sentrix_home"
@@ -78,7 +79,13 @@ class QdrantVectorIndex:
         try:
             self._get_client()
         except VectorIndexUnavailable as error:
-            return VectorIndexStatus(backend="qdrant", available=False, degraded=True, reason=str(error))
+            return VectorIndexStatus(
+                backend="qdrant",
+                available=False,
+                degraded=True,
+                reason=str(error),
+                operational_issue=retrieval_operational_issue(error),
+            )
         return VectorIndexStatus(backend="qdrant", available=True)
 
     def upsert(self, records: Sequence[VectorRecord]) -> int:

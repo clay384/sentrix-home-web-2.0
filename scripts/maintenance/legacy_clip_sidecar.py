@@ -32,10 +32,21 @@ import argparse
 import contextlib
 import json
 import os
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
+    from PIL import Image
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.maintenance.embedding_identity import clip_identity, implementation_sha, runtime_versions  # noqa: E402
 
 DIMENSION = 768
 CONTEXT_LENGTH = 52
@@ -64,11 +75,15 @@ _backend = ""  # BACKEND_ONNX | BACKEND_TORCH
 _device = "cpu"
 _error = ""
 _lock = threading.Lock()
+_identity: dict[str, object] | None = None
+_identity_error = ""
+_identity_runtime: dict[str, object] = {}
 
 
 # ═══════════════════════════════════════════════════════════
 # 后端探测
 # ═══════════════════════════════════════════════════════════
+
 
 def _resolve_onnx_paths() -> tuple[Path, Path]:
     """返回 ONNX 模型路径（环境变量 > 默认路径）。"""
@@ -110,19 +125,21 @@ def _detect_backend() -> str:
 # ONNX 后端
 # ═══════════════════════════════════════════════════════════
 
+
 def _pick_onnx_providers() -> list[str]:
     """根据环境变量或可用 EP 选择 ONNX Runtime execution providers。"""
     requested = os.getenv("SENTRIX_LEGACY_CLIP_DEVICE", "auto").strip().lower()
     if requested == "cpu":
         return ["CPUExecutionProvider"]
     import onnxruntime as ort
+
     available = ort.get_available_providers()
     if "CUDAExecutionProvider" in available:
         return ["CUDAExecutionProvider", "CPUExecutionProvider"]
     return ["CPUExecutionProvider"]
 
 
-def _preprocess_image_numpy(img: "Image.Image") -> "np.ndarray":
+def _preprocess_image_numpy(img: Image.Image) -> np.ndarray:
     """PIL Image → FP16 numpy array，shape (1, 3, 224, 224)。
 
     等价于 torchvision.transforms.Compose([
@@ -132,12 +149,13 @@ def _preprocess_image_numpy(img: "Image.Image") -> "np.ndarray":
     ]) 但用纯 numpy 实现，不依赖 torch。
     """
     import numpy as np
+    from PIL import Image
 
     _INPUT_SIZE = 224
     _MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
     _STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
 
-    img = img.convert("RGB").resize((_INPUT_SIZE, _INPUT_SIZE), Image.BICUBIC)
+    img = img.convert("RGB").resize((_INPUT_SIZE, _INPUT_SIZE), Image.Resampling.BICUBIC)
     arr = np.asarray(img, dtype=np.float32) / 255.0
     arr = np.transpose(arr, (2, 0, 1))
     arr = (arr - _MEAN[:, None, None]) / _STD[:, None, None]
@@ -198,6 +216,7 @@ def _load_onnx() -> None:
 
 def _embed_image_onnx(path: str) -> list[float]:
     import numpy as np
+    from PIL import Image
 
     if _img_session is None:
         raise RuntimeError(_error or "vision model not loaded")
@@ -215,23 +234,26 @@ def _embed_query_onnx(text: str) -> list[float]:
     if _txt_session is None:
         raise RuntimeError(_error or "text model not loaded")
     from cn_clip.clip import tokenize
+
     tokens = tokenize([str(text)], context_length=CONTEXT_LENGTH).numpy()
     with _lock:
         out = _txt_session.run(None, {"text": tokens})[0]
     return _normalize_numpy(out.astype(np.float32).flatten())
 
 
-def _normalize_numpy(vec: "np.ndarray") -> list[float]:
+def _normalize_numpy(vec: np.ndarray) -> list[float]:
     import numpy as np
+
     norm = float(np.linalg.norm(vec))
     if norm > 0:
         vec = vec / norm
-    return vec.tolist()
+    return [float(value) for value in vec.tolist()]
 
 
 # ═══════════════════════════════════════════════════════════
 # PyTorch 后端
 # ═══════════════════════════════════════════════════════════
+
 
 def _pick_torch_device() -> str:
     """PyTorch 设备选择：CUDA → MPS → CPU。"""
@@ -239,6 +261,7 @@ def _pick_torch_device() -> str:
     if requested and requested != "auto":
         return requested
     import torch
+
     if torch.cuda.is_available():
         return "cuda"
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
@@ -246,10 +269,35 @@ def _pick_torch_device() -> str:
     return "cpu"
 
 
-def _load_torch() -> None:
-    """加载 PyTorch 模型。"""
-    global _torch_model, _torch_preprocess, _device, _error
+def _current_identity(checkpoint: Path, model_name: str) -> dict[str, object]:
+    from cn_clip.clip import utils
 
+    spec = {**utils._MODEL_INFO[model_name], "checkpoint_filename": utils._MODELS[model_name][1]}
+    return clip_identity(
+        checkpoint,
+        model_name,
+        Path(utils.__file__).resolve().parents[1],
+        spec,
+        implementation_sha(
+            Path(__file__),
+            [
+                "_normalize_list",
+                "_embed_image_torch",
+                "_embed_query_torch",
+                "_embed_image",
+                "_embed_query",
+                "Handler.do_POST",
+            ],
+        ),
+    )
+
+
+def _load_torch() -> None:
+    """Load PyTorch; certify only artifacts stable across the actual model load."""
+    global _torch_model, _torch_preprocess, _device, _error
+    global _identity, _identity_error, _identity_runtime
+
+    _identity, _identity_error, _identity_runtime = None, "", {}
     checkpoint = _resolve_torch_checkpoint()
     model_name = os.getenv("CHINESE_CLIP_MODEL", "ViT-L-14")
     _device = _pick_torch_device()
@@ -258,8 +306,17 @@ def _load_torch() -> None:
         _error = f"checkpoint missing: {checkpoint}"
         return
     try:
+        import torch
         from cn_clip.clip import load_from_name
 
+        before = None
+        try:
+            before = _current_identity(checkpoint, model_name)
+        except Exception as error:  # noqa: BLE001 - identity failure does not alter embedding behavior
+            _identity_error = f"{type(error).__name__}: {error}"
+
+        # cn_clip 按 ``download_root`` 找 ``clip_cn_vit-l-14.pt``。指向已有权重的
+        # 目录，避免它尝试联网下载。
         model, preprocess = load_from_name(
             model_name,
             device=_device,
@@ -270,12 +327,27 @@ def _load_torch() -> None:
         _torch_preprocess = preprocess
         _error = ""
         print(f"[CLIP] PyTorch 模型加载成功 (device={_device})")
-    except Exception as error:  # noqa: BLE001
+        _identity_runtime = {
+            "device": _device,
+            "threads": torch.get_num_threads(),
+            "parameter_dtypes": sorted({str(p.dtype) for p in _torch_model.parameters()}),
+            "versions": runtime_versions(["torch", "torchvision", "Pillow", "cn-clip"]),
+        }
+        try:
+            after = _current_identity(checkpoint, model_name)
+            if before is None or before != after:
+                raise ValueError("embedding artifacts changed or were unidentified during model load")
+            _identity, _identity_error = after, ""
+        except Exception as error:  # noqa: BLE001 - loaded model can serve; capacity identity remains unavailable
+            _identity = None
+            _identity_error = f"{type(error).__name__}: {error}"
+    except Exception as error:  # noqa: BLE001 - 启动失败要让 /health 说出来
         _error = f"{type(error).__name__}: {error}"
 
 
 def _embed_image_torch(path: str) -> list[float]:
     import torch
+    from PIL import Image
 
     if _torch_model is None or _torch_preprocess is None:
         raise RuntimeError(_error or "model not loaded")
@@ -310,21 +382,24 @@ def _normalize_list(values: list[float]) -> list[float]:
 # 统一入口（根据后端分发）
 # ═══════════════════════════════════════════════════════════
 
+
 def _load() -> None:
     """根据探测结果加载对应后端。ONNX 失败时尝试回退到 PyTorch。"""
-    global _backend, _error
+    global _backend, _error, _identity, _identity_error, _identity_runtime
 
+    _identity, _identity_error, _identity_runtime = None, "", {}
     _backend = _detect_backend()
     print(f"[CLIP] 选择后端: {_backend}")
 
     if _backend == BACKEND_ONNX:
+        _identity_error = "ONNX embedding capacity identity is not certified; use the pinned torch backend"
         _load_onnx()
         # ONNX 加载失败 → 尝试回退到 PyTorch
         if _img_session is None:
             onnx_error = _error
             checkpoint = _resolve_torch_checkpoint()
             if checkpoint.is_file():
-                print(f"[CLIP] ONNX 失败，回退到 PyTorch 后端...")
+                print("[CLIP] ONNX 失败，回退到 PyTorch 后端...")
                 _backend = BACKEND_TORCH
                 _load_torch()
             else:
@@ -355,6 +430,7 @@ def _is_loaded() -> bool:
 # ═══════════════════════════════════════════════════════════
 # HTTP Handler
 # ═══════════════════════════════════════════════════════════
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args: object) -> None:
@@ -387,6 +463,16 @@ class Handler(BaseHTTPRequestHandler):
                     "dimension": DIMENSION,
                     "device": _device,
                     "error": _error,
+                    "embedding_identity": _identity if _backend == BACKEND_TORCH else None,
+                    "embedding_identity_error": (
+                        _identity_error
+                        if _backend == BACKEND_TORCH
+                        else "ONNX embedding capacity identity is not certified; use the pinned torch backend"
+                    ),
+                    "embedding_runtime": {
+                        **_identity_runtime,
+                        "listen_port": getattr(self.server, "server_port", None),
+                    },
                 },
             )
         elif self.path == "/stats":
@@ -429,6 +515,7 @@ class Handler(BaseHTTPRequestHandler):
 # ═══════════════════════════════════════════════════════════
 # 入口
 # ═══════════════════════════════════════════════════════════
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)

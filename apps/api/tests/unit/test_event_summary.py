@@ -25,6 +25,7 @@ from sentrix.application.memories.summarize_event import (
     projection_from_reply,
 )
 from sentrix.domain.assistant.models import ChatMessage, ChatRole, ModelReply
+from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.media.models import Asset, AssetStatus, MediaType, Observation
 from sentrix.domain.memories.events import EventRecord
 from sentrix.infrastructure.persistence.database import Database
@@ -300,3 +301,16 @@ def test_the_model_call_carries_a_system_message_that_holds_the_prompt(repos):
     assert "事件总结器" in model.messages[0].content
     assert "obs_1" in model.messages[1].content  # 证据在 user 那条里
     assert "事件总结器" not in model.messages[1].content
+
+
+@pytest.mark.parametrize("code", ["time_limit", "output_limit", "provider_rejected"])
+def test_operational_summary_failure_propagates_without_fallback_write(repos, code):
+    seed(repos)
+    failure = ModelServiceError("operation failed", error_code=code, http_status=429)
+    model = FakeChatModel(error=failure)
+    before = repos[0].get("evt_1")
+    with pytest.raises(ModelServiceError) as caught:
+        use_case(repos, model).execute("evt_1")
+    assert caught.value is failure
+    assert repos[0].get("evt_1") == before
+    assert model.calls == 1

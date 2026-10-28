@@ -15,7 +15,7 @@
 //     的模块约定一致（本层只吃运行时 JSON 形状）。
 
 import { EXECUTION_PHASES } from "./constants.ts";
-import { fmtMemory, fmtMs, fmtNumber, fmtPct, fmtTokens, statusLabel } from "./format.ts";
+import { fmtMemory, fmtMs, fmtNumber, fmtPct, fmtTokens, operationalCountNote, statusLabel } from "./format.ts";
 
 /** `itemCallMetrics` 的权威实现在 `lib/trace.ts`；这里 re-export 保持本模块对外接口不变。 */
 export { itemCallMetrics } from "./trace.ts";
@@ -662,7 +662,18 @@ export function keyMetricRows(run: unknown, summary: unknown): KeyMetric[] {
   const throughputNote = s.agent_throughput_latency_mode === "measured_agent_phase"
     ? `Agent 阶段实际墙钟 ÷ ${s.agent_phase_completed_count ?? s.total ?? 0} 题 · 并发 ${r.qa_concurrency ?? "-"} · 不含 Judge（Judge 与 Agent 并行）`
     : "历史记录按时间线回退估算，不是实测值";
+  const operational = dict(s.operational);
   return [
+    {
+      label: "不可评估",
+      value: operational.not_evaluable_count == null ? "未记录" : `${operational.not_evaluable_count} 题`,
+      note: operationalCountNote(operational.by_kind),
+    },
+    {
+      label: "评分未完成",
+      value: operational.judge_incomplete_count == null ? "未记录" : `${operational.judge_incomplete_count} 题`,
+      note: operationalCountNote(operational.judge_by_kind),
+    },
     {
       label: "回答质量均分",
       value: s.answer_quality_mean == null ? "未计算" : `${s.answer_quality_mean} / 2`,

@@ -285,3 +285,22 @@ def test_search_without_a_scope_covers_every_album(scripted_client: TestClient) 
         "空 scope 必须跨两个相册"
     )
     assert [item["asset"]["id"] for item in one_album["items"]] == [album1_id]
+
+
+def test_search_http_retains_structured_embedding_failure(isolated_app):
+    import httpx
+
+    from sentrix.infrastructure.models.legacy import ChineseClipSidecarEmbedder
+
+    isolated_app.state.container = dataclasses.replace(
+        isolated_app.state.container,
+        visual_embedder=ChineseClipSidecarEmbedder(
+            "http://sidecar.invalid",
+            client=httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(429))),
+        ),
+    )
+    response = TestClient(isolated_app).get("/api/v1/search", params={"q": "query"})
+    assert response.status_code == 200
+    visual = next(row for row in response.json()["channel_trace"] if row["channel"] == "visual_ann")
+    assert visual["operational_issue"]["error_code"] == "provider_rejected"
+    assert visual["operational_issue"]["http_status"] == 429

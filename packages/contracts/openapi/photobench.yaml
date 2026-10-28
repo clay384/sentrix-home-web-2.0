@@ -1096,6 +1096,10 @@ components:
       title: ImportObservationProjection
     JudgeObservation:
       properties:
+        operational_issue:
+          anyOf:
+          - $ref: '#/components/schemas/OperationalIssue'
+          - type: 'null'
         score:
           title: Score
         score_normalization_version:
@@ -1136,6 +1140,51 @@ components:
       additionalProperties: true
       type: object
       title: JudgeObservation
+    JudgeRequestMetrics:
+      properties:
+        version:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Version
+        requests_started:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Requests Started
+        responses_received:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Responses Received
+        request_errors:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Request Errors
+        http_429:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Http 429
+        in_flight:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: In Flight
+        rate_waiting:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Rate Waiting
+        rate_wait_ms:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Rate Wait Ms
+      additionalProperties: true
+      type: object
+      title: JudgeRequestMetrics
     MemoryObservation:
       properties:
         memory_accounting:
@@ -1258,8 +1307,81 @@ components:
       additionalProperties: true
       type: object
       title: MemoryObservation
+    OperationalCounts:
+      properties:
+        not_evaluable_count:
+          type: integer
+          title: Not Evaluable Count
+        by_kind:
+          additionalProperties:
+            type: integer
+          type: object
+          title: By Kind
+        judge_incomplete_count:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Judge Incomplete Count
+        judge_by_kind:
+          anyOf:
+          - additionalProperties:
+              type: integer
+            type: object
+          - type: 'null'
+          title: Judge By Kind
+      additionalProperties: true
+      type: object
+      required:
+      - not_evaluable_count
+      - by_kind
+      title: OperationalCounts
+    OperationalIssue:
+      properties:
+        version:
+          type: integer
+          const: 1
+          title: Version
+        kind:
+          type: string
+          enum:
+          - output_limit
+          - context_limit
+          - step_limit
+          - time_limit
+          - provider_rejected
+          - resource_error
+          - model_output_invalid
+          - configuration_error
+          title: Kind
+        evidence:
+          additionalProperties: true
+          type: object
+          title: Evidence
+        scope:
+          anyOf:
+          - type: string
+            const: judge
+          - type: 'null'
+          title: Scope
+      additionalProperties: true
+      type: object
+      required:
+      - version
+      - kind
+      - evidence
+      title: OperationalIssue
+      description: Versioned execution evidence, separate from answer/architecture
+        quality.
     PhaseMetricsProjection:
       properties:
+        operational:
+          anyOf:
+          - $ref: '#/components/schemas/OperationalCounts'
+          - type: 'null'
+        judge_requests:
+          anyOf:
+          - $ref: '#/components/schemas/JudgeRequestMetrics'
+          - type: 'null'
         agent_completed:
           anyOf:
           - type: integer
@@ -1300,6 +1422,10 @@ components:
       title: PhaseMetricsProjection
     PhaseProgressProjection:
       properties:
+        operational:
+          anyOf:
+          - $ref: '#/components/schemas/OperationalCounts'
+          - type: 'null'
         total:
           anyOf:
           - type: integer
@@ -1320,6 +1446,31 @@ components:
           - type: integer
           - type: 'null'
           title: Agent Total
+        agent_waiting:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Agent Waiting
+        agent_running:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Agent Running
+        judge_waiting:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Judge Waiting
+        judge_running:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Judge Running
+        outcome_unknown:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Outcome Unknown
         judge_completed:
           anyOf:
           - type: integer
@@ -1394,6 +1545,34 @@ components:
       title: PhaseProgressProjection
     RunItemObservation:
       properties:
+        operational_issue:
+          anyOf:
+          - $ref: '#/components/schemas/OperationalIssue'
+          - type: 'null'
+        judge_issue:
+          anyOf:
+          - $ref: '#/components/schemas/OperationalIssue'
+          - type: 'null'
+        evaluation_status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Evaluation Status
+        execution_status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Execution Status
+        judge_status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Judge Status
+        judge_dispatch_status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Judge Dispatch Status
         judge:
           anyOf:
           - $ref: '#/components/schemas/JudgeObservation'
@@ -1424,6 +1603,10 @@ components:
       title: RunItemsResponse
     RunMetricsResponse:
       properties:
+        summary:
+          anyOf:
+          - $ref: '#/components/schemas/RunSummaryProjection'
+          - type: 'null'
         read_revision:
           anyOf:
           - type: string
@@ -1499,6 +1682,15 @@ components:
       additionalProperties: true
       type: object
       title: RunMetricsResponse
+    RunSummaryProjection:
+      properties:
+        operational:
+          anyOf:
+          - $ref: '#/components/schemas/OperationalCounts'
+          - type: 'null'
+      additionalProperties: true
+      type: object
+      title: RunSummaryProjection
     RuntimeConfigResponse:
       properties:
         runtime_config:

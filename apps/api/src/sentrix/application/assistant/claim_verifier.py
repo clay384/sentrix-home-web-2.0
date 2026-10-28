@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -21,8 +21,9 @@ from sentrix.domain.assistant.claim_verifier import (
 )
 from sentrix.domain.assistant.evidence_binding import Fact
 from sentrix.domain.assistant.evidence_ledger import EvidenceRequirement
-from sentrix.domain.assistant.models import ChatMessage, ChatRole
+from sentrix.domain.assistant.models import ChatMessage, ChatRole, ModelReply
 from sentrix.domain.assistant.ports import ChatModel
+from sentrix.domain.assistant.tools import ToolSpec
 
 log = logging.getLogger("sentrix.assistant.claim_verifier")
 
@@ -40,6 +41,7 @@ class ClaimVerifier:
         requirement: EvidenceRequirement | None,
         include_debug: bool = False,
         step_id: str = "claim_verifier",
+        complete: Callable[[Sequence[ChatMessage], Sequence[ToolSpec]], ModelReply] | None = None,
     ) -> ClaimReview:
         raw_messages = build_claim_messages(query=query, claim=claim, facts=facts, requirement=requirement)
         messages = [ChatMessage(ChatRole(str(item["role"])), str(item["content"])) for item in raw_messages]
@@ -57,7 +59,8 @@ class ClaimVerifier:
                 "response": None,
             }
         try:
-            reply = self._model.complete(messages, ())
+            # The turn callback shares its step budget and operational recorder.
+            reply = (complete or self._model.complete)(messages, ())
         except Exception:
             log.warning("L3 claim 核验调用失败，按 ambiguous 放行", exc_info=True)
             return ClaimReview(claim=claim, debug_call=debug_call)

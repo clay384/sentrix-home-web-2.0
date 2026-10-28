@@ -27,6 +27,7 @@ Handler = Callable[[httpx.Request], httpx.Response]
         ("POST", httpx.WriteError, 1),
         ("POST", httpx.RemoteProtocolError, 1),
         ("POST", httpx.ReadTimeout, 1),
+        ("POST", httpx.WriteTimeout, 1),
     ],
 )
 def test_retries_are_bounded_and_never_replay_an_uncertain_post(method, error, retries):

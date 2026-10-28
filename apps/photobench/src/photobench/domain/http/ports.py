@@ -95,3 +95,29 @@ class JsonHttpClient(Protocol):
         直接交出去——这正是 ``request_bytes`` 做不到的那件事。
         """
         ...
+
+
+HttpAttemptObserver = Callable[[Mapping[str, Any]], None]
+
+
+@runtime_checkable
+class ObservedJsonHttpClient(Protocol):
+    """Optional safe transport metadata; ordinary JsonHttpClient remains unchanged."""
+
+    def request_json_observed(
+        self,
+        url: str,
+        payload: Mapping[str, Any] | None = None,
+        method: str = "GET",
+        timeout: int = 120,
+        extra_headers: Mapping[str, str] | None = None,
+        *,
+        observer: HttpAttemptObserver,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Any: ...
+
+
+@runtime_checkable
+class SharedGateHttpClient(Protocol):
+    @property
+    def shared_gate_enabled(self) -> bool: ...

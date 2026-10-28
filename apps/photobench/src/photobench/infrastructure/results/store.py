@@ -61,43 +61,22 @@ def _overview(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def read_entry(run_dir: Path) -> dict[str, Any]:
-    """Cheap committed metadata; legacy derived index is invalidated by file identity."""
+    """Use immutable committed metadata; legacy files have no reliable revision.
+
+    In-place same-size writes can preserve both mtime_ns and ctime_ns within a
+    filesystem clock tick. A stat-only derived index can silently retain old scores.
+    """
     with run_lock(run_dir):
         metadata = committed_path(run_dir, "metadata.json")
-        if metadata.is_file():
+        if metadata.parent != run_dir and metadata.is_file():
             entry = json.loads(metadata.read_text(encoding="utf-8"))["entry"]
             if not isinstance(entry, dict):
                 raise ValueError("invalid committed entry")
             return entry
-        path = run_dir / "run.json"
-        stat = path.stat()
-        signature = [stat.st_ino, stat.st_size, stat.st_mtime_ns]
-        index = run_dir / ".photobench-read-index.json"
-        try:
-            cached = json.loads(index.read_text(encoding="utf-8"))
-            if cached.get("signature") == signature and isinstance(cached.get("entry"), dict):
-                entry = cached["entry"]
-                assert isinstance(entry, dict)
-                return entry
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
-        state = json.loads(path.read_text(encoding="utf-8"))
+        state = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
         if not isinstance(state, dict) or not state.get("run_id"):
             raise ValueError("missing run_id")
-        entry = run_list_entry(state)
-        # Derived only. Read-only historical directories remain readable.
-        temporary = index.with_suffix(".tmp")
-        try:
-            temporary.write_text(
-                json.dumps({"signature": signature, "entry": entry}, ensure_ascii=False), encoding="utf-8"
-            )
-            temporary.replace(index)
-        except OSError:
-            log.warning("Could not cache historical run entry: %s", run_dir, exc_info=True)
-        finally:
-            with suppress(OSError):
-                temporary.unlink(missing_ok=True)
-        return entry
+        return run_list_entry(state)
 
 
 def write_committed_snapshot(run_dir: Path, state: dict[str, Any]) -> None:
@@ -208,7 +187,7 @@ class FileRunStore:
         run_dir = self._run_dir(run_id)
         with run_lock(run_dir):
             path = committed_path(run_dir, "metadata.json")
-            if path.is_file():
+            if path.parent != run_dir and path.is_file():
                 overview = json.loads(path.read_text(encoding="utf-8"))["overview"]
                 if not isinstance(overview, dict):
                     raise ValueError("invalid committed overview")
@@ -216,14 +195,17 @@ class FileRunStore:
             return {**_overview(self.load_state(run_id)), "read_revision": self.revision(run_id)}
 
     def revision(self, run_id: str) -> str:
+        """Only immutable committed generations provide a cacheable identity.
+
+        Empty means unversioned, not a stable revision of a mutable legacy file.
+        No hashing or parsing of the large run payload is needed on the new path.
+        """
         run_dir = self._run_dir(run_id)
         with run_lock(run_dir):
             path = committed_path(run_dir, "run.json")
-            try:
-                stat = path.stat()
-            except FileNotFoundError as exc:
-                raise KeyError(run_id) from exc
-            return f"{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}"
+            if not path.is_file():
+                raise KeyError(run_id)
+            return f"snapshot:{path.parent.name}" if path.parent != run_dir else ""
 
     def telemetry_revision(self, run_id: str) -> str:
         run_dir = self._run_dir(run_id)

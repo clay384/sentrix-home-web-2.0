@@ -33,7 +33,9 @@ def test_completed_suites_release_execution_and_thread_objects(tmp_path, mode):
                 "existing_scope_id": "scope-old" if mode == "reuse" else "",
             }
         )
-        assert _wait_until(lambda: not suites.active_run_ids())
+        # Terminal state can become visible before the worker's finally releases
+        # its thread. Wait for the cleanup whose boundedness this test verifies.
+        assert _wait_until(lambda: not suites.active_run_ids() and not suites._threads)
     assert _wait_until(lambda: not suites._threads)
     assert not suites._active
 
@@ -271,11 +273,12 @@ def test_recovery_uses_commit_instead_of_stale_legacy_export(tmp_path):
         lease.close()
 
 
-def test_many_legacy_records_are_not_reparsed_on_warm_start(tmp_path, monkeypatch):
+def test_many_committed_records_are_not_reparsed_on_warm_start(tmp_path, monkeypatch):
     from photobench.infrastructure.results.recovery import FileRunStartupRecovery
 
+    writer = FileResultWriter(tmp_path)
     for index in range(1000):
-        _write(tmp_path, str(index), {"run_id": str(index), "status": "completed", "items": []})
+        writer.write_snapshot(str(index), {"run_id": str(index), "status": "completed", "items": []})
     store = FileRunStore(tmp_path)
     assert len(list(store.iter_entries())) == 1000
     original = Path.read_text
@@ -376,3 +379,57 @@ def test_pointer_directory_sync_failure_is_reported_without_deleting_published_d
         writer.write_snapshot("r", {"run_id": "r", "status": "completed", "items": [], "counter": 1})
     assert store.FileRunStore(tmp_path).load_state("r")["counter"] == 1
     assert json.loads((tmp_path / "r" / "run.json").read_text())["counter"] == 0
+
+
+def test_legacy_same_metadata_score_changes_invalidate_all_read_views(tmp_path, monkeypatch):
+    run = tmp_path / "r" / "run.json"
+    _write(tmp_path, "r", _state("r"))
+    frozen_stat = run.stat()
+    actual_stat = Path.stat
+
+    def unchanged_stat(path, *args, **kwargs):
+        return frozen_stat if path == run else actual_stat(path, *args, **kwargs)
+
+    # Deterministic reproduction of the observed inode/size/mtime/ctime collision.
+    monkeypatch.setattr(Path, "stat", unchanged_stat)
+    store = FileRunStore(tmp_path)
+    reader = ReadRuns(store, RunIndex(), _NoQaMetadata(), SimpleNamespace(), lambda: "unused")
+    assert reader.get_run("r")["summary"]["answer_quality_mean"] == 1
+    assert reader._state("r")["items"][0]["judge"]["score"] == 2
+    assert list(store.iter_entries())[0]["summary"]["answer_quality_mean"] == 1
+    state = _state("r")
+    state["items"][0]["judge"]["score"] = 0
+    _write(tmp_path, "r", state)
+    assert store.revision("r") == ""
+    assert reader.get_run("r")["summary"]["answer_quality_mean"] == 0
+    assert reader._state("r")["items"][0]["judge"]["score"] == 0
+    assert list(store.iter_entries())[0]["summary"]["answer_quality_mean"] == 0
+
+
+def test_committed_generations_keep_fast_cached_overview_and_invalidate_on_publish(tmp_path, monkeypatch):
+    writer = FileResultWriter(tmp_path)
+    writer.write_snapshot("r", _state("r"))
+    store = FileRunStore(tmp_path)
+    revision = store.revision("r")
+    assert revision.startswith("snapshot:")
+    reader = ReadRuns(store, RunIndex(), _NoQaMetadata(), SimpleNamespace(), lambda: "unused")
+    load = store.load_overview
+    calls = []
+
+    def overview(run_id):
+        calls.append(run_id)
+        return load(run_id)
+
+    monkeypatch.setattr(store, "load_overview", overview)
+    monkeypatch.setattr(
+        store, "load_state", lambda *_: pytest.fail("large payload read for committed overview")
+    )
+    assert reader.get_run("r")["summary"]["answer_quality_mean"] == 1
+    assert reader.get_run("r")["summary"]["answer_quality_mean"] == 1
+    assert calls == ["r"]
+    state = _state("r")
+    state["items"][0]["judge"]["score"] = 0
+    writer.write_snapshot("r", state)
+    assert store.revision("r") != revision
+    assert reader.get_run("r")["summary"]["answer_quality_mean"] == 0
+    assert calls == ["r", "r"]

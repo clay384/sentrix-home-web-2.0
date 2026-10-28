@@ -125,12 +125,19 @@ def _run_turn(container: Container) -> RunTurn:
             # preview 的 ``place`` 取自这里（导入期 EXIF GPS 反解出来的行政地名），
             # 不是 ``observations.place``（VLM 的场景描述）——理由见 ``_place_label``。
             asset_places=container.asset_place_repository,
+            video_repository=container.video_repository,
         ),
         # 墙钟是部署事实：Mac/CPU 上 4 并发时一次 inspect 就可能 30-60s，
         # 180s 的默认值会把正常回合截成 timeout。由 Settings 注入，153 仍用 180。
         profile=replace(
             DEFAULT_PROFILE,
             wall_time_s=container.settings.agent_wall_time_s,
+            max_steps=container.settings.agent_max_steps,
+            strict_model_step_budget=container.settings.vlm_native_output_budget,
+            max_tool_calls=container.settings.agent_max_tool_calls,
+            max_search_calls=container.settings.agent_max_search_calls,
+            max_page_calls=container.settings.agent_max_page_calls,
+            max_inspections=container.settings.agent_max_inspections,
         ),
     )
 

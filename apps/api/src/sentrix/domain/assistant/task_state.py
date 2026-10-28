@@ -59,6 +59,7 @@ class TaskState:
     started_at: float = field(default_factory=time.monotonic)
     phase: str = PLANNING
     model_steps: int = 0
+    budget_events: list[dict[str, Any]] = field(default_factory=list)
     records: list[ToolCallRecord] = field(default_factory=list)
     progress: list[ProgressEvent] = field(default_factory=list)
     guard_blocked_codes: set[str] = field(default_factory=set)
@@ -205,7 +206,7 @@ class TaskState:
         拒绝时说得出是哪一条满了（1.0 把它们合在一次检查里，只会回一句
         ``budget exhausted``）。
         """
-        return self.inspection_calls < self.profile.max_inspections
+        return self.profile.max_inspections is None or self.inspection_calls < self.profile.max_inspections
 
     def can_step(self) -> bool:
         """还能不能再问一次模型。
@@ -216,8 +217,37 @@ class TaskState:
         """
         return self.model_steps < self.profile.max_steps and self.wall_remaining() > 0
 
+    def needs_reserved_final(self) -> bool:
+        """Strict loops keep their last available model step for an authored answer.
+
+        A one-step profile cannot provide both exploration and finalization; it
+        keeps its existing explicit exhaustion behavior if the model asks a tool.
+        Planner remains separate; L2 and context recovery share model_steps.
+        """
+        return (
+            self.profile.strict_model_step_budget
+            and self.model_steps > 0
+            and self.model_steps + 1 == self.profile.max_steps
+            and self.can_step()
+        )
+
     def can_call_tool(self) -> bool:
-        return self.tool_round_trips < self.profile.max_tool_calls and self.has_final_reserve()
+        return (
+            self.profile.max_tool_calls is None or self.tool_round_trips < self.profile.max_tool_calls
+        ) and self.has_final_reserve()
+
+    def record_budget_limit(
+        self, code: str, *, budget_name: str, used: int | float, limit: int | float
+    ) -> None:
+        """Record an actual gate decision, not mere proximity to a configured limit."""
+        if any(
+            event["error_code"] == code and event["budget_name"] == budget_name
+            for event in self.budget_events
+        ):
+            return
+        self.budget_events.append(
+            {"error_code": code, "budget_name": budget_name, "used": used, "limit": limit}
+        )
 
     def wall_remaining(self) -> float:
         return self.profile.wall_time_s - (time.monotonic() - self.started_at)

@@ -51,3 +51,11 @@ class RequestOutcomeUnknownError(RuntimeError):
             "automatic_replay": False,
         }
         super().__init__(f"{method} outcome unknown after {cause_type}; request was not replayed")
+
+
+class SharedJudgeGateError(RuntimeError):
+    """A shared Judge dispatch gate failed closed; never retry as a provider call."""
+
+    def __init__(self, code: str) -> None:
+        self.facts = {"code": code, "automatic_replay": False, "source": "shared_judge_gate"}
+        super().__init__("shared_judge_gate:" + code)

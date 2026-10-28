@@ -6,9 +6,12 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import pytest
+
 import sentrix.api.routes.media as media_routes
 from sentrix.application.memories.build_graph import BuildMemoryGraph
 from sentrix.application.retrieval.retrieve_graph import RetrieveGraph, graph_direction, graph_intent
+from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.media.models import Asset, AssetStatus, MediaType, Observation, ObservationFact
 from sentrix.domain.memories.causality import CausalVerdict
 from sentrix.domain.memories.events import EventEntityRecord, EventRecord
@@ -343,7 +346,19 @@ def test_graph_quality_reference_detects_spurious_deterministic_edge(migrations_
     assert quality["reference_edge_recall"] is None
 
 
-def test_causal_judge_failure_keeps_other_graph_edges_and_reports_degraded(migrations_ready_db):
+@pytest.mark.parametrize(
+    "failure",
+    [
+        TimeoutError("model unavailable"),
+        ModelServiceError(
+            "time limit", error_code="time_limit", request_policy={"request_outcome_unknown": True}
+        ),
+        ModelServiceError(
+            "output limit", error_code="output_limit", finish_reason="length", completion_tokens=4096
+        ),
+    ],
+)
+def test_causal_judge_failure_keeps_other_graph_edges_and_reports_degraded(migrations_ready_db, failure):
     assets = (
         _asset("video", "/tmp/video.mp4"),
         replace(_asset("frame-a", "/tmp/a.jpg", parent_asset_id="video"), source_timestamp_sec=1.0),
@@ -364,7 +379,7 @@ def test_causal_judge_failure_keeps_other_graph_edges_and_reports_degraded(migra
 
     class _BrokenJudge:
         def judge(self, prompt, *, expected_count):
-            raise TimeoutError("model unavailable")
+            raise failure
 
     graph = SqliteMemoryGraphRepository(migrations_ready_db)
     stats = BuildMemoryGraph(
@@ -380,6 +395,18 @@ def test_causal_judge_failure_keeps_other_graph_edges_and_reports_degraded(migra
     ).execute(SCOPE)
 
     assert stats.causal_status == "degraded"
+    assert len(stats.causal_issues) == 1
+    if isinstance(failure, ModelServiceError):
+        issue = stats.causal_issues[0]
+        assert issue["error_code"] == failure.error_code
+        assert issue["request_policy"] == failure.request_policy
+        assert issue["completion_tokens"] == failure.completion_tokens
+    from dataclasses import asdict
+
+    from sentrix.api.schemas.timeline import MemoryGraphBuildResponse
+
+    payload = MemoryGraphBuildResponse(**asdict(stats)).model_dump()
+    assert payload["causal_issues"][0]["error_type"] == type(failure).__name__
     assert stats.causal_candidate_pairs == 1
     assert stats.causal_edges == 0
     assert graph.status(SCOPE).available

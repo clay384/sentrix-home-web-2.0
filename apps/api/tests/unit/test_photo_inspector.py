@@ -25,7 +25,9 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from PIL import Image
 
+from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.media.inspection import (
     CERTAINTY_SUPPORTED,
     CERTAINTY_UNCERTAIN,
@@ -94,14 +96,14 @@ def _b64(payload: bytes) -> str:
 @pytest.fixture
 def photo(tmp_path: Path) -> Path:
     path = tmp_path / "photo.jpg"
-    path.write_bytes(b"\xff\xd8\xff\xe0full-photo")
+    Image.new("RGB", (12, 8), "red").save(path, format="JPEG")
     return path
 
 
 @pytest.fixture
 def crop(tmp_path: Path) -> Path:
     path = tmp_path / "crop.jpg"
-    path.write_bytes(b"\xff\xd8\xff\xe0person-crop")
+    Image.new("RGB", (6, 4), "blue").save(path, format="JPEG")
     return path
 
 
@@ -229,8 +231,8 @@ def test_the_crop_is_sent_before_the_photo(photo: Path, crop: Path) -> None:
     inspector.inspect(str(photo), QUESTION, target_person="爸爸", crop=str(crop))
 
     assert len(inspector.images[0]) == 2
-    assert inspector.images[0][0].endswith(_b64(b"\xff\xd8\xff\xe0person-crop"))
-    assert inspector.images[0][1].endswith(_b64(b"\xff\xd8\xff\xe0full-photo"))
+    assert inspector.images[0][0].endswith(_b64(crop.read_bytes()))
+    assert inspector.images[0][1].endswith(_b64(photo.read_bytes()))
 
 
 def test_without_a_crop_only_the_photo_is_sent(photo: Path) -> None:
@@ -239,7 +241,7 @@ def test_without_a_crop_only_the_photo_is_sent(photo: Path) -> None:
     inspector.inspect(str(photo), QUESTION)
 
     assert len(inspector.images[0]) == 1
-    assert inspector.images[0][0].endswith(_b64(b"\xff\xd8\xff\xe0full-photo"))
+    assert inspector.images[0][0].endswith(_b64(photo.read_bytes()))
 
 
 def test_an_unreadable_crop_falls_back_to_the_photo_alone(photo: Path, tmp_path: Path) -> None:
@@ -287,6 +289,7 @@ class _RecordingEndpoint(BaseHTTPRequestHandler):
 
     posts: ClassVar[list[dict[str, Any]]] = []
     reply: ClassVar[dict[str, Any]] = {"observation": "戴了", "certainty": "supported"}
+    finish_reason: ClassVar[str | None] = "stop"
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的接口
         self._send(b'{"object":"list","data":[{"id":"fake-vlm","object":"model"}]}', 200)
@@ -294,7 +297,10 @@ class _RecordingEndpoint(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的接口
         length = int(self.headers.get("Content-Length") or 0)
         self.posts.append(json.loads(self.rfile.read(length)))
-        body = {"choices": [{"message": {"content": json.dumps(self.reply, ensure_ascii=False)}}]}
+        choice: dict[str, Any] = {"message": {"content": json.dumps(self.reply, ensure_ascii=False)}}
+        if self.finish_reason is not None:
+            choice["finish_reason"] = self.finish_reason
+        body = {"choices": [choice]}
         self._send(json.dumps(body).encode("utf-8"), 200)
 
     def _send(self, payload: bytes, status: int) -> None:
@@ -312,6 +318,7 @@ class _RecordingEndpoint(BaseHTTPRequestHandler):
 def inspector_factory() -> Iterator[Any]:
     """一个打到本文件自己起的端点上的真适配器（探测与调用都是真 HTTP）。"""
     _RecordingEndpoint.posts = []
+    _RecordingEndpoint.finish_reason = "stop"
     httpd = HTTPServer(("127.0.0.1", 0), _RecordingEndpoint)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     base_url = f"http://127.0.0.1:{httpd.server_port}/v1"
@@ -338,8 +345,8 @@ def test_the_wire_body_carries_the_question_and_two_image_blocks(
     assert QUESTION in content[0]["text"]
     assert FACE_MANIFEST_PREFIX_1_0 in content[0]["text"]
     assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
-    assert content[1]["image_url"]["url"].endswith(_b64(b"\xff\xd8\xff\xe0person-crop"))
-    assert content[2]["image_url"]["url"].endswith(_b64(b"\xff\xd8\xff\xe0full-photo"))
+    assert content[1]["image_url"]["url"].endswith(_b64(crop.read_bytes()))
+    assert content[2]["image_url"]["url"].endswith(_b64(photo.read_bytes()))
     # 模型名是**问端点要的**，不是写死的常量。
     assert body["model"] == "fake-vlm"
 
@@ -349,6 +356,19 @@ def test_the_wire_body_has_a_single_image_block_without_a_crop(inspector_factory
 
     content = _RecordingEndpoint.posts[0]["messages"][0]["content"]
     assert [block["type"] for block in content] == ["text", "image_url"]
+
+
+def test_wire_reply_without_finish_is_unknown_and_never_retried(
+    inspector_factory: Any, photo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Valid answer JSON alone does not prove that the generation completed."""
+    monkeypatch.setattr(_RecordingEndpoint, "finish_reason", None)
+    with pytest.raises(ModelServiceError) as caught:
+        inspector_factory().inspect(str(photo), QUESTION)
+    assert caught.value.error_code == "provider_response_invalid"
+    assert caught.value.request_policy["request_outcome_unknown"] is True
+    assert len(_RecordingEndpoint.posts) == 1
+    assert QUESTION in _RecordingEndpoint.posts[0]["messages"][0]["content"][0]["text"]
 
 
 # ---- 对照臂：这个端口做的事，``VlmObserver`` 结构上做不到 ---------------------------
@@ -385,3 +405,56 @@ def test_the_inspector_downscales_both_the_photo_and_the_crop(
 
     assert [name for name, _ in seen] == [photo.name, crop.name]
     assert [max_side for _, max_side in seen] == [IMAGE_MAX_SIDE, IMAGE_MAX_SIDE]
+
+
+@pytest.mark.parametrize("suffix", [".mp4", ".jpg", ".png"])
+def test_mp4_magic_never_becomes_image_url_or_discovers_model(tmp_path, suffix, monkeypatch):
+    path = tmp_path / ("not-an-image" + suffix)
+    path.write_bytes(bytes.fromhex("000000206674797069736f6d0000020069736f6d69736f32617663316d703431"))
+    inspector = ScriptedInspector({"observation": "must not be used"})
+
+    def no_discovery(*_args):
+        raise AssertionError("invalid media must fail before model discovery")
+
+    monkeypatch.setattr(ServedModel, "current", no_discovery)
+    with pytest.raises(ModelServiceError) as caught:
+        inspector.inspect(path, QUESTION)
+    assert caught.value.error_code == "request_configuration_invalid"
+    assert caught.value.request_policy["request_outcome_unknown"] is False
+    assert caught.value.request_policy["request_phase"] == "media_validation"
+    assert inspector.images == [] and inspector.prompts == []
+
+
+@pytest.mark.parametrize(
+    ("image_format", "mime"),
+    [
+        ("JPEG", "image/jpeg"),
+        ("PNG", "image/png"),
+        ("WEBP", "image/webp"),
+        ("GIF", "image/gif"),
+        ("BMP", "image/bmp"),
+        ("TIFF", "image/tiff"),
+    ],
+)
+def test_valid_image_magic_preserves_exact_bytes_and_actual_mime(tmp_path, image_format, mime):
+    # A misleading extension must not affect a valid image container's MIME.
+    path = tmp_path / "photo.unrelated"
+    Image.new("RGB", (12, 8), "red").save(path, format=image_format)
+    original = path.read_bytes()
+    inspector = ScriptedInspector({"observation": "fixture"})
+    inspector.inspect(path, QUESTION)
+    url = inspector.images[0][0]
+    assert url.startswith(f"data:{mime};base64,")
+    assert base64.b64decode(url.split(",", 1)[1]) == original
+    assert path.read_bytes() == original
+
+
+def test_corrupt_image_is_an_explicit_local_error_without_a_model_call(tmp_path):
+    path = tmp_path / "corrupt.jpg"
+    path.write_bytes(b"\xff\xd8\xff\xe0truncated-jpeg")
+    inspector = ScriptedInspector({"observation": "must not be used"})
+    with pytest.raises(ModelServiceError) as caught:
+        inspector.inspect(path, QUESTION)
+    assert caught.value.request_policy["input_error"] == "invalid_image_data"
+    assert caught.value.error_code != "provider_rejected"
+    assert inspector.images == []

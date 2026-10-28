@@ -22,7 +22,8 @@ from sentrix.domain.assistant.ports import (
 )
 from sentrix.domain.assistant.tools import TOOL_SPECS, openai_tools
 from sentrix.infrastructure.assistant.chat_client import (
-    MAX_ANSWER_TOKENS,
+    CONTEXT_SAFETY_TOKENS,
+    DEFAULT_CONTEXT_TOKENS,
     PROMPT_COMPACTION_RATIO,
     TOKENS_PER_CHAR,
     TOOLS_TOKENS_PER_CHAR,
@@ -456,8 +457,8 @@ def test_the_output_budget_is_derived_from_the_real_window(server: str):
 
     prompt_tokens = OpenAIChatModel.estimate_prompt_tokens(messages_, TOOL_SPECS)
     sent = _Handler.received[0]["body"]["max_tokens"]
-    assert sent == min(MAX_ANSWER_TOKENS, CONTEXT_TOKENS - prompt_tokens)
-    assert sent != min(MAX_ANSWER_TOKENS, 4400 - prompt_tokens)
+    assert sent == CONTEXT_TOKENS - prompt_tokens - CONTEXT_SAFETY_TOKENS
+    assert sent != 4400 - prompt_tokens - CONTEXT_SAFETY_TOKENS
 
 
 def test_the_estimate_counts_the_tool_schemas(server: str):
@@ -506,7 +507,13 @@ def test_a_short_prompt_gets_the_full_answer_budget(server: str):
 
     chat_model(server).complete(messages(), TOOL_SPECS)
 
-    assert _Handler.received[0]["body"]["max_tokens"] == MAX_ANSWER_TOKENS
+    expected = (
+        DEFAULT_CONTEXT_TOKENS
+        - OpenAIChatModel.estimate_prompt_tokens(messages(), TOOL_SPECS)
+        - CONTEXT_SAFETY_TOKENS
+    )
+    assert _Handler.received[0]["body"]["max_tokens"] == expected
+    assert expected > 2048
 
 
 # ---- 生成被截断：它长得像 500，但不是服务故障 -------------------------------
@@ -675,3 +682,222 @@ def test_an_answer_without_any_channel_is_untouched(server: str):
 
     assert result.content == "  这是你要的海边照片。  "
     assert result.thought == ""
+
+
+def test_native_budget_uses_server_tokenizer_without_hidden_client_caps(server: str):
+    _Handler.response = reply("完整答案" * 1000)
+    _Handler.response["usage"] = {"prompt_tokens": 250000, "completion_tokens": 5000}
+    model = OpenAIChatModel(
+        server,
+        ServedModel(server, generation_profile="qwen35_nonthinking", native_output_budget=True),
+        context_tokens=262144,
+    )
+    # A conservative character estimate may exceed the window. Only the actual
+    # provider tokenizer can determine whether the template fits in native mode.
+    result = model.complete(
+        [ChatMessage(ChatRole.SYSTEM, "系统"), ChatMessage(ChatRole.USER, "问" * 400000)], ()
+    )
+    body = _Handler.received[0]["body"]
+    assert "max_tokens" not in body and "max_completion_tokens" not in body
+    assert body["temperature"] == 0.7 and body["presence_penalty"] == 1.5
+    assert body["seed"] == 42 and body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert result.completion_tokens == 5000
+    assert result.request_policy["output_budget"] == "native_remaining_context"
+    assert result.request_policy["max_model_len"] == 262144
+
+
+def test_native_length_is_explicit_limit_with_usage_not_a_valid_answer(server: str):
+    _Handler.response = reply("没有写完")
+    _Handler.response["choices"][0]["finish_reason"] = "length"
+    _Handler.response["usage"] = {"prompt_tokens": 260000, "completion_tokens": 2144}
+    model = OpenAIChatModel(server, ServedModel(server, native_output_budget=True), context_tokens=262144)
+    with pytest.raises(OutputTruncatedError) as error:
+        model.complete(messages(), ())
+    assert error.value.error_code == "output_limit"
+    assert error.value.finish_reason == "length"
+    assert error.value.completion_tokens == 2144
+    assert error.value.request_policy["max_output_tokens"] is None
+    assert len(_Handler.received) == 1
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 429, 503])
+def test_provider_rejection_keeps_typed_status_and_is_not_retried(server: str, status: int):
+    _Handler.status = status
+    _Handler.response = {"error": {"message": "request rejected"}}
+    with pytest.raises(ModelServiceError) as error:
+        chat_model(server).complete(messages(), ())
+    assert error.value.error_code == "provider_rejected"
+    assert error.value.http_status == status
+    assert len(_Handler.received) == 1
+
+
+def test_refreshed_model_transport_error_retains_native_policy(server: str, monkeypatch):
+    import httpx
+
+    served = ServedModel(server, native_output_budget=True)
+    served.current()
+    _Handler.served = ["new-model"]
+    client = OpenAIChatModel(server, served, context_tokens=262144)
+    original = client._post
+
+    def post(name, request_messages, specs, **kwargs):
+        if name == "new-model":
+            raise ModelServiceError(
+                "response timeout",
+                error_code="time_limit",
+                request_policy={"request_outcome_unknown": True},
+            ) from httpx.ReadTimeout("timeout")
+        return original(name, request_messages, specs, **kwargs)
+
+    monkeypatch.setattr(client, "_post", post)
+    with pytest.raises(ModelServiceError) as error:
+        client.complete(messages(), ())
+    assert error.value.error_code == "time_limit"
+    assert error.value.request_policy["max_model_len"] == 262144
+    assert error.value.request_policy["max_output_tokens"] is None
+    assert error.value.request_policy["request_outcome_unknown"] is True
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"choices": []},
+        {"choices": [{"message": None}]},
+        {"choices": [{"message": {"content": ""}, "finish_reason": "content_filter"}]},
+    ],
+)
+def test_invalid_provider_protocol_or_filter_is_not_an_answer(server, body):
+    _Handler.response = body
+    with pytest.raises(ModelServiceError) as raised:
+        chat_model(server).complete(messages(), ())
+    assert raised.value.error_code == "provider_rejected"
+    assert raised.value.http_status == 200
+    assert len(_Handler.received) == 1
+
+
+def test_discovery_failure_keeps_native_policy_and_never_posts(server, monkeypatch):
+    import httpx
+
+    def timeout(*args, **kwargs):
+        raise httpx.ReadTimeout("fixture")
+
+    monkeypatch.setattr(httpx, "get", timeout)
+    model = OpenAIChatModel(server, ServedModel(server, native_output_budget=True), context_tokens=262144)
+    with pytest.raises(ModelServiceError) as raised:
+        model.complete(messages(), ())
+    assert raised.value.error_code == "time_limit"
+    assert raised.value.request_policy["request_outcome_unknown"] is False
+    assert raised.value.request_policy["max_output_tokens"] is None
+    assert raised.value.request_policy["max_model_len"] == 262144
+    assert _Handler.received == []
+
+
+@pytest.mark.parametrize("phase", ["planner", "l3"])
+def test_native_new_planner_and_l3_http_bodies_have_no_output_cap(server, phase):
+    from sentrix.application.assistant.claim_verifier import ClaimVerifier
+    from sentrix.application.assistant.goal_planner import GoalPlanner
+    from sentrix.domain.assistant.claim_verifier import high_risk_claims
+
+    model = OpenAIChatModel(
+        server,
+        ServedModel(server, generation_profile="qwen35_nonthinking", native_output_budget=True),
+        context_tokens=262144,
+    )
+    if phase == "planner":
+        declaration = {
+            "action": "declare",
+            "declaration": {
+                "goal": "找照片",
+                "requirements": [
+                    {
+                        "id": "req1",
+                        "evidence_type": "photo_set",
+                        "description": "照片",
+                        "predicate": "check",
+                        "value_type": "media_set",
+                        "scope": {},
+                        "required": True,
+                    }
+                ],
+            },
+        }
+        _Handler.response = reply(json.dumps(declaration))
+        result = GoalPlanner(model, max_attempts=1).declare("找照片", scope_id="scope1")
+        assert result.requirements is not None
+        assert result.model_calls[0]["request_policy"]["http_post_attempts"] == 1
+    else:
+        _Handler.response = reply('{"verdict":"ambiguous"}')
+        ClaimVerifier(model).review(
+            query="几张照片",
+            claim=high_risk_claims("一共有12张照片。")[0],
+            facts=[],
+            requirement=None,
+        )
+    assert len(_Handler.received) == 1
+    body = _Handler.received[0]["body"]
+    assert "max_tokens" not in body and "max_completion_tokens" not in body
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert body["temperature"] == 0.7 and body["presence_penalty"] == 1.5
+    assert "tools" not in body and "tool_choice" not in body
+    if phase == "planner":
+        assert body["response_format"]["type"] == "json_schema"
+
+
+def test_native_known_structured_refusal_keeps_both_http_attempts_uncapped(server):
+    _Handler.response = reply("完整回答")
+    _Handler.reject_structured = True
+    model = OpenAIChatModel(server, ServedModel(server, native_output_budget=True), context_tokens=262144)
+
+    result = model.complete_structured(
+        messages(),
+        (),
+        response_format={"type": "json_schema", "json_schema": {"name": "x", "schema": {}}},
+    )
+
+    assert len(_Handler.received) == 2
+    assert result.request_policy["http_post_attempts"] == 2
+    assert result.request_policy["structured_fallback"]["refused_http_status"] == 400
+    for entry in _Handler.received:
+        assert "max_tokens" not in entry["body"] and "max_completion_tokens" not in entry["body"]
+
+
+def test_native_structured_unknown_after_http_body_is_never_replayed(server, monkeypatch):
+    def disconnect_after_body(handler):
+        length = int(handler.headers.get("Content-Length") or 0)
+        body = json.loads(handler.rfile.read(length) or b"{}")
+        _Handler.received.append({"path": handler.path, "body": body})
+        handler.close_connection = True  # A received request with no response/terminal outcome.
+
+    monkeypatch.setattr(_Handler, "do_POST", disconnect_after_body)
+    model = OpenAIChatModel(server, ServedModel(server, native_output_budget=True), context_tokens=262144)
+    with pytest.raises(ModelServiceError) as caught:
+        model.complete_structured(
+            messages(),
+            (),
+            response_format={"type": "json_schema", "json_schema": {"name": "x", "schema": {}}},
+        )
+
+    assert len(_Handler.received) == 1
+    assert caught.value.request_policy["request_outcome_unknown"] is True
+    assert caught.value.request_policy["http_post_attempts"] == 1
+    assert "structured_fallback" not in caught.value.request_policy
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_structured_provider_failure_is_reported_without_plain_retry(server, status):
+    _Handler.status = status
+    _Handler.response = {"error": "provider unavailable"}
+    model = OpenAIChatModel(server, ServedModel(server, native_output_budget=True), context_tokens=262144)
+
+    with pytest.raises(ModelServiceError) as caught:
+        model.complete_structured(
+            messages(),
+            (),
+            response_format={"type": "json_schema", "json_schema": {"name": "x", "schema": {}}},
+        )
+
+    assert len(_Handler.received) == 1
+    assert caught.value.http_status == status
+    assert caught.value.request_policy["http_post_attempts"] == 1
+    assert caught.value.request_policy["request_outcome_unknown"] is False

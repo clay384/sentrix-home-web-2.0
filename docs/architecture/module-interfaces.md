@@ -410,13 +410,16 @@ class VlmObserver(Protocol):
 
 - 返回固定七字段的 `ObservationSemantics`；
 - 不猜姓名、不输出坐标、不做关系推断；
-- 失败（端点不可达、非 JSON、读图失败）返回 `None`，不抛；
+- 非 JSON 与读图失败保留内容降级并返回 `None`；端点/运行失败显式抛错；
 - 最多 3 次调用：首轮 → 缺自然语言补全 → 出现拉丁文则中文化；
+- 与照片问询、人物视觉共用 `chat_json`：复用 `ServedModel.generation_parameters()` 的显式采样策略、标准 `response_format={"type":"json_object"}`；省略输出预算字段，由后端计算原生剩余窗口（含图片与模板输入）；
+- 运行拒绝、网络/超时和 finish_reason=length 抛带 error_code/http_status/request_policy 的 ModelServiceError；结果未知单列且不重试。内容 JSON 无法解析仍返回 None 并记录不含正文的质量降级；图片流水线会把操作失败资产标为 failed，视频关键帧传播相同错误；
+- 不支持 JSON 模式不重试或回退为自由生成；错误与质量 warning 均不记录输入图片、提示词或回复正文；
 - 单次超时 `SENTRIX_VLM_TIMEOUT_S`（默认 180s）。
 
 **替换验收**
 
-- [ ] 坏图、非 JSON、端点 500 三种失败都返回 `None`，导入继续；
+- [ ] 坏图、非 JSON 返回 `None`；端点 500、超时和截断作为 typed 操作失败传播，流水线标 failed 并给出原因；
 - [ ] 观察结果能落 `observations`，且 `source_type="import"`；
 - [ ] 视频关键帧走同一条观察链；
 - [ ] 用 20 张黄金图对比 `caption/activity/place/people` 的非空率。
@@ -430,6 +433,7 @@ class VlmObserver(Protocol):
 **必须保持**
 
 - `fail -> None`，不抛；
+- 共用 §4.2 的固定采样、JSON 模式和可定位降级协议；
 - 图序 = 语义：裁剪件在前、原图在后；
 - `crop` 读不了时退回原图；
 - 结果交给 application 判断，适配器不做业务决策。
@@ -443,6 +447,7 @@ class VlmObserver(Protocol):
 **必须保持**
 
 - 一切失败返回 `None`；
+- 三条入口共用 §4.2 的固定采样、JSON 模式和可定位降级协议；
 - 提示词在 domain/application，适配器不拼业务提示词；
 - `clothing` 去重保序；
 - 不在导入前置路径上阻塞主链路。
@@ -504,6 +509,10 @@ legacy文本HTTP协议：优先`POST /embed`，仅404时协商`/v1/embeddings`�
 这是同一模型的传输协议兼容，不切换嵌入方案。量化差异记录在运行部署证据中，完整回归使用新scope。
 
 ---
+
+检索诊断另有可选 EmbeddingDiagnostics.last_operational_issue 端口：只读当前线程最近一次嵌入调用的结构化结果，不执行 I/O。legacy 适配器在每次调用（包括空输入）开始清空，成功后为空；超时、HTTP 拒绝、传输失败、非法向量、熔断按类型和响应状态记录安全字段，绝不以共享 load_error 给并发题目归因。现有 embed_query / embed_image 的空列表降级及计算语义不变。
+
+只读 QA 链路将该证据经 TextSearchResult / VisualSearchResult.operational_issue、ChannelTrace.operational_issue 传到搜索 API 和 Agent 内部 retrieval_channels；不进入模型可见内容。PhotoBench 将明确故障记为不可评估、保留原轨迹及未知结果而不重发，普通无命中和没有 typed 证据的旧降级不猜测原因。运行诊断同时报告既有 BGE/CLIP 超时，容量入口要求 expected-runtime 显式绑定；修改这些预算要独立记录实验条件。
 
 ### 4.6 向量索引（`VectorIndex`）
 
@@ -1252,3 +1261,14 @@ Judge一致性v3进一步限定为明确“模型/助手的回答/答案/结论�
 保留同步 `POST /api/v1/imports`，新增可选 `operation_id` 和独立 `GET /api/v1/imports/{operation_id}/progress`。产品仅输出通用处理事实；`completed = imported + deduplicated + failed`，`total` 为实际扫描并应用 limit 后的支持媒体数，扫描前为 null。媒体计数完成后仍依次进行事件总结、参与者刷新、家庭图谱、人物画像，只有同步请求完成才终态。updated_at 是步骤更新时间，observed_at 是查询时间，不能互换。查询不会重放导入。
 
 由 domain ImportProgressStore 端口、application TrackImport 和 bootstrap 装配的有界进程内适配器实现；最多32个活跃跟踪、128条终态，重启或淘汰后404。重复在册ID409，容量不足429，均发生在副作用前。此能力不是持久作业队列，不承诺跨进程查询或取消产品执行。PhotoBench 使用运行快照中的同一客户端，每秒轮询、单次3秒超时，保存最后事实及查询故障；不盲重试导入POST。旧服务无进度时明确不可用。
+
+
+### 2026-10-27：视觉 JSON 的显式业务契约
+
+`chat_json(..., *, output_schema=None, schema_name=None)` 在 `SENTRIX_VLM_JSON_OUTPUT_MODE=json_schema` 时，使用调用方的 schema 发送 `response_format={type:json_schema,json_schema:{name,schema,strict:true}}`。默认仍为 `json_object`；`prompt_only` 仍只省略格式字段。契约配置在模型发现 GET 和生成 POST 前校验，缺失或不支持时抛 `ModelServiceError(error_code=request_configuration_invalid)`，policy 明确 `request_phase=request_validation`、`request_outcome_unknown=false`；公共错误为500/“请求配置错误”，PhotoBench独立归configuration_error，不作为回答质量0。
+
+`infrastructure/media/json_output_contracts.py` 定义五种契约：观察（初始/补全/中文化共用），人物画像，人物瞬间，人物外观，图片复核。只有原提示明确的观察 objects≤40/clothing≤12/facts≤8，以及原画像校验器的 themes 2–6/每主题至少一个引用写入数组约束；瞬间和外观不增加数量上限。画像引用kind保留既有合法person_moment/relationship，复核certainty保留supported/uncertain。保留原提示，不加字符串或token预算，不改变官方采样。契约子集仅object/array/string/number/required/additionalProperties/enum/minItems/maxItems，未知关键字不会被忽略执行；没有远程schema引用。
+
+显式schema模式沿用 `parse_json_object` 的对象提取（包括既有围栏/正文提取），对提取后的业务形状校验，不等同于原始整串 strict JSON 验收；真实协议实验仍须单独记录 strict json.loads 结果。完成的JSON若不满足同一契约则报已知 `model_output_invalid`，不修补、不截断、不自动降级或重发；默认两模式的合法空对象处理保持原样。实际请求的 `json_schema_name/json_schema_sha256/json_schema_hash_format` 进入安全policy与全部SSE状态；指纹采用排序键、紧凑ASCII JSON，原schema内容不进入日志。派发后的传输未完成仍按unknown处理。
+
+未来使用schema新建库，应在该库producer_sources中加入契约模块实际源码哈希，并绑定本次生成模式及实际schema指纹。已经由json_object生产的v2快照按其原冻结producer identity验证；查询侧改用schema不能强迫旧清单补字段或使原库失效。本接口不修改快照格式、既有清单或原生上下文。

@@ -116,7 +116,7 @@ class ReadRuns:
         """
         revision = self._versions.revision(run_id) if self._versions is not None else "legacy"
         with self._lock:
-            if self._state_versions.get(run_id) != revision:
+            if not revision or self._state_versions.get(run_id) != revision:
                 self._states.pop(run_id, None)
                 self._state_weights.pop(run_id, None)
                 self._state_versions.pop(run_id, None)
@@ -129,7 +129,7 @@ class ReadRuns:
         if (
             state.get("status") not in NON_TERMINAL_STATUSES
             and weight <= _STATE_CACHE_BYTES
-            and (self._versions is None or self._versions.revision(run_id) == revision)
+            and (self._versions is None or bool(revision) and self._versions.revision(run_id) == revision)
         ):
             with self._lock:
                 self._states[run_id] = state

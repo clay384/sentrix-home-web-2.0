@@ -156,6 +156,11 @@ def test_locked_directory_degrades_loudly(tmp_path: Path):
         assert status.available is False
         assert status.degraded is True
         assert "already accessed" in status.reason
+        assert status.operational_issue == {
+            "error_code": "resource_error",
+            "failure_code": "vector_index_unavailable",
+            "error_type": "VectorIndexUnavailable",
+        }
 
         with pytest.raises(VectorIndexUnavailable):
             index.search(space="visual", vector=(1.0, 0.0, 0.0, 0.0), limit=5, model_name=MODEL)

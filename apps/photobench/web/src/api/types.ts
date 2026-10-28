@@ -62,7 +62,25 @@ export interface ImportObservation {
   error?: string | null;
 }
 
+/** Version 1 operational evidence; it is not an answer-quality failure. */
+export interface OperationalIssue {
+  version: 1;
+  kind: "output_limit" | "context_limit" | "step_limit" | "time_limit" | "provider_rejected" | "resource_error" | "model_output_invalid" | "configuration_error";
+  evidence: Record<string, unknown>;
+  scope?: "judge" | null;
+  [key: string]: unknown;
+}
+
+export interface OperationalCounts {
+  not_evaluable_count: number;
+  by_kind: Record<string, number>;
+  judge_incomplete_count?: number | null;
+  judge_by_kind?: Record<string, number> | null;
+  [key: string]: unknown;
+}
+
 export interface PhaseProgress {
+  operational?: OperationalCounts | null;
   operation_id?: string;
   observation?: ImportObservation | null;
   availability?: string;
@@ -85,6 +103,11 @@ export interface PhaseProgress {
   agent_completed?: number | null;
   agent_total?: number | null;
   agent_in_flight?: number;
+  agent_waiting?: number | null;
+  agent_running?: number | null;
+  judge_waiting?: number | null;
+  judge_running?: number | null;
+  outcome_unknown?: number | null;
   /** Judge 已结束的题数（含评分失败）；有效评分数另见 summary.judge_valid_count。 */
   judge_completed?: number | null;
   judge_total?: number | null;
@@ -102,6 +125,17 @@ export interface PhaseProgress {
  * 另有 `gpu_metrics` 这种非执行阶段。
  */
 export interface Phase {
+  operational?: OperationalCounts | null;
+  judge_requests?: {
+    version?: number | null;
+    requests_started?: number | null;
+    responses_received?: number | null;
+    request_errors?: number | null;
+    http_429?: number | null;
+    in_flight?: number | null;
+    rate_waiting?: number | null;
+    rate_wait_ms?: number | null;
+  } | null;
   scanned_count?: number | null;
   sampling_integrity?: {
     callback_failures?: number;
@@ -186,6 +220,7 @@ export interface MemorySourceObservation {
 
 /** run 指标汇总。后端 `summary` 的字段是开放的，前端 `effectiveRunSummary` 现算 60+ 项。 */
 export interface RunSummary {
+  operational?: OperationalCounts | null;
   run_valid?: boolean | null;
   completed?: number;
   total?: number;
@@ -354,6 +389,7 @@ export interface RunListParams {
 
 /** Judge 评分（`judge`）。列表信封里只有前四格，详情里有 `reason`（实测）。 */
 export interface Judge {
+  operational_issue?: OperationalIssue | null;
   score?: number | null;
   status?: string | null;
   rejudge_id?: string | null;
@@ -379,7 +415,14 @@ export interface TaskJudge {
 
 /** 一行逐题摘要（`/api/v1/runs/{id}/items` 的 `items[]`）。 */
 export interface RunItemSummary {
+  operational_issue?: OperationalIssue | null;
+  judge_issue?: OperationalIssue | null;
+  /** Operational limits are not an architecture-quality verdict. */
+  evaluation_status?: string | null;
   index: number;
+  execution_status?: string | null;
+  judge_status?: string | null;
+  judge_dispatch_status?: string | null;
   qa_id?: string;
   question?: string;
   task_type?: string;

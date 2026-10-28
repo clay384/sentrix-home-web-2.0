@@ -72,3 +72,105 @@ def test_invalid_deployment_profile_rejected():
 
     with pytest.raises(ValueError):
         Settings(deployment_profile="unknown")
+
+
+def test_explicit_30_step_native_budget_is_reported_without_changing_legacy_defaults(tmp_path):
+    baseline = Settings(data_dir=tmp_path)
+    assert baseline.agent_max_steps == 8
+    settings = Settings(
+        data_dir=tmp_path,
+        agent_max_steps=30,
+        agent_max_tool_calls=28,
+        agent_max_search_calls=28,
+        agent_max_page_calls=28,
+        agent_max_inspections=28,
+        vlm_context_tokens=262144,
+        vlm_native_output_budget=True,
+        vlm_generation_profile="qwen35_nonthinking",
+    )
+    actual = settings.runtime_configuration()
+    assert actual["agent_max_steps"] == 30 and actual["agent_max_tool_calls"] == 28
+    assert actual["vlm_native_output_budget"] is True
+    assert actual["vlm_context_tokens"] == 262144
+    assert actual["vlm_generation_profile"] == "qwen35_nonthinking"
+
+
+def test_contradictory_agent_limits_are_rejected():
+    import pytest
+
+    with pytest.raises(ValueError, match="reserve"):
+        Settings(agent_max_steps=8, agent_max_tool_calls=30)
+    with pytest.raises(ValueError, match="agent_max_search_calls"):
+        Settings(agent_max_search_calls=7)
+
+
+def test_embedding_timeout_environment_is_in_runtime_evidence(monkeypatch):
+    monkeypatch.setenv("SENTRIX_TEXT_EMBEDDER_TIMEOUT_S", "120")
+    monkeypatch.setenv("SENTRIX_LEGACY_CLIP_TIMEOUT_S", "120")
+    actual = Settings().runtime_configuration()
+    assert actual["text_embedder_timeout_s"] == 120
+    assert actual["legacy_clip_timeout_s"] == 120
+
+
+def test_native_explicit_null_environment_disables_only_tool_caps(monkeypatch):
+    monkeypatch.setenv("SENTRIX_VLM_NATIVE_OUTPUT_BUDGET", "true")
+    monkeypatch.setenv("SENTRIX_AGENT_MAX_STEPS", "30")
+    keys = ["agent_max_tool_calls", "agent_max_search_calls", "agent_max_page_calls", "agent_max_inspections"]
+    for key in keys:
+        monkeypatch.setenv("SENTRIX_" + key.upper(), "null")
+    settings = Settings()
+    assert settings.agent_max_steps == 30
+    assert all(settings.runtime_configuration()[key] is None for key in keys)
+    monkeypatch.setenv("SENTRIX_VLM_NATIVE_OUTPUT_BUDGET", "false")
+    import pytest
+
+    with pytest.raises(ValueError, match="native"):
+        Settings()
+    monkeypatch.setenv("SENTRIX_VLM_NATIVE_OUTPUT_BUDGET", "true")
+    monkeypatch.setenv("SENTRIX_AGENT_MAX_TOOL_CALLS", "None")
+    with pytest.raises(ValueError):
+        Settings()
+
+
+def test_optional_json_stream_evidence_defaults_and_data_root(tmp_path):
+    settings = Settings(data_dir=tmp_path)
+    assert settings.vlm_json_streaming is False
+    assert settings.vlm_json_private_content is False
+    assert settings.vlm_json_evidence_dir == tmp_path / "diagnostics" / "vlm-json"
+
+
+def test_json_stream_environment_is_reported_and_private_requires_stream(monkeypatch, tmp_path):
+    import pytest
+
+    with pytest.raises(ValueError, match="requires streaming"):
+        Settings(data_dir=tmp_path, vlm_json_private_content=True)
+    monkeypatch.setenv("SENTRIX_VLM_JSON_STREAMING", "true")
+    monkeypatch.setenv("SENTRIX_VLM_JSON_PRIVATE_CONTENT", "true")
+    settings = Settings(data_dir=tmp_path)
+    facts = settings.runtime_configuration()
+    assert facts["vlm_json_streaming"] is True
+    assert facts["vlm_json_private_content"] is True
+
+
+def test_json_output_mode_is_independent_explicit_and_reported(monkeypatch):
+    import pytest
+
+    monkeypatch.setenv("SENTRIX_VLM_JSON_OUTPUT_MODE", "prompt_only")
+    settings = Settings()
+    assert settings.vlm_json_output_mode == "prompt_only"
+    assert settings.runtime_configuration()["vlm_json_output_mode"] == "prompt_only"
+    assert settings.vlm_json_streaming is False
+    assert settings.vlm_native_output_budget is False
+    monkeypatch.delenv("SENTRIX_VLM_JSON_OUTPUT_MODE")
+    assert Settings().vlm_json_output_mode == "json_object"
+    with pytest.raises(ValueError):
+        Settings(vlm_json_output_mode="auto")
+
+
+def test_schema_output_mode_is_explicit_and_does_not_enable_new_budgets(monkeypatch):
+    monkeypatch.setenv("SENTRIX_VLM_JSON_OUTPUT_MODE", "json_schema")
+    settings = Settings()
+    assert settings.vlm_json_output_mode == "json_schema"
+    assert settings.runtime_configuration()["vlm_json_output_mode"] == "json_schema"
+    assert settings.vlm_json_streaming is False
+    assert settings.vlm_native_output_budget is False

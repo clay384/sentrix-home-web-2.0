@@ -23,10 +23,16 @@
 「这条候选怎么写」，它变不出候选；少了这一路，``MaintainFacts`` 的 ``candidates``
 在生产装配下恒为空元组，门禁全开也写不出一条事实。
 
-模型不可用、HTTP 失败、返回的不是 JSON——一律返回 ``None``：观察是**增强**，
-不是导入的前置条件。1.0 在 ``pipeline`` 里也是这么收尾的（异常吞掉、留下无向量的资产）。
-**探测不到模型名（``ModelServiceError``）也走这一条**，但那条 ``log.warning`` 里带着端点
-地址与原因——降级是设计好的，静默不是。
+所有 JSON 调用复用 ServedModel 的显式采样策略；默认请求 response_format=json_object，
+显式 prompt_only 模式仅省略该字段；json_schema 模式使用调用方的既有业务契约，
+派发前核对契约，完整响应再次校验形状。不自动降级或重试。
+不指定 max_tokens/max_completion_tokens，让后端按实际输入计算原生剩余窗口。
+不支持该模式的端点不会被静默重试或降为非约束生成。结构化错误与诊断日志均不含原文。
+
+无法读取本地图片时仍返回 ``None``；合法空 JSON 对象保留既有语义。
+完整响应无法解析 JSON 对象时抛 ``model_output_invalid``，明确结果已知、格式不可用。
+HTTP 拒绝、超时、连接故障、输出截断或响应协议不完整同样抛结构化 ``ModelServiceError``，
+由流水线/工具层向用户报告；不能把运行失败伪装为已完成的空观察。
 
 **模型名同样不写死**：观察与对话打的是同一个 8100，写死名字的后果与对话侧一样（换后端
 就 404）。名字由 ``ServedModel`` 问端点要，见 ``assistant/model_endpoint.py``。
@@ -39,7 +45,7 @@ import io
 import json
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -49,8 +55,14 @@ from PIL import Image, ImageOps
 from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.media.models import MODEL_FACT_CONFIDENCE, ObservationFact
 from sentrix.domain.media.ports import ObservationSemantics
-from sentrix.infrastructure.assistant.chat_client import MAX_ANSWER_TOKENS
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
+from sentrix.infrastructure.media.image_io import ensure_heif_support
+from sentrix.infrastructure.media.json_output_contracts import (
+    OBSERVATION_SCHEMA,
+    matches_output_contract,
+    prepare_output_contract,
+)
+from sentrix.infrastructure.media.vlm_json_stream import stream_json_response
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +139,7 @@ def _shrink_image(payload: bytes, mime: str, path: Path, max_side: int) -> tuple
                 image = background
             else:
                 image = image.convert("RGB")
-            image.thumbnail((max_side, max_side), Image.LANCZOS)
+            image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
             out = io.BytesIO()
             image.save(out, format="JPEG", quality=85, optimize=True)
             return out.getvalue(), "image/jpeg"
@@ -147,7 +159,36 @@ def _encode_image(path: Path, *, max_side: int | None = None) -> str | None:
     except OSError as error:
         log.warning("观察用的图片读不了: %s (%s)", path, error)
         return None
-    mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+    # Detect the actual image container, not its filename: MP4 bytes must never
+    # become an image/jpeg data URL. Validation does not resize or re-encode.
+    heif = payload[4:8] == b"ftyp" and payload[8:12] in (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1")
+    if heif and not ensure_heif_support():
+        raise ModelServiceError(
+            "本地 HEIF 图片解码器不可用；未发送模型请求。",
+            error_code="request_configuration_invalid",
+            request_policy={
+                "request_phase": "media_validation",
+                "request_outcome_unknown": False,
+                "input_error": "image_decoder_unavailable",
+            },
+        )
+    try:
+        with Image.open(io.BytesIO(payload)) as image:
+            image_format = image.format or ""
+            mime = Image.MIME.get(image_format) or {"HEIF": "image/heif"}.get(image_format)
+            if not mime or not mime.startswith("image/"):
+                raise ValueError("not an image container")
+            image.verify()
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as error:
+        raise ModelServiceError(
+            "输入不是可读取的图片或图片文件已损坏；未发送模型请求。",
+            error_code="request_configuration_invalid",
+            request_policy={
+                "request_phase": "media_validation",
+                "request_outcome_unknown": False,
+                "input_error": "invalid_image_data",
+            },
+        ) from error
     if max_side is not None:
         payload, mime = _shrink_image(payload, mime, path, max_side)
     return f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
@@ -171,7 +212,7 @@ def parse_json_object(text: str) -> dict[str, Any] | None:
     只做两件事：先试整串，再试第一个 ``{...}`` 块。1.0 的
     ``parse_json_response`` 还要补花括号、补引号、删尾随逗号（``runtime.py:1586-1661``），
     那套修复器是为「让模型在正文里写 action JSON」服务的；这里少一层，
-    解析不出来就当这次观察没拿到。
+    解析不出来返回 None，由调用方报告结构化格式错误。
     """
     stripped = text.strip()
     for candidate in (stripped, *(_JSON_OBJECT_RE.findall(stripped))):
@@ -237,13 +278,16 @@ def chat_json(
     prompt: str,
     image: str | Sequence[str] | None,
     timeout_s: float,
+    *,
+    output_schema: Mapping[str, Any] | None = None,
+    schema_name: str | None = None,
 ) -> dict[str, Any] | None:
-    """一次「提示词（+ 一张或多张图）→ JSON 对象」的往返。任何失败都返回 ``None``。
+    """一次「提示词（+ 一张或多张图）→ JSON 对象」的往返。格式/运行失败抛结构化类型错误。
 
     ``OpenAIVlmObserver`` / ``person_vision_model.OpenAIPersonVision`` /
     ``photo_inspector.OpenAIPhotoInspector`` 共用这一段：请求体的形状（``content`` 是块
     数组、图走 ``image_url`` 的 data URL）与失败口径只在这一处，改一次三边都动——三条
-    链路都不许把「模型没答」升级成「导入失败」。
+    链路都区分内容质量降级与运行限制；操作失败必须由各自调用方报告。
 
     **为什么会收一串图。** 1.0 的 ``inspect_photo`` 在指名了目标人物时发**两张**：
     裁剪件在前、原图在后（``tools.py:2192``）。多图在这里只是多几个 ``image_url`` 块，
@@ -254,19 +298,173 @@ def chat_json(
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     for url in [image] if isinstance(image, str) else list(image or ()):
         content.append({"type": "image_url", "image_url": {"url": url}})
+    name = "unresolved"
+    dispatched = False
+    # Validate the explicit business contract before model discovery or generation.
+    format_parameters, format_policy, contract = prepare_output_contract(
+        model.json_output_mode, output_schema, schema_name
+    )
+    policy: dict[str, Any] = {
+        **model.generation_parameters(),
+        **format_policy,
+        "output_budget_policy": "native_remaining_context",
+        "timeout_s": timeout_s,
+    }
     try:
+        name = model.current()
         body = {
-            "model": model.current(),
+            "model": name,
             "messages": [{"role": "user", "content": content}],
-            "max_tokens": MAX_ANSWER_TOKENS,
+            **model.generation_parameters(),
+            # Omit output caps: the provider computes native remaining context
+            # after tokenizing the full prompt, including images and template.
+            # The explicit format mode is independent of sampling and native budgets.
+            # Unsupported endpoints fail visibly once; never retry unconstrained.
+            **format_parameters,
         }
-        response = httpx.post(endpoint, json=body, timeout=timeout_s)
-        response.raise_for_status()
-        payload = response.json()
-    except (httpx.HTTPError, ModelServiceError, ValueError) as error:
-        log.warning("视觉调用失败，本次结果跳过: %s", error)
-        return None
-    return parse_json_object(_first_content(payload))
+        dispatched = True
+        status_code = 200
+        if model.json_streaming:
+            stage = (
+                "initial_observation"
+                if prompt == _OBSERVE_PROMPT
+                else "recovery_observation"
+                if prompt == _RECOVERY_PROMPT
+                else "chinese_canonicalization"
+                if prompt.startswith(_CANONICAL_PROMPT)
+                else "json_call"
+            )
+            payload = stream_json_response(
+                endpoint,
+                body,
+                timeout_s,
+                evidence_dir=model.json_evidence_dir,
+                private_content=model.json_private_content,
+                stage=stage,
+                request_policy=policy,
+            )
+        else:
+            response = httpx.post(endpoint, json=body, timeout=timeout_s)
+            response.raise_for_status()
+            status_code = response.status_code
+            payload = response.json()
+    except httpx.HTTPStatusError as error:
+        raise ModelServiceError(
+            f"视觉模型请求被服务拒绝（provider_rejected，HTTP {error.response.status_code}）。",
+            error_code="provider_rejected",
+            http_status=error.response.status_code,
+            request_policy=policy,
+        ) from error
+    except httpx.HTTPError as error:
+        code = "time_limit" if isinstance(error, httpx.TimeoutException) else "provider_unavailable"
+        raise ModelServiceError(
+            f"视觉模型请求未能完成（{code}，{type(error).__name__}）；未自动重试。",
+            error_code=code,
+            request_policy={
+                **policy,
+                "request_outcome_unknown": not isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)),
+            },
+        ) from error
+    except ModelServiceError as error:
+        # Keep transport evidence intact; discovery failures precede any POST.
+        if error.error_code is None:
+            error.error_code = (
+                "time_limit"
+                if isinstance(error.__cause__, httpx.TimeoutException)
+                else "provider_unavailable"
+            )
+        error.request_policy = {
+            **policy,
+            **error.request_policy,
+            "request_outcome_unknown": error.request_policy.get("request_outcome_unknown", dispatched),
+        }
+        raise
+    except ValueError as error:
+        raise ModelServiceError(
+            "视觉模型响应协议结构不可识别（provider_response_invalid）；未自动重试。",
+            error_code="provider_response_invalid",
+            http_status=status_code,
+            request_policy={**policy, "request_outcome_unknown": True},
+        ) from error
+    text = _first_content(payload)
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    first = choices[0] if isinstance(choices, list) and choices else None
+    raw_finish_reason = first.get("finish_reason") if isinstance(first, dict) else None
+    finish_reason = (
+        raw_finish_reason
+        if raw_finish_reason in (None, "stop", "length", "tool_calls", "content_filter", "function_call")
+        else "unknown"
+    )
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    raw_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+    completion_tokens = raw_tokens if type(raw_tokens) is int and raw_tokens >= 0 else None
+    parsed = parse_json_object(text)
+    if finish_reason == "content_filter":
+        raise ModelServiceError(
+            "视觉模型服务拒绝返回内容（provider_rejected，content_filter）；未自动重试。",
+            error_code="provider_rejected",
+            http_status=status_code,
+            finish_reason="content_filter",
+            request_policy={**policy, "request_outcome_unknown": False},
+        )
+    if finish_reason in {"tool_calls", "function_call"}:
+        raise ModelServiceError(
+            "视觉JSON请求收到不支持的工具响应（provider_response_invalid）；未自动重试。",
+            error_code="provider_response_invalid",
+            http_status=status_code,
+            finish_reason=finish_reason,
+            request_policy={**policy, "request_outcome_unknown": True},
+        )
+    if finish_reason == "length":
+        raw_prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+        raise ModelServiceError(
+            "视觉模型达到本次可用输出/上下文上限（output_limit），回复未完成。",
+            error_code="output_limit",
+            http_status=status_code,
+            request_policy=policy,
+            finish_reason="length",
+            prompt_tokens=raw_prompt_tokens
+            if type(raw_prompt_tokens) is int and raw_prompt_tokens >= 0
+            else None,
+            completion_tokens=completion_tokens,
+        )
+    if finish_reason != "stop":
+        raise ModelServiceError(
+            "视觉模型响应缺少完整结束证据（provider_response_invalid）；未自动重试。",
+            error_code="provider_response_invalid",
+            http_status=status_code,
+            request_policy={**policy, "request_outcome_unknown": True},
+        )
+    message = first.get("message") if isinstance(first, dict) else None
+    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+        raise ModelServiceError(
+            "视觉模型响应协议结构不可识别（provider_response_invalid）；未自动重试。",
+            error_code="provider_response_invalid",
+            http_status=status_code,
+            request_policy={**policy, "request_outcome_unknown": True},
+        )
+    if message.get("tool_calls") or message.get("function_call"):
+        raise ModelServiceError(
+            "视觉JSON请求收到未请求的工具调用（provider_response_invalid）；未自动重试。",
+            error_code="provider_response_invalid",
+            http_status=status_code,
+            request_policy={**policy, "request_outcome_unknown": True},
+        )
+    if parsed is None or (contract is not None and not matches_output_contract(parsed, contract)):
+        # A known completed generation with unusable structure is not a lost request.
+        raw_prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+        raise ModelServiceError(
+            "模型输出格式错误（model_output_invalid）：完整响应不是可用的业务 JSON 对象；未自动重试。",
+            error_code="model_output_invalid",
+            http_status=status_code,
+            request_policy={**policy, "request_outcome_unknown": False},
+            finish_reason="stop",
+            prompt_tokens=raw_prompt_tokens
+            if type(raw_prompt_tokens) is int and raw_prompt_tokens >= 0
+            else None,
+            completion_tokens=completion_tokens,
+        )
+    return parsed
 
 
 class OpenAIVlmObserver:
@@ -316,7 +514,15 @@ class OpenAIVlmObserver:
         return semantics_from_payload(parsed)
 
     def _chat(self, prompt: str, image: str | None) -> dict[str, Any] | None:
-        return chat_json(self._endpoint, self._model, prompt, image, self._timeout)
+        return chat_json(
+            self._endpoint,
+            self._model,
+            prompt,
+            image,
+            self._timeout,
+            output_schema=OBSERVATION_SCHEMA,
+            schema_name="sentrix_observation_v1",
+        )
 
 
 def _first_content(payload: object) -> str:

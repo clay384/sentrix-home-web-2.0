@@ -527,4 +527,4 @@ class FakeHttpClient:
 
 def judge_reply(content: str) -> dict[str, Any]:
     """judge 端点的最小响应信封：``choices[0].message.content`` 里放那段 JSON。"""
-    return {"choices": [{"message": {"content": content}}]}
+    return {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": content}}]}

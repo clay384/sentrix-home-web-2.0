@@ -182,6 +182,7 @@ def search_assets(
                 latency_ms=trace.latency_ms,
                 backend=trace.backend,
                 reason=trace.reason,
+                operational_issue=dict(trace.operational_issue) if trace.operational_issue else None,
             )
             for trace in result.channel_trace
         ],

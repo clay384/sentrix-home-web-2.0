@@ -4,7 +4,7 @@
 协议相同、只在「校不校验模型名」上不同，所以名字由 ``ServedModel`` 问端点要（见
 ``model_endpoint.py`` 的模块注释）。
 
-三处与 1.0 的差异，每一处都指向一个实测出的失败：
+四处与 1.0 的差异，每一处都指向一个实测出的失败：
 
 1. **原生 ``tools`` / ``tool_calls``，不再让模型在正文里写 JSON。**
    1.0 要模型输出 ``{"action": "tool_call", ...}`` 这样的正文 JSON，为此写了一套
@@ -16,13 +16,10 @@
    模板容忍，严格的 Qwen 模板直接 400（PhotoBench 上 84% 的题在第二步 preflight 挂掉）。
    1.0 的修法是 ``_merge_system_constraint`` 把新约束折进 messages[0]；2.0 更简单：
    系统提示词只在开头拼一次，之后不再往里加东西。
-3. **``max_tokens`` 按剩余上下文算，而窗口是部署事实。** 1.0 是
-   ``min(1501, 4400 - prompt_tokens)``、下限 64（``app.py:2680-2692``），那个 4400 是照
-   它自己的 ``max_model_len = 4501`` 算的。2.0 的窗口由 ``Settings.vlm_context_tokens``
-   给（生产 6144 = 8100 的 ``--ctx-size 24576 ÷ --parallel 4``）；**剩余不足 256 时
-   不发请求**，抛 ``PromptTooLongError`` 让调用方压缩历史——那条下限 64 只会把
-   「提示词太大」伪装成「模型服务挂了」。估算**必须把 tools 的 schema 一起算进来**，
-   它走的是同一个窗口。
+3. **输出预算遵循端点窗口，没有固定 2048 上限。** 原生模式不发送输出 cap，
+   由服务端 tokenizer 计入模板、工具和图片后使用剩余上下文；旧端点模式按估算的
+   剩余窗口发送 ``max_tokens``，并保留原有的历史压缩门槛。部署选择与实际窗口进入
+   每次调用证据，``length``、上下文拒绝与供应商错误单独报告，不当作合法答案。
 4. **思考通道在这里剥掉。** Gemma 4 的推理写在 ``<|channel>thought\\n……<channel|>`` 里，
    8100 没开 ``--reasoning-parser``，于是这一段原样落在 ``content`` 上。实测（2026-09-25）
    工具往返两轮之后模型给出的最终 content 是
@@ -36,6 +33,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -56,28 +54,9 @@ log = logging.getLogger("sentrix.assistant.chat_client")
 _CHANNEL_OPEN = "<|channel>"
 _CHANNEL_CLOSE = "<channel|>"
 
-# 1.0 ``app.py:2680-2692`` 的两个人工常数：给回答留的 token 上限，与安全余量。
-#
-# **``PROMPT_BUDGET_TOKENS = 4400`` 已被删除，它是一条静默失败。** 那个数是照 1.0
-# 自己的 ``max_model_len = 4501`` 算的（1.0 注释原文：「Phase H H4：max_model_len=4501
-# 的硬上限保护」），而 2.0 的窗口是 **6144**（8100 的 ``--ctx-size 24576 ÷ --parallel 4``）。
-# 常量没跟着换，于是 ``4400 - prompt_tokens`` 在提示词超过 4336 token 时给负数，被
-# ``max(MIN_ANSWER_TOKENS, …)`` 抬成 64——**发出一个「窗口装得下、但输出只够写半个
-# JSON」的请求**，端点回 500（解析失败）或 400（超窗），而用户看到的是「模型服务不可用」。
-# 实测两轮 487 题里 22 道是这么来的。窗口现在从 ``Settings.vlm_context_tokens`` 传进来。
-# ``1501`` 被改成 ``2048``，理由与上面删掉 4400 是同一条：**它也是从 1.0 自己的窗口推
-# 出来的**（``4501 - 101`` 的安全余量），端点换了之后那个数就不再有意义。
-#
-# **它现在的职责只剩「延迟护栏」，与窗口无关**——窗口那部分由 ``context - prompt`` 管
-# （见 ``_max_tokens``）。留着它的理由是一个跑飞的生成会拖过 180s 的墙钟预算。
-#
-# 2048 的依据是实测：20261009 那一轮 11 道题以「工具调用 JSON 被截断」死掉，最大的一处
-# 断在 **5683 个字符**（参数是 ASCII 为主的 JSON，约 1500–1700 token）——**正好卡在 1501
-# 上**。这是那批失败的直接成因。
-MAX_ANSWER_TOKENS = 2048
-# 估算器是字符数 × 系数，和端点真实 tokenizer 会有 1~几十 token 的漂移。窗口
-# 恰好 4096 时，2049 input + 2048 output 只差 1 token 也会被 vLLM 400 拒掉；
-# 留一段固定余量，宁可少生成，也不要把整轮打成 model_error。
+# Legacy endpoints use a conservative prompt estimate. Native mode sends no
+# output cap: the serving engine counts the actual template/tools/images and
+# uses its remaining native context. Neither path imposes the old 2048 cap.
 CONTEXT_SAFETY_TOKENS = 128
 
 # 无论上下文多满都必须留下的最小生成量。**它不是 64。**
@@ -316,8 +295,34 @@ class OpenAIChatModel:
             # 这两条与 schema 无关，回退普通请求只会再失败一次。
             raise
         except ModelServiceError as error:
-            log.warning("端点不接受结构化输出，回退普通请求：%s", error)
-            return self._complete(messages, tools)
+            # Only a known refusal of the structured fields permits fallback.
+            # A timeout/unknown generation must never be dispatched a second time.
+            if not error.request_policy.get("structured_output_rejected"):
+                raise
+            if error.request_policy.get("request_outcome_unknown") is not False:
+                raise
+            prior_posts = int(error.request_policy.get("http_post_attempts") or 0)
+            fallback = {"refused_http_status": error.http_status, "known_structured_refusal": True}
+            log.warning("端点明确拒绝结构化字段，回退普通请求：HTTP %s", error.http_status)
+            try:
+                reply = self._complete(messages, tools)
+            except ModelServiceError as fallback_error:
+                fallback_error.request_policy = {
+                    **fallback_error.request_policy,
+                    "structured_fallback": fallback,
+                    "http_post_attempts": prior_posts
+                    + int(fallback_error.request_policy.get("http_post_attempts") or 0),
+                }
+                raise
+            return replace(
+                reply,
+                request_policy={
+                    **reply.request_policy,
+                    "structured_fallback": fallback,
+                    "http_post_attempts": prior_posts
+                    + int(reply.request_policy.get("http_post_attempts") or 0),
+                },
+            )
 
     def _complete(
         self,
@@ -333,14 +338,27 @@ class OpenAIChatModel:
             raise ChatModelError("system 消息只能出现在开头；后续约束请折进第一条")
 
         # 名字先拿到再请求：拿不到就在这里失败，不会带着一个空名字去问端点。
-        model_name = self._model.current()
-        response = self._post(
-            model_name,
-            messages,
-            tools,
-            response_format=response_format,
-            chat_template_kwargs=chat_template_kwargs,
-        )
+        policy = {**self._request_policy(messages, tools), "http_post_attempts": 0}
+        try:
+            model_name = self._model.current()
+            response = self._post(
+                model_name,
+                messages,
+                tools,
+                response_format=response_format,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+            policy["http_post_attempts"] += 1
+        except ModelServiceError as error:
+            error.request_policy = {
+                **policy,
+                **error.request_policy,
+                "http_post_attempts": policy["http_post_attempts"]
+                + int(error.request_policy.get("http_post_attempts") or 0),
+            }
+            if isinstance(error, PromptTooLongError) and not error.error_code:
+                error.error_code = "context_limit"
+            raise
 
         if response.status_code == 404:
             # 名字对不上时 vLLM 回的就是 404（llama.cpp 不校验名字，这条只在 vLLM 上出现），
@@ -351,13 +369,25 @@ class OpenAIChatModel:
             refreshed = self._model.current()
             if refreshed != model_name:
                 model_name = refreshed
-                response = self._post(
-                    model_name,
-                    messages,
-                    tools,
-                    response_format=response_format,
-                    chat_template_kwargs=chat_template_kwargs,
-                )
+                try:
+                    response = self._post(
+                        model_name,
+                        messages,
+                        tools,
+                        response_format=response_format,
+                        chat_template_kwargs=chat_template_kwargs,
+                    )
+                    policy["http_post_attempts"] += 1
+                except ModelServiceError as error:
+                    error.request_policy = {
+                        **policy,
+                        **error.request_policy,
+                        "http_post_attempts": policy["http_post_attempts"]
+                        + int(error.request_policy.get("http_post_attempts") or 0),
+                    }
+                    if isinstance(error, PromptTooLongError) and not error.error_code:
+                        error.error_code = "context_limit"
+                    raise
 
         if response.status_code != 200:
             # **先认「这一句是被切断的」。** llama.cpp 解析不了工具调用的参数时会回 500，
@@ -375,26 +405,76 @@ class OpenAIChatModel:
             # （压缩历史再试），而「模型服务不可用」这句话在这里不成立。
             if _is_context_overflow(response):
                 raise PromptTooLongError(
-                    f"提示词超出端点的上下文窗口（{response.status_code}）：{response.text[:200]}"
+                    f"提示词超出端点的上下文窗口（{response.status_code}）：{response.text[:200]}",
+                    error_code="context_limit",
+                    http_status=response.status_code,
+                    request_policy=policy,
                 )
             if _is_truncated_tool_call(response):
                 raise OutputTruncatedError(
                     f"模型端点 {self._base_url} 上的 {model_name} 写工具调用时被截断"
-                    f"（{response.status_code}）：{response.text[:200]}"
+                    f"（{response.status_code}）：{response.text[:200]}",
+                    error_code="output_limit",
+                    http_status=response.status_code,
+                    request_policy=policy,
                 )
             raise ModelServiceError(
                 f"模型端点 {self._base_url} 上的 {model_name} 返回 {response.status_code}："
-                f"{response.text[:200]}"
+                f"{response.text[:200]}",
+                error_code="provider_rejected",
+                http_status=response.status_code,
+                request_policy={
+                    **policy,
+                    "request_outcome_unknown": False,
+                    "structured_output_rejected": bool(
+                        response_format is not None
+                        and response.status_code in {400, 422}
+                        and any(
+                            token in response.text.lower()
+                            for token in (
+                                "response_format",
+                                "json_schema",
+                                "structured output",
+                                "chat_template_kwargs",
+                            )
+                        )
+                    ),
+                },
             )
 
         try:
             body = response.json()
             choice = body["choices"][0]
             message = choice["message"]
-        except (ValueError, KeyError, IndexError) as error:
-            raise ModelServiceError(f"模型响应结构不可识别：{response.text[:200]}") from error
+            if not isinstance(message, dict):
+                raise ValueError("message must be an object")
+        except (ValueError, KeyError, IndexError, TypeError) as error:
+            raise ModelServiceError(
+                "模型响应协议结构不可识别。",
+                error_code="provider_rejected",
+                http_status=response.status_code,
+                request_policy=policy,
+            ) from error
+        if choice.get("finish_reason") == "content_filter":
+            raise ModelServiceError(
+                "供应商内容过滤拒绝完成请求。",
+                error_code="provider_rejected",
+                http_status=response.status_code,
+                request_policy=policy,
+                finish_reason="content_filter",
+            )
 
         usage = body.get("usage") or {}
+        if choice.get("finish_reason") == "length":
+            raise OutputTruncatedError(
+                "模型达到本次可用输出/上下文上限，回复未完成；这是运行限制，不是有效答案。",
+                error_code="output_limit",
+                http_status=response.status_code,
+                request_policy=policy,
+                finish_reason="length",
+                prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                completion_tokens=int(usage.get("completion_tokens") or 0),
+            )
         content, thought = split_thought_channel(str(message.get("content") or ""))
         if thought:
             # 不静默：内容留在 ``ModelReply.thought`` 上，这里再留一行痕，便于回答看起来
@@ -406,9 +486,19 @@ class OpenAIChatModel:
             tool_calls=_read_tool_calls(message.get("tool_calls")),
             finish_reason=str(choice.get("finish_reason") or ""),
             tool_argument_parse_facts=_tool_parse_facts(message.get("tool_calls")),
+            request_policy=policy,
             prompt_tokens=int(usage.get("prompt_tokens") or 0),
             completion_tokens=int(usage.get("completion_tokens") or 0),
         )
+
+    def _request_policy(self, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> dict[str, Any]:
+        native = self._model.native_output_budget
+        return {
+            "max_model_len": self._context_tokens,
+            "output_budget": "native_remaining_context" if native else "estimated_remaining_context",
+            "max_output_tokens": None if native else self._max_tokens(messages, tools),
+            "request_timeout_s": self._timeout_s,
+        }
 
     def _post(
         self,
@@ -421,7 +511,7 @@ class OpenAIChatModel:
     ) -> httpx.Response:
         prompt_tokens = self.estimate_prompt_tokens(messages, tools)
         budget = self._max_tokens(messages, tools)
-        if budget < MIN_USABLE_OUTPUT_TOKENS:
+        if not self._model.native_output_budget and budget < MIN_USABLE_OUTPUT_TOKENS:
             # **不发这个请求。** 发出去的结果只有两种，两种都会说错原因：端点回 500
             # （生成被截断、JSON 解析不了）或 400（超窗），而 ``complete`` 把它们统一
             # 报成 ``ModelServiceError`` ——用户看到「模型服务当前不可用」，运维去看端点
@@ -441,10 +531,11 @@ class OpenAIChatModel:
         payload: dict[str, Any] = {
             "model": model_name,
             "messages": [_dump_message(message) for message in messages],
-            "temperature": 0.0,
+            **self._model.generation_parameters(),
             "stream": False,
-            "max_tokens": budget,
         }
+        if not self._model.native_output_budget:
+            payload["max_tokens"] = budget
         if tools:
             payload["tools"] = list(openai_tools(tools))
             payload["tool_choice"] = "auto"
@@ -457,7 +548,18 @@ class OpenAIChatModel:
             with httpx.Client(timeout=self._timeout_s) as client:
                 return client.post(f"{self._base_url}/chat/completions", json=payload)
         except httpx.HTTPError as error:
-            raise ModelServiceError(f"模型端点 {self._base_url} 不可达：{error}") from error
+            raise ModelServiceError(
+                f"模型端点 {self._base_url} 不可达：{type(error).__name__}",
+                error_code="time_limit"
+                if isinstance(error, httpx.TimeoutException)
+                else "provider_unavailable",
+                request_policy={
+                    "http_post_attempts": 1,
+                    "request_outcome_unknown": not isinstance(
+                        error, (httpx.ConnectError, httpx.ConnectTimeout)
+                    ),
+                },
+            ) from error
 
     def prompt_over_soft_limit(self, prompt_tokens: int) -> bool:
         """估算值超过窗口的 ``PROMPT_COMPACTION_RATIO`` 就要求调用方先压历史。
@@ -465,7 +567,9 @@ class OpenAIChatModel:
         与「只剩不到 256 token」的硬判据分开：那条是**发出去必然失败**的底线，
         这条是**再带上下一轮工具结果就会顶到窗口**的预警，触发得更早。
         """
-        return prompt_tokens > int(self._context_tokens * PROMPT_COMPACTION_RATIO)
+        return not self._model.native_output_budget and prompt_tokens > int(
+            self._context_tokens * PROMPT_COMPACTION_RATIO
+        )
 
     @staticmethod
     def estimate_prompt_tokens(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec] = ()) -> int:
@@ -499,4 +603,4 @@ class OpenAIChatModel:
         available = (
             self._context_tokens - self.estimate_prompt_tokens(messages, tools) - CONTEXT_SAFETY_TOKENS
         )
-        return min(MAX_ANSWER_TOKENS, available)
+        return available

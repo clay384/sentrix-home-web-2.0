@@ -88,6 +88,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from sentrix.application.media.extract_video_scenes import VideoSceneExtraction
+from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.identity.ports import FaceEnroller, PreparedFaces
 from sentrix.domain.media.models import Asset, AssetStatus, MediaType, Observation
 from sentrix.domain.media.ports import (
@@ -596,6 +597,10 @@ class ImportAssets:
                 if isinstance(result, VideoSceneExtraction)
                 else VideoSceneExtraction(scene_count=int(result))
             )
+        except ModelServiceError:
+            # A keyframe model request failed operationally. Let the pipeline
+            # mark its source failed and expose the typed cause, never processed.
+            raise
         except Exception as error:  # noqa: BLE001 —— 场景是增强，不该让整次导入 500
             log.warning("视频场景抽取失败 asset=%s: %s", asset.id, error)
             return VideoSceneExtraction(reason=f"{type(error).__name__}: {error}")

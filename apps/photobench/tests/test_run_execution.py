@@ -285,7 +285,8 @@ def test_judge_results_and_progress_are_published_while_an_agent_is_still_runnin
                 phase = state.data["phases"]["qa_eval"]
                 assert phase["judge_completed"] == phase["progress"]["judge_completed"] == 1
                 assert phase["progress"]["judge_total"] == 2
-                assert len(state.data["items"]) == 1
+                assert len(state.data["items"]) == 2
+                assert state.data["items"][1]["execution_status"] == "running"
                 assert state.data["items"][0]["judge"]["score"] == (0 if outcome == "zero" else None)
                 assert state.data["items"][0]["judge_status"] == (
                     "completed" if outcome == "zero" else "failed"
@@ -643,6 +644,39 @@ def test_explicit_pipeline_reports_causal_judge_degradation():
     assert phase["status"] == "partial"
     assert phase["causal_graph_seconds"] == 1.0
     assert phase["error_details"][0]["error_type"] == "causal_inference_error"
+
+
+@pytest.mark.parametrize("failures", [0, 2, None])
+def test_explicit_pipeline_preserves_insight_evidence_and_reports_known_failures(failures):
+    insights = (
+        {"ranked": 3, "core": 2, "selections": 8, "moments": 5, "moment_failures": failures, "portraits": 2}
+        if failures is not None
+        else None
+    )
+    client = FakeSentrixClient(
+        explicit_pipeline=True,
+        assets=_assets(),
+        turns={"turn_1": [_completed_turn()]},
+        import_result={"imported": 2, "asset_ids": ["asset_a", "asset_b"], "failures": []},
+        pipeline_result={
+            "processed": 2,
+            "failures": [],
+            "memory_graph": {"node_count": 10, "edge_count": 12},
+            **({"insights": insights} if insights is not None else {}),
+        },
+    )
+    execution, _client, _writer, _lifecycle, _albums = _execution(client=client)
+
+    state = execution.execute(_request())
+
+    phase = state["phases"]["pipeline_processing"]
+    assert phase["insights"] == insights
+    assert phase["status"] == ("partial" if failures else "done")
+    if failures:
+        assert phase["error"] == "人物瞬间处理不完整"
+        assert phase["error_details"][0]["error_type"] == "person_insights_incomplete"
+    else:
+        assert not phase["error_details"]
 
 
 class _TickingTime:
@@ -1006,7 +1040,10 @@ def test_a_turn_that_never_reaches_a_terminal_state_fails_its_item():
     execution, _client, _writer, _lifecycle, _albums = _execution(client=client)
     state = execution.execute(_request(turn_timeout=0))
     item = state["items"][0]
-    assert item["execution_status"] == "timeout"
+    assert item["execution_status"] == "outcome_unknown"
+    assert item["operational_issue"]["kind"] == "time_limit"
+    assert item["request_failure"]["automatic_replay"] is False
+    assert item["judge"]["score"] is None
     assert "did not complete" in item["error"]
     assert state["run_valid"] is False
 
@@ -1108,8 +1145,8 @@ def test_with_a_manager_the_model_is_stopped_then_started_then_probed():
         "chat",
         "list_models",
         "chat_stream",
-        "health",
         "max_concurrency",
+        "health",
     ]
 
 
@@ -1682,3 +1719,446 @@ def test_import_final_scan_count_uses_product_outcomes_not_manifest_expectation(
     assert phase["scanned_count"] == 3  # five entries, three supported media actually settled
     assert (phase["accepted_count"], phase["deduplicated_count"], phase["failed_count"]) == (1, 1, 1)
     assert phase["directories"][0]["progress"]["request_status"] == "returned"
+
+
+def test_resume_only_judges_proven_not_started_and_preserves_unknown(monkeypatch):
+    rows = [{"qa_id": key} for key in ("pending", "zero", "failed", "unknown", "legacy", "qa-unknown")]
+    execution, _, writer, _, _ = _execution(albums=FakeAlbums(manifest=_manifest(), qa_rows=rows))
+    state = RunState({"scope_id": "s", "album_id": ALBUM}, run_id="resume", writer=writer)
+    called = []
+
+    def judge_item(item, *_):
+        # The actual external call cannot begin before its in-flight intent is durable.
+        persisted = writer.snapshots[-1][1]["items"]
+        assert next(x for x in persisted if x["qa_id"] == item["qa_id"])["judge_status"] == "running"
+        called.append(item["qa_id"])
+        return {**item, "judge_status": "completed", "judge": {"score": 2}}
+
+    monkeypatch.setattr(execution, "_evaluate_one", lambda *_: pytest.fail("completed/unknown QA replayed"))
+    monkeypatch.setattr(execution, "_probe_endpoint_health", lambda: pytest.fail("Judge-only needs no model"))
+    monkeypatch.setattr(execution, "_judge", SimpleNamespace(judge_item=judge_item))
+    prior = [
+        {
+            "qa_id": "pending",
+            "execution_status": "completed",
+            "judge_status": "pending",
+            "judge_dispatch_status": "not_started",
+            "answer": "kept",
+        },
+        {
+            "qa_id": "zero",
+            "execution_status": "completed",
+            "judge_status": "completed",
+            "judge": {"score": 0},
+        },
+        {
+            "qa_id": "failed",
+            "execution_status": "completed",
+            "judge_status": "failed",
+            "judge": {"score": None},
+        },
+        {"qa_id": "unknown", "execution_status": "completed", "judge_status": "running"},
+        {"qa_id": "legacy", "execution_status": "completed", "judge_status": "pending"},
+        {"qa_id": "qa-unknown", "execution_status": "running"},
+    ]
+    execution._phase_qa_eval(state, _request(prior_items=prior))
+    actual = {item["qa_id"]: item for item in state.data["items"]}
+    assert called == ["pending"]
+    assert actual["pending"]["answer"] == "kept"
+    assert actual["zero"]["judge"]["score"] == 0
+    assert actual["failed"]["judge_status"] == "failed"
+    assert actual["unknown"]["judge_status"] == actual["legacy"]["judge_status"] == "outcome_unknown"
+    assert actual["qa-unknown"]["execution_status"] == "outcome_unknown"
+    assert state.data["phases"]["qa_eval"]["status"] == "partial"
+    assert state.data["phases"]["qa_eval"]["progress"]["outcome_unknown"] == 3
+    assert prior[3]["judge_status"] == "running"  # source evidence was not mutated
+
+
+def test_dispatch_checkpoint_failure_prevents_external_work(monkeypatch):
+    execution, _, _, _, _ = _execution()
+    state = RunState({"scope_id": "s", "album_id": ALBUM})
+
+    def persist(*_, **__):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(state, "persist", persist)
+    monkeypatch.setattr(execution, "_evaluate_one", lambda *_: pytest.fail("uncheckpointed dispatch"))
+    with pytest.raises(OSError, match="disk unavailable"):
+        execution._phase_qa_eval(state, _request())
+
+
+def test_cancel_stops_new_bounded_qa_dispatch(monkeypatch):
+    rows = [{"qa_id": str(index)} for index in range(5)]
+    execution, _, _, _, _ = _execution(albums=FakeAlbums(manifest=_manifest(), qa_rows=rows))
+    state = RunState({"scope_id": "s", "album_id": ALBUM})
+    calls = []
+
+    def evaluate(row, *_):
+        calls.append(row["qa_id"])
+        state.request_cancel()
+        return {"qa_id": row["qa_id"], "execution_status": "completed"}
+
+    monkeypatch.setattr(execution, "_evaluate_one", evaluate)
+    monkeypatch.setattr(
+        execution, "_judge", SimpleNamespace(judge_item=lambda *_: pytest.fail("new Judge after stop"))
+    )
+    execution._phase_qa_eval(state, _request(qa_concurrency=1))
+    assert calls == ["0"]
+    assert state.data["items"][0]["judge_dispatch_status"] == "not_started"
+    assert state.data["phases"]["qa_eval"]["progress"]["agent_waiting"] == 4
+    assert state.data["phases"]["qa_eval"]["progress"]["judge_waiting"] == 1
+
+
+def test_missing_judge_pool_is_independent_and_bounded_at_four(monkeypatch):
+    rows = [{"qa_id": str(index)} for index in range(5)]
+    execution, _, _, _, _ = _execution(albums=FakeAlbums(manifest=_manifest(), qa_rows=rows))
+    state = RunState({"scope_id": "s", "album_id": ALBUM})
+    entered = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    calls = []
+
+    def judge_item(item, *_):
+        with lock:
+            calls.append(item["qa_id"])
+            if len(calls) == 4:
+                entered.set()
+        assert release.wait(5)
+        return {**item, "judge_status": "completed"}
+
+    prior = [
+        {
+            "qa_id": row["qa_id"],
+            "execution_status": "completed",
+            "judge_status": "pending",
+            "judge_dispatch_status": "not_started",
+        }
+        for row in rows
+    ]
+    monkeypatch.setenv("PHOTOBENCH_JUDGE_CONCURRENCY", "4")
+    monkeypatch.setattr(execution, "_judge", SimpleNamespace(judge_item=judge_item))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(execution._phase_qa_eval, state, _request(qa_concurrency=1, prior_items=prior))
+        try:
+            assert entered.wait(3)
+            assert len(calls) == 4
+            assert state.data["qa_concurrency"] == 1
+            assert state.data["judge_concurrency"] == 4
+        finally:
+            release.set()
+        future.result(timeout=5)
+    assert len(calls) == 5
+
+
+def test_judge_dispatch_is_durable_on_disk_and_unknown_recovery_never_replays(tmp_path, monkeypatch):
+    from photobench.infrastructure.results.store import FileResultWriter, FileRunStore
+
+    writer = FileResultWriter(tmp_path)
+    store = FileRunStore(tmp_path)
+    execution, _, _, _, _ = _execution(writer=writer)
+    state = RunState(
+        {"run_id": "disk-checkpoint", "scope_id": "s", "album_id": ALBUM, "status": "running"},
+        run_id="disk-checkpoint",
+        writer=writer,
+        debounce=0.01,
+    )
+    saved_at_dispatch = []
+
+    def judge_item(item, *_):
+        saved_at_dispatch.extend(store.load_state("disk-checkpoint")["items"])
+        assert saved_at_dispatch[0]["judge_dispatch_status"] == "in_flight"
+        return {**item, "judge_status": "completed", "judge": {"score": 2}}
+
+    monkeypatch.setattr(execution, "_judge", SimpleNamespace(judge_item=judge_item))
+    prior = [
+        {
+            "qa_id": "q1",
+            "execution_status": "completed",
+            "judge_status": "pending",
+            "judge_dispatch_status": "not_started",
+        }
+    ]
+    state.start_persist_writer()
+    try:
+        execution._phase_qa_eval(state, _request(prior_items=prior))
+    finally:
+        state.stop_persist_writer()
+    assert store.load_state("disk-checkpoint")["items"][0]["judge_status"] == "completed"
+    # The last durable state if the process had died during that cloud call.
+    monkeypatch.setattr(
+        execution, "_judge", SimpleNamespace(judge_item=lambda *_: pytest.fail("unknown replayed"))
+    )
+    resumed = RunState({"scope_id": "s", "album_id": ALBUM})
+    execution._phase_qa_eval(resumed, _request(prior_items=saved_at_dispatch))
+    assert resumed.data["items"][0]["judge_status"] == "outcome_unknown"
+
+
+def test_uncertain_agent_post_keeps_unknown_facts_and_is_not_resumed(monkeypatch):
+    from photobench.domain.errors import RequestOutcomeUnknownError
+
+    execution, client, _, _, _ = _execution()
+
+    def disconnected(**_):
+        raise RequestOutcomeUnknownError(method="POST", cause_type="ReadTimeout", attempts=1)
+
+    monkeypatch.setattr(client, "start_turn", disconnected)
+    item = execution._evaluate_one(_rows()[0], "s", {}, _request())
+    assert item["execution_status"] == "outcome_unknown"
+    assert item["request_failure"]["automatic_replay"] is False
+    monkeypatch.setattr(execution, "_evaluate_one", lambda *_: pytest.fail("unknown Agent replayed"))
+    state = RunState({"scope_id": "s", "album_id": ALBUM})
+    execution._phase_qa_eval(state, _request(prior_items=[item]))
+    assert state.data["items"][0]["execution_status"] == "outcome_unknown"
+
+
+def test_cancel_during_dispatch_checkpoint_sends_no_new_requests(monkeypatch):
+    execution, _, _, _, _ = _execution()
+    state = RunState({"scope_id": "s", "album_id": ALBUM})
+
+    def persist(*_, **kwargs):
+        if kwargs.get("wait"):
+            state.request_cancel()
+
+    monkeypatch.setattr(state, "persist", persist)
+    monkeypatch.setattr(execution, "_evaluate_one", lambda *_: pytest.fail("Agent dispatched after cancel"))
+    execution._phase_qa_eval(state, _request())
+    assert state.data["items"][0]["execution_status"] == "scheduled"
+
+
+def test_cancel_during_judge_checkpoint_retains_missing_score_and_backlog(monkeypatch):
+    execution, _, _, _, _ = _execution()
+    state = RunState({"scope_id": "s", "album_id": ALBUM})
+
+    def persist(*_, **kwargs):
+        if kwargs.get("wait"):
+            state.request_cancel()
+
+    monkeypatch.setattr(state, "persist", persist)
+    monkeypatch.setattr(
+        execution,
+        "_judge",
+        SimpleNamespace(judge_item=lambda *_: pytest.fail("Judge dispatched after cancel")),
+    )
+    prior = [
+        {
+            "qa_id": "q1",
+            "execution_status": "completed",
+            "judge_status": "pending",
+            "judge_dispatch_status": "not_started",
+        }
+    ]
+    execution._phase_qa_eval(state, _request(prior_items=prior))
+    assert state.data["items"][0]["judge_status"] == "pending"
+    assert state.data["items"][0]["judge_dispatch_status"] == "not_started"
+    assert state.data["phases"]["qa_eval"]["progress"]["judge_waiting"] == 1
+
+
+@pytest.mark.parametrize(
+    "code", ["output_limit", "context_limit", "time_limit", "provider_rejected", "resource_error"]
+)
+@pytest.mark.parametrize("source", ["model", "retrieval"])
+def test_structured_model_limit_stops_next_turn_and_judge_and_is_not_replayed(monkeypatch, code, source):
+    first = _completed_turn()
+    first["result"]["trace"] = {
+        "model_calls": [{"error_code": code, "http_status": 400 if code == "provider_rejected" else None}]
+    }
+    if source == "retrieval":
+        first["result"]["trace"] = {
+            "tool_calls": [
+                {
+                    "tool": "search_memories",
+                    "observation": {
+                        "retrieval_channels": [
+                            {
+                                "channel": "text_ann",
+                                "status": "degraded",
+                                "operational_issue": {"error_code": code},
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    row = {
+        **_rows()[0],
+        "conversation": [
+            {"message": "first", "expected_action": "answer"},
+            {"message": "second", "expected_action": "answer"},
+        ],
+    }
+    client = FakeSentrixClient(asset_polls=_polls(_assets()), turns={"turn_1": [first]})
+    execution, *_ = _execution(client=client, albums=FakeAlbums(manifest=_manifest(), qa_rows=[row]))
+    monkeypatch.setattr(
+        execution,
+        "_judge",
+        SimpleNamespace(judge_item=lambda *_: pytest.fail("operational item sent to Judge")),
+    )
+    monkeypatch.setattr(execution, "_probe_endpoint_health", lambda: None)
+    state = RunState({"scope_id": "s", "album_id": ALBUM})
+    execution._phase_qa_eval(state, _request())
+    item = state.data["items"][0]
+    assert len(item["runtime_turns"]) == 1
+    assert item["operational_issue"]["kind"] == code
+    assert item["judge_status"] == "skipped"
+    assert item["judge"]["score"] is None
+    assert state.data["phases"]["qa_eval"]["status"] == "partial"
+    assert state.data["phases"]["qa_eval"]["progress"]["operational"]["not_evaluable_count"] == 1
+    monkeypatch.setattr(execution, "_evaluate_one", lambda *_: pytest.fail("operational QA replayed"))
+    resumed = RunState({"scope_id": "s", "album_id": ALBUM})
+    execution._phase_qa_eval(resumed, _request(prior_items=[item]))
+    assert resumed.data["items"][0]["operational_issue"] == item["operational_issue"]
+
+
+@pytest.mark.parametrize("judge_status", ["pending", "completed", "running", "outcome_unknown"])
+def test_resume_historical_budget_zero_never_dispatches_agent_or_judge(monkeypatch, judge_status):
+    execution, *_ = _execution()
+    monkeypatch.setattr(execution, "_evaluate_one", lambda *_: pytest.fail("QA replayed"))
+    monkeypatch.setattr(
+        execution, "_judge", SimpleNamespace(judge_item=lambda *_: pytest.fail("Judge replayed"))
+    )
+    item = {
+        "qa_id": "q1",
+        "execution_status": "completed",
+        "judge_status": judge_status,
+        "judge_dispatch_status": "not_started",
+        "termination_reason": "step_budget_exhausted",
+        "judge": {"score": 0},
+    }
+    state = RunState({"scope_id": "s", "album_id": ALBUM})
+    execution._phase_qa_eval(state, _request(prior_items=[item]))
+    result = state.data["items"][0]
+    assert result["judge"]["score"] is None
+    assert result["judge_status"] == (
+        "outcome_unknown" if judge_status in {"running", "outcome_unknown"} else "skipped"
+    )
+    assert result["judge"]["excluded_observation"]["score"] == 0
+
+
+@pytest.mark.parametrize("issue_source", ["family_failed", "family_typed_issue", "causal_issues"])
+def test_explicit_build_cannot_accept_failed_graph_work_even_with_all_assets_processed(issue_source):
+    issue = {
+        "error_code": "output_limit",
+        "finish_reason": "length",
+        "request_policy": {"max_model_len": 262144},
+    }
+    graph = {"scope_id": "s", "causal_status": "ok"}
+    family = {"run": {"status": "completed", "stats": {}}}
+    if issue_source == "family_failed":
+        family["run"]["status"] = "failed"
+    elif issue_source == "family_typed_issue":
+        family["run"]["stats"]["operational_issue"] = issue
+    else:
+        graph["causal_issues"] = [issue]
+    client = FakeSentrixClient(
+        explicit_pipeline=True,
+        assets=_assets(),
+        import_result={"imported": 2, "asset_ids": ["asset_a", "asset_b"], "failures": []},
+        pipeline_result={"processed": 2, "failures": [], "memory_graph": graph, "family_graph": family},
+    )
+    execution, *_ = _execution(client=client)
+    state = execution.execute(_request(mode="build"))
+    phase = state["phases"]["pipeline_processing"]
+    assert phase["status"] == "partial"
+    assert phase["processed_asset_count"] == 2
+    assert state["scope_build"]["status"] == "incomplete"
+    assert phase["memory_graph"] == graph
+    assert phase["family_graph"] == family
+    assert phase["error_details"][0]["error_type"] == (
+        "causal_inference_error" if issue_source == "causal_issues" else "family_graph_error"
+    )
+    if issue_source == "family_typed_issue":
+        assert phase["error_details"][0]["operational_issue"] == issue
+
+
+@pytest.mark.parametrize("http_failure", [False, True])
+def test_vlm_build_failure_cannot_be_accepted_in_response_or_http_error(monkeypatch, http_failure):
+    client = FakeSentrixClient(
+        explicit_pipeline=True,
+        assets=_assets(),
+        import_result={"imported": 2, "asset_ids": ["asset_a", "asset_b"], "failures": []},
+        pipeline_result={
+            "processed": 1,
+            "failures": [{"file_name": "a.jpg", "reason": "output_limit"}],
+            "memory_graph": {"scope_id": "s"},
+        },
+    )
+    if http_failure:
+
+        def reject(**_):
+            raise RuntimeError('HTTP 502: {"code":"output_limit","message":"模型输出预算耗尽"}')
+
+        monkeypatch.setattr(client, "process_pipeline", reject)
+    execution, *_ = _execution(client=client)
+    state = execution.execute(_request(mode="build"))
+    phase = state["phases"]["pipeline_processing"]
+    assert phase["status"] == ("failed" if http_failure else "partial")
+    assert state["scope_build"]["status"] == "incomplete"
+    assert "output_limit" in (state["fatal_error"] if http_failure else phase["error_details"][0]["reason"])
+
+
+@pytest.mark.parametrize("judge_status", ["completed", "failed", "outcome_unknown"])
+def test_resume_received_invalid_judge_never_dispatches_qa_or_judge(monkeypatch, judge_status):
+    execution, *_ = _execution()
+    monkeypatch.setattr(execution, "_evaluate_one", lambda *_: pytest.fail("QA replayed"))
+    monkeypatch.setattr(execution, "_probe_endpoint_health", lambda: pytest.fail("model health not needed"))
+    monkeypatch.setattr(
+        execution, "_judge", SimpleNamespace(judge_item=lambda *_: pytest.fail("Judge replayed"))
+    )
+    prior = {
+        "qa_id": "q1",
+        "execution_status": "completed",
+        "judge_status": judge_status,
+        "judge_dispatch_status": "finished",
+        "judge": {"score": None, "judge_status": judge_status, "raw_text": "not valid JSON"},
+    }
+    state = RunState({"scope_id": "s", "album_id": ALBUM})
+    execution._phase_qa_eval(state, _request(prior_items=[prior]))
+    result = state.data["items"][0]
+    assert result["execution_status"] == "completed"
+    assert result["judge_status"] == ("outcome_unknown" if judge_status == "outcome_unknown" else "failed")
+    assert result["judge"]["score"] is None
+
+
+@pytest.mark.parametrize("failure", ["poll_timeout", "post_unknown"])
+def test_later_turn_unknown_preserves_completed_history_without_replay(monkeypatch, failure):
+    from photobench.domain.errors import RequestOutcomeUnknownError
+
+    execution, client, _, _, _ = _execution()
+    posts = []
+
+    def start_turn(**kwargs):
+        posts.append(kwargs)
+        if len(posts) == 2 and failure == "post_unknown":
+            raise RequestOutcomeUnknownError(method="POST", cause_type="ReadTimeout", attempts=1)
+        return {"turn_id": f"turn-{len(posts)}"}
+
+    def get_turn(**kwargs):
+        if kwargs["turn_id"] == "turn-2":
+            raise TimeoutError("second turn polling timed out")
+        return {
+            "status": "completed",
+            "result": {"answer": "first answer", "termination_reason": "completed"},
+        }
+
+    monkeypatch.setattr(client, "start_turn", start_turn)
+    monkeypatch.setattr(client, "get_turn", get_turn)
+    row = {**_rows()[0], "conversation": [{"message": "first"}, {"message": "second"}]}
+    item = execution._evaluate_one(row, "s", {}, _request(turn_timeout=0))
+    assert len(posts) == 2
+    assert item["execution_status"] == "outcome_unknown"
+    assert item["request_failure"]["automatic_replay"] is False
+    assert len(item["runtime_turns"]) == 1
+    assert item["runtime_turns"][0]["turn_id"] == "turn-1"
+    assert item["runtime_turns"][0]["answer"] == "first answer"
+    if failure == "poll_timeout":
+        assert item["request_failure"]["turn_id"] == "turn-2"
+        assert item["request_failure"]["cause_type"] == "TimeoutError"
+    else:
+        assert item["request_failure"]["cause_type"] == "ReadTimeout"
+        assert item["request_failure"]["attempts"] == 1
+    monkeypatch.setattr(execution, "_evaluate_one", lambda *_: pytest.fail("unknown Agent replayed"))
+    state = RunState({"scope_id": "s", "album_id": ALBUM})
+    execution._phase_qa_eval(state, _request(prior_items=[item]))
+    assert state.data["items"][0]["execution_status"] == "outcome_unknown"
+    assert state.data["items"][0]["runtime_turns"] == item["runtime_turns"]
+    assert len(posts) == 2

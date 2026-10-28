@@ -238,8 +238,26 @@ export function judgeRoundState(item: unknown, task: unknown): string {
   return "updated";
 }
 
+export function operationalReason(kind: unknown): string {
+  const labels: Record<string, string> = {
+    output_limit: "输出预算", context_limit: "上下文预算", step_limit: "轮次或工具次数限制",
+    model_output_invalid: "模型输出格式错误",
+    configuration_error: "请求配置错误",
+    time_limit: "时间预算", provider_rejected: "供应商拒绝或不可用", resource_error: "资源异常",
+  };
+  return typeof kind === "string" ? labels[kind] || "运行限制" : "运行限制";
+}
+
+export function operationalCountNote(value: unknown): string {
+  const entries = Object.entries(dict(value)).filter(([, count]) => typeof count === "number" && count > 0);
+  return entries.length ? entries.map(([kind, count]) => `${operationalReason(kind)} ${String(count)} 题`).join(" · ") : "按结构化运行证据统计；不计为回答错误";
+}
+
 /** 1.0 `:750-758` —— 同样把 `activeRejudge` 显式化为 `task`。 */
 export function judgeScoreLabel(item: unknown, task: unknown): string {
+  const row = dict(item);
+  if (row.operational_issue || row.evaluation_status === "not_evaluable") return `不可评估（${operationalReason(dict(row.operational_issue).kind)}）`;
+  if (row.judge_issue) return `评分未完成（${operationalReason(dict(row.judge_issue).kind)}）`;
   const judge = dict(dict(item).judge);
   if (judge.consistency_status === "inconsistent") return "评分异常";
   const state = judgeRoundState(item, task);

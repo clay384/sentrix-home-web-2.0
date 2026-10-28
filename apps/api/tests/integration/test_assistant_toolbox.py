@@ -1081,3 +1081,21 @@ def test_memory_facts_rejects_a_person_that_was_never_confirmed(toolbox):
 
     assert outcome.failure_reason == "person_not_named_in_current_album"
     assert outcome.model_visible["status"] == "unresolved_person"
+
+
+def test_embedding_fault_is_internal_tool_evidence_not_model_visible(toolbox):
+    import httpx
+
+    from sentrix.infrastructure.models.legacy import BgeSidecarEmbedder
+
+    build, _ = toolbox
+    build._retrieval._text._embedder = BgeSidecarEmbedder(
+        "http://sidecar.invalid",
+        client=httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(503))),
+    )
+    outcome = run(toolbox, "search_memories", query="海边")
+    trace = next(row for row in outcome.observation["retrieval_channels"] if row["channel"] == "text_ann")
+    assert trace["operational_issue"]["http_status"] == 503
+    assert trace["operational_issue"]["error_code"] == "provider_rejected"
+    assert "operational_issue" not in str(outcome.model_visible)
+    assert outcome.ok

@@ -231,7 +231,8 @@ def test_index_dropping_between_status_and_search_still_returns_results():
     assert [item.asset_id for item in result.hits] == ["asset_a"]
     assert result.backend == "sqlite_exact"
     assert result.degraded is True
-    assert "already accessed" in result.degraded_reason
+    assert result.degraded_reason == "vector_index_unavailable"
+    assert result.operational_issue["error_code"] == "resource_error"
 
 
 def test_no_index_configured_uses_the_authoritative_store():
@@ -341,3 +342,42 @@ def test_an_empty_store_is_not_scheme_drift():
     # `_recall` 会先置 `no_index_configured`——拿 degraded 做断言等于把别的原因
     # 也算进来，那样这条用例就测不到漂移判据本身了。
     assert "scheme_out_of_sync" not in result.degraded_reason
+
+
+@pytest.mark.parametrize("phase", ["status", "count"])
+def test_index_resource_fault_survives_exact_fallback(phase):
+    from sentrix.domain.retrieval.ports import retrieval_operational_issue
+
+    class ResourceIndex(FakeIndex):
+        def status(self):
+            if phase == "status":
+                return VectorIndexStatus(
+                    backend="qdrant",
+                    available=False,
+                    degraded=True,
+                    reason="private directory",
+                    operational_issue=retrieval_operational_issue(
+                        VectorIndexUnavailable("private directory")
+                    ),
+                )
+            return super().status()
+
+        def count(self, **_kwargs):
+            raise VectorIndexUnavailable("private directory")
+
+    result = build(vectors=FakeVectors(hits=[hit("asset_a", 0.9)]), index=ResourceIndex()).execute(request())
+    assert [item.asset_id for item in result.hits] == ["asset_a"]
+    assert result.backend == "sqlite_exact"
+    assert result.degraded_reason == "vector_index_unavailable"
+    assert result.operational_issue == {
+        "error_code": "resource_error",
+        "failure_code": "vector_index_unavailable",
+        "error_type": "VectorIndexUnavailable",
+    }
+
+
+def test_no_index_and_stale_index_are_not_resource_failures():
+    for index in (None, FakeIndex(count=0)):
+        result = build(vectors=FakeVectors(hits=[hit("asset_a", 0.9)]), index=index).execute(request())
+        assert result.degraded and result.hits
+        assert result.operational_issue is None

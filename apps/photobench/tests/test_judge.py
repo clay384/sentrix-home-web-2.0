@@ -218,7 +218,8 @@ def test_a_cancelled_runner_stops_the_retry_wait():
     runner = _runner(http, cancel=cancel)
     with pytest.raises(RunCancelledError):
         runner._request({"model": "m"})
-    assert len(http.calls) == 1
+    assert len(http.calls) == 0
+    assert runner.request_metrics()["requests_started"] == 0
 
 
 # ---- 任务行为与证据判分 ---------------------------------------------------
@@ -445,3 +446,322 @@ def test_reference_answer_praise_does_not_describe_the_tested_models_answer():
     result = _runner(http).judge("q", "r", "a")
     assert result["score"] == 0
     assert len(http.calls) == 1
+
+
+def test_request_metrics_count_actual_attempts_and_rate_limits():
+    cause = Exception("rate limit")
+    cause.response = SimpleNamespace(status_code=429)
+    error = RuntimeError("HTTP 429")
+    error.__cause__ = cause
+    http = FakeHttpClient([error, judge_reply('{"score":2,"reason":"ok"}')])
+    runner = _runner(http)
+    runner._request({"model": "m"})
+    metrics = runner.request_metrics()
+    assert metrics["requests_started"] == 2
+    assert metrics["http_429"] == metrics["request_errors"] == metrics["responses_received"] == 1
+    assert metrics["in_flight"] == metrics["rate_waiting"] == 0
+    metrics["requests_started"] = 99
+    assert runner.request_metrics()["requests_started"] == 2
+
+
+@pytest.mark.parametrize("failed_stage", ["task", "quality", "evidence"])
+@pytest.mark.parametrize("error_kind", ["ReadTimeout", "WriteTimeout"])
+def test_uncertain_cloud_post_is_not_retried_or_hidden(failed_stage, error_kind):
+    import httpx
+
+    from photobench.infrastructure.http.client import HttpxJsonClient
+
+    calls = []
+    task_response = judge_reply('{"actual_action":"answer","reason":"ok"}')
+    quality_response = judge_reply('{"score":2,"reason":"ok"}')
+
+    def handler(request):
+        import json
+
+        payload = json.loads(request.content)
+        system = payload["messages"][0]["content"]
+        calls.append(system)
+        if system == failed_stage:
+            raise getattr(httpx, error_kind)("request outcome is unknown", request=request)
+        return httpx.Response(200, json=task_response if system == "task" else quality_response)
+
+    client = HttpxJsonClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    runner = JudgeRunner(
+        http=client,
+        judge_url="http://judge/v1",
+        judge_model="m",
+        task_judge_prompt="task",
+        answer_quality_prompt="quality",
+        evidence_judge_prompt="evidence",
+        evidence_enabled=failed_stage == "evidence",
+        inline_images=lambda *_: [{"type": "image_url", "image_url": {"url": "data:test"}}],
+    )
+    item = {
+        "runtime_turns": [
+            {
+                "message": "q",
+                "answer": "a",
+                "expected_action": "answer",
+                "termination_reason": "answered",
+                "agent_status": "complete",
+                "predicted_images": [{"file_name": "a.jpg"}],
+            }
+        ]
+    }
+    result = runner.judge_item(item, {}, {})
+    assert result["judge_status"] == "outcome_unknown"
+    key = {"task": "task_judge", "quality": "judge", "evidence": "evidence_judge"}[failed_stage]
+    verdict = result["runtime_turns"][0][key]
+    assert verdict["judge_status"] == "outcome_unknown"
+    assert verdict["request_failure"]["automatic_replay"] is False
+    assert calls.count(failed_stage) == 1
+    if failed_stage == "task":
+        assert calls == ["task"]  # Later sub-judgements were never dispatched.
+    assert runner.request_metrics()["requests_started"] == len(calls)
+    assert runner.request_metrics()["request_errors"] == 1
+
+
+def test_received_server_error_remains_retryable():
+    cause = Exception("unavailable")
+    cause.response = SimpleNamespace(status_code=503)
+    error = RuntimeError("HTTP 503")
+    error.__cause__ = cause
+    http = FakeHttpClient([error, judge_reply('{"score":2,"reason":"ok"}')])
+    runner = _runner(http)
+    runner._request({"model": "m"})
+    assert len(http.calls) == 2
+
+
+@pytest.mark.parametrize("method", ["quality", "task", "evidence"])
+@pytest.mark.parametrize(
+    "finish_reason,kind", [("length", "output_limit"), ("content_filter", "provider_rejected")]
+)
+def test_cloud_incomplete_finish_even_with_valid_json_never_retries(method, finish_reason, kind):
+    raw = judge_reply('{"score":0,"reason":"内容错误","actual_action":"answer"}')
+    raw["choices"][0]["finish_reason"] = finish_reason
+    http = FakeHttpClient([raw])
+    runner = _runner(
+        http, inline_images=lambda *_: [{"type": "image_url", "image_url": {"url": "data:test"}}]
+    )
+    if method == "quality":
+        result = runner.judge("q", "ref", "answer")
+    elif method == "task":
+        result = runner.judge_task_action("q", "answer", "answer", "complete", "answered")
+    else:
+        result = runner.judge_evidence("q", "answer", [{"file_name": "a"}], {})
+    assert result["score"] is None
+    assert result["judge_status"] == "failed"
+    assert result["operational_issue"]["kind"] == kind
+    assert result["reason"] == "judge_" + kind
+    assert result["operational_issue"]["evidence"]["value"] == finish_reason
+    assert result["operational_issue"]["scope"] == "judge"
+    assert result["raw_response"] == raw
+    assert len(http.calls) == 1
+
+
+def test_item_with_operational_failure_never_calls_cloud():
+    http = FakeHttpClient([])
+    result = _runner(http).judge_item(
+        {
+            "execution_status": "completed",
+            "termination_reason": "step_budget_exhausted",
+            "runtime_turns": [{"message": "q", "answer": "a", "expected_action": "answer"}],
+        },
+        {},
+        {},
+    )
+    assert result["judge"]["score"] is None
+    assert result["judge_status"] == "skipped"
+    assert http.calls == []
+
+
+@pytest.mark.parametrize(
+    "finish_reason,kind", [("length", "output_limit"), ("content_filter", "provider_rejected")]
+)
+def test_cloud_incomplete_finish_stops_later_subrequests_and_preserves_raw_turn(finish_reason, kind):
+    raw = judge_reply('{"actual_action":"answer","reason":"足够"}')
+    raw["choices"][0]["finish_reason"] = finish_reason
+    http = FakeHttpClient([raw])
+    result = _runner(http).judge_item(
+        {
+            "execution_status": "completed",
+            "runtime_turns": [
+                {"message": "q", "answer": "a", "expected_action": "answer", "termination_reason": "answered"}
+            ],
+        },
+        {},
+        {},
+    )
+    assert result["execution_status"] == "completed"
+    assert result["judge_status"] == "failed"
+    assert result["judge"]["score"] is None
+    assert result["judge_issue"]["kind"] == kind
+    assert result["runtime_turns"][0]["task_judge"]["raw_response"] == raw
+    assert len(http.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "not JSON",
+        "{}",
+        '{"reason":"missing score"}',
+        '{"score":NaN,"reason":"invalid"}',
+        '{"score":true,"reason":"invalid"}',
+        '{"score":3,"reason":"invalid"}',
+        '{"score":0}',
+        '{"score":2,"reason":null}',
+    ],
+)
+def test_complete_invalid_quality_reply_is_known_failure_and_never_retried(text):
+    raw = judge_reply(text)
+    raw["choices"][0]["finish_reason"] = "stop"
+    http = FakeHttpClient([raw])
+    result = _runner(http).judge("q", "r", "a")
+    assert len(http.calls) == 1
+    assert result["judge_status"] == "failed"
+    assert result["score"] is None
+    assert result["raw_response"] == raw
+    assert result["operational_issue"]["kind"] == "model_output_invalid"
+    assert result["operational_issue"]["evidence"]["request_outcome_unknown"] is False
+    assert result["attempts"][0]["raw_response"] == raw
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "not JSON",
+        '{"reason":"missing action"}',
+        '{"actual_action":"unknown","reason":"invalid"}',
+        '{"actual_action":[],"reason":"invalid"}',
+    ],
+)
+def test_complete_invalid_action_reply_does_not_start_quality_subrequest(text):
+    http = FakeHttpClient([judge_reply(text)])
+    item = {"runtime_turns": [{"message": "q", "answer": "a", "expected_action": "answer"}]}
+    result = _runner(http).judge_item(item, {"answer": "r"}, {})
+    assert len(http.calls) == 1
+    assert result["judge_status"] == "failed"
+    assert result["judge_issue"]["kind"] == "model_output_invalid"
+    assert result["runtime_turns"][0]["task_judge"]["actual_action"] is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "not JSON",
+        '{"applicable":true,"reason":"missing score"}',
+        '{"applicable":true,"score":NaN,"reason":"invalid"}',
+        '{"applicable":"false","score":0,"reason":"invalid"}',
+    ],
+)
+def test_complete_invalid_evidence_reply_is_not_a_quality_zero(text):
+    http = FakeHttpClient([judge_reply(text)])
+    runner = _runner(http, inline_images=lambda *_: [{"type": "image_url", "image_url": {"url": "fake"}}])
+    result = runner.judge_evidence("q", "a", [{"id": "a"}], {})
+    assert len(http.calls) == 1
+    assert result["judge_status"] == "failed"
+    assert result["score"] is None
+    assert result["operational_issue"]["kind"] == "model_output_invalid"
+
+
+def test_valid_zero_and_intentional_non_grades_remain_distinct_from_invalid_replies():
+    http = FakeHttpClient(
+        [
+            judge_reply('{"score":0,"reason":"模型回答错误"}'),
+            judge_reply('{"applicable":false,"score":null,"reason":"no visual claim"}'),
+        ]
+    )
+    runner = _runner(http, inline_images=lambda *_: [{"type": "image_url", "image_url": {"url": "fake"}}])
+    zero = runner.judge("q", "r", "a")
+    assert zero["judge_status"] == "completed" and zero["score"] == 0
+    na = runner.judge_evidence("q", "a", [{"id": "a"}], {})
+    assert na["judge_status"] == "completed" and na["applicable"] is False and na["score"] is None
+    assert runner.judge_task_action("q", "a", None, None, None)["reason"] == "not_labeled"
+    assert runner.judge_evidence("q", "", [], {})["reason"] == "no_answer"
+    assert len(http.calls) == 2
+
+
+def test_consistency_exhaustion_is_known_judge_failure_not_completed_null():
+    http = FakeHttpClient(
+        [
+            judge_reply('{"score":0,"reason":"模型回答正确"}'),
+            judge_reply('{"score":0,"reason":"模型回答正确"}'),
+        ]
+    )
+    result = _runner(http).judge("q", "r", "a")
+    assert len(http.calls) == 2  # Existing distinct-prompt consistency check only.
+    assert result["judge_status"] == "failed"
+    assert result["operational_issue"]["evidence"]["value"] == "score_reason_inconsistent"
+    assert result["operational_issue"]["evidence"]["request_outcome_unknown"] is False
+
+
+@pytest.mark.parametrize("kind", ["quality", "action", "evidence"])
+@pytest.mark.parametrize(
+    "protocol",
+    [
+        "missing_finish",
+        "tool_finish",
+        "tool_message",
+        "bad_choices",
+        "bad_message",
+        "missing_content",
+        "non_object",
+        "invalid_http_json",
+        "invalid_http_encoding",
+    ],
+)
+def test_invalid_grading_envelope_never_scores_or_replays_valid_looking_content(kind, protocol):
+    import json
+
+    text = '{"score":0,"reason":"模型回答错误","actual_action":"answer","applicable":true}'
+    raw = judge_reply(text)
+    if protocol == "missing_finish":
+        raw["choices"][0].pop("finish_reason")
+    elif protocol == "tool_finish":
+        raw["choices"][0]["finish_reason"] = "tool_calls"
+    elif protocol == "tool_message":
+        raw["choices"][0]["message"]["tool_calls"] = [{"id": "not requested"}]
+    elif protocol == "bad_choices":
+        raw["choices"] = {}
+    elif protocol == "bad_message":
+        raw["choices"][0]["message"] = [text]
+    elif protocol == "missing_content":
+        raw["choices"][0]["message"].pop("content")
+    elif protocol == "non_object":
+        raw = []
+    elif protocol == "invalid_http_encoding":
+        raw = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid encoding")
+    else:
+        raw = json.JSONDecodeError("invalid upstream body", "invalid", 0)
+    http = FakeHttpClient([raw])
+    runner = _runner(http, inline_images=lambda *_: [{"type": "image_url", "image_url": {"url": "fake"}}])
+    if kind == "quality":
+        result = runner.judge("q", "r", "a")
+    elif kind == "action":
+        result = runner.judge_task_action("q", "a", "answer", "completed", "answered")
+    else:
+        result = runner.judge_evidence("q", "a", [{"id": "a"}], {})
+    assert len(http.calls) == 1
+    assert result["judge_status"] == "outcome_unknown"
+    assert result.get("score") is None
+    assert runner.request_metrics()["requests_started"] == 1
+    assert runner.request_metrics()["in_flight"] == 0
+    issue = result["operational_issue"]
+    assert issue["kind"] == "provider_rejected"
+    assert issue["evidence"]["error_code"] == "provider_response_invalid"
+    assert issue["evidence"]["request_outcome_unknown"] is True
+
+
+def test_invalid_action_protocol_stops_later_judge_subrequests():
+    raw = judge_reply('{"actual_action":"answer","reason":"valid looking"}')
+    raw["choices"][0].pop("finish_reason")
+    http = FakeHttpClient([raw])
+    result = _runner(http).judge_item(
+        {"runtime_turns": [{"message": "q", "answer": "a", "expected_action": "answer"}]},
+        {"answer": "r"},
+        {},
+    )
+    assert len(http.calls) == 1
+    assert result["judge_status"] == "outcome_unknown"
+    assert result["judge_issue"]["evidence"]["error_code"] == "provider_response_invalid"

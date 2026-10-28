@@ -27,15 +27,15 @@
    ``analyze_person_appearance`` 的入图是头肩裁剪件（本来就小），走同一条不影响结果。
 2. **``_core_vision_options`` 不搬**（1.0 ``:1097-1105`` 的 ``think`` / ``num_ctx`` /
    ``num_predict`` 是 llama.cpp 与 ollama 的私有字段）。``chat_json`` 发的是
-   ``MAX_ANSWER_TOKENS``，与 ``VlmObserver`` 同一个预算。
+   原生剩余窗口策略，省略 ``max_tokens/max_completion_tokens``，与 ``VlmObserver`` 一致。
 3. **返回里没有 ``"model"``。** 1.0 的 ``analyze_person_appearance`` 回 ``self.model``
    （``:1350``），2.0 把它提到端口的 ``model_id`` 上——与 ``VlmObserver.model_id``
    同一条口径（1.0 ``analyze_image`` 的 ``parsed["model"]`` 在 2.0 也是这么处理的）。
 
-**解析失败一律 ``None``。** 1.0 的 ``parse_json_response`` 失败时回 ``{}``：画像那条会把
-``{}`` 收成空画像，而空画像必然通不过 ``validate_portrait``，最后同样落到
-``deterministic_portrait``；瞬间那条会收成零条瞬间。两种写法的**结果相同**，2.0 选
-``None`` 是为了与 ``VlmObserver`` 同一条口径。
+无法读取本地图片时保留 ``None``；合法空对象在默认模式仍走既有归一化。
+完整响应无法解析 JSON 或不符合显式 ``json_schema`` 业务契约时抛结构化输出格式错误；
+传输/供应商/预算故障同样由调用方报告，不能伪装成已完成的空画像或零条瞬间。
+画像、瞬间、外观各自传入自己的输出契约，不使用观察器的八字段契约。
 
 **``role`` 形参不搬。** 1.0 的 ``role="writer"`` / ``role="verify"`` 是按角色路由到不同
 模型（``_endpoint_for``，``:697-719``），2.0 只有一台端点、一个 ``ServedModel``。
@@ -51,6 +51,11 @@ from typing import Any
 from sentrix.domain.identity.moments import PERSON_MOMENT_PROMPT, normalize_person_moments
 from sentrix.domain.identity.portrait import PERSON_PORTRAIT_PROMPT, normalize_writer_output
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
+from sentrix.infrastructure.media.json_output_contracts import (
+    APPEARANCE_SCHEMA,
+    MOMENTS_SCHEMA,
+    PORTRAIT_SCHEMA,
+)
 from sentrix.infrastructure.media.vlm_observer import IMAGE_MAX_SIDE, _encode_image, chat_json
 
 # 1.0 ``model_clients.py:1350`` 的 ``normalize_confidence(..., 0.55)`` 里的那个默认值。
@@ -123,7 +128,9 @@ class OpenAIPersonVision:
     def write_person_portrait(self, pack: Mapping[str, object]) -> dict[str, object] | None:
         """1.0 ``model_clients.py:1291-1297``。提示词与归一化都在 ``domain/identity/portrait``。"""
         prompt = PERSON_PORTRAIT_PROMPT + "\n证据包：" + json.dumps(dict(pack), ensure_ascii=False)
-        parsed = self._chat(prompt, None)
+        parsed = self._chat(
+            prompt, None, output_schema=PORTRAIT_SCHEMA, schema_name="sentrix_person_portrait_v1"
+        )
         if parsed is None:
             return None
         return normalize_writer_output(parsed)
@@ -142,7 +149,9 @@ class OpenAIPersonVision:
         prompt = PERSON_MOMENT_PROMPT
         if context:
             prompt += "\n图片上下文：" + json.dumps(dict(context), ensure_ascii=False)
-        parsed = self._chat(prompt, image)
+        parsed = self._chat(
+            prompt, image, output_schema=MOMENTS_SCHEMA, schema_name="sentrix_person_moments_v1"
+        )
         if parsed is None:
             return None
         return {"moments": normalize_person_moments(parsed, list(labels))}
@@ -160,7 +169,9 @@ class OpenAIPersonVision:
         if image is None:
             return None
         prompt = _APPEARANCE_PROMPT + json.dumps(dict(metadata or {}), ensure_ascii=False)
-        parsed = self._chat(prompt, image)
+        parsed = self._chat(
+            prompt, image, output_schema=APPEARANCE_SCHEMA, schema_name="sentrix_person_appearance_v1"
+        )
         if parsed is None:
             return None
         clothing: list[str] = []
@@ -173,5 +184,20 @@ class OpenAIPersonVision:
             "confidence": _confidence(parsed.get("confidence")),
         }
 
-    def _chat(self, prompt: str, image: str | None) -> dict[str, Any] | None:
-        return chat_json(self._endpoint, self._model, prompt, image, self._timeout)
+    def _chat(
+        self,
+        prompt: str,
+        image: str | None,
+        *,
+        output_schema: Mapping[str, Any],
+        schema_name: str,
+    ) -> dict[str, Any] | None:
+        return chat_json(
+            self._endpoint,
+            self._model,
+            prompt,
+            image,
+            self._timeout,
+            output_schema=output_schema,
+            schema_name=schema_name,
+        )

@@ -70,7 +70,7 @@ def render_numbered_preview(
     if scale < 1.0:
         image = image.resize(
             (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
-            Image.LANCZOS,
+            Image.Resampling.LANCZOS,
         )
     draw = ImageDraw.Draw(image)
     label_map: dict[str, dict[str, Any]] = {}

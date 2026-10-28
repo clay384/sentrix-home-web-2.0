@@ -145,6 +145,7 @@ class GoalPlanner:
                     prompt_tokens=reply.prompt_tokens,
                     completion_tokens=reply.completion_tokens,
                     finish_reason=reply.finish_reason,
+                    request_policy=dict(reply.request_policy),
                 )
                 if include_debug:
                     debug_call.update(
@@ -160,6 +161,18 @@ class GoalPlanner:
                 # 转述比在上层另拼一句更准。别的原因（2.0 自己拼错了请求）不往里塞，
                 # 免得把内部形状说给用户听。
                 call.update(error_type=type(error).__name__, error=str(error))
+                if isinstance(error, ModelServiceError):
+                    for key in (
+                        "error_code",
+                        "http_status",
+                        "request_policy",
+                        "finish_reason",
+                        "prompt_tokens",
+                        "completion_tokens",
+                    ):
+                        value = getattr(error, key)
+                        if value is not None:
+                            call[key] = value
                 if include_debug:
                     debug_call.update(error_type=type(error).__name__, error=str(error))
                 duration_ms = round((time.perf_counter() - started) * 1000, 1)

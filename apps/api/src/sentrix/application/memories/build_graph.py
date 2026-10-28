@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from datetime import datetime
 
+from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.identity.ports import EntityRepository, RelationshipRepository
 from sentrix.domain.media.models import Observation
 from sentrix.domain.media.ports import AssetRepository, ObservationRepository
@@ -53,6 +54,20 @@ def _digest(prefix: str, *parts: object) -> str:
 
 def _node_id(kind: str, value: str) -> str:
     return f"{kind}:{value}"
+
+
+def _causal_issue(error: Exception, batch: int) -> dict[str, object]:
+    issue: dict[str, object] = {"batch_index": batch, "error_type": type(error).__name__}
+    if isinstance(error, ModelServiceError):
+        issue.update(
+            error_code=error.error_code,
+            http_status=error.http_status,
+            request_policy=dict(error.request_policy),
+            finish_reason=error.finish_reason,
+            prompt_tokens=error.prompt_tokens,
+            completion_tokens=error.completion_tokens,
+        )
+    return issue
 
 
 class BuildMemoryGraph:
@@ -505,6 +520,7 @@ class BuildMemoryGraph:
         pairs = extract_causal_pairs(tuple(frames))
         causal_status = "no_candidates" if not pairs else "not_configured"
         causal_edges = 0
+        causal_issues: list[dict[str, object]] = []
         if pairs and self._causal_judge is not None:
             causal_status = "ok"
             for offset in range(0, len(pairs), 12):
@@ -522,6 +538,7 @@ class BuildMemoryGraph:
                             recovered.append(replace(one[0], pair_id=local_index))
                         except Exception as retry_error:
                             causal_status = "degraded"
+                            causal_issues.append(_causal_issue(retry_error, offset // 12))
                             log.warning(
                                 "因果单对重试失败 scope=%s pair=%s→%s: %s",
                                 scope,
@@ -532,6 +549,7 @@ class BuildMemoryGraph:
                     verdicts = recovered
                 except Exception as error:  # 图是派生投影；故障必须可观测，不能冒充无因果边
                     causal_status = "degraded"
+                    causal_issues.append(_causal_issue(error, offset // 12))
                     log.warning("因果边判定失败 scope=%s batch=%d: %s", scope, offset // 12, error)
                     continue
                 for verdict in verdicts:
@@ -587,6 +605,7 @@ class BuildMemoryGraph:
             causal_candidate_pairs=len(pairs),
             causal_edges=causal_edges,
             causal_status=causal_status,
+            causal_issues=tuple(causal_issues),
             causal_seconds=round(causal_seconds, 3),
             keyframe_count=keyframe_stats.frame_count,
             keyframe_temporal_edges=keyframe_stats.temporal_edges,

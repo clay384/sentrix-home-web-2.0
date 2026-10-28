@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from sentrix.application.media.import_assets import ImportAssets, ImportRequest
+from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.media.models import (
     Asset,
     AssetStatus,
@@ -544,3 +545,51 @@ def test_audio_import_without_the_probe_chain_still_works():
     assert result.media_type is MediaType.AUDIO
     assert result.audio_probed is False
     assert assets.get(result.asset_id).mime_type == "audio/mp4"
+
+
+def test_video_keyframe_model_operation_failure_propagates_without_quality_fallback():
+    failure = ModelServiceError("time_limit", error_code="time_limit")
+
+    def fail_scene(_asset_id):
+        raise failure
+
+    use_case, _, _ = build_video(
+        metadata_reader=FakeVideoMetadata(VIDEO_METADATA), scene_extractor=fail_scene
+    )
+    with pytest.raises(ModelServiceError) as caught:
+        use_case.execute(
+            ImportRequest(scope_id="album1", file_name="clip.mov", content_type=None, content=b"mov")
+        )
+    assert caught.value is failure
+
+
+def test_pipeline_marks_image_model_operation_failure_failed_and_reports_reason():
+    from sentrix.application.media.import_album import AlbumProcessRequest, ProcessAlbumPipeline
+    from sentrix.application.media.observe_asset import ObserveAsset
+
+    class FailedVision:
+        def observe(self, _path):
+            raise ModelServiceError(
+                "provider_rejected HTTP429", error_code="provider_rejected", http_status=429
+            )
+
+    use_case, assets, observations, _ = build()
+    staged = use_case.execute(
+        ImportRequest(
+            scope_id="album1",
+            file_name="one.jpg",
+            content_type="image/jpeg",
+            content=b"one",
+            defer_processing=True,
+        )
+    )
+    observer = ObserveAsset(observer=FailedVision(), observations=observations)
+    use_case._observer = observer
+    result = ProcessAlbumPipeline(importer=use_case, assets=assets, workers=1).execute(
+        AlbumProcessRequest(scope_id="album1", asset_ids=(staged.asset_id,))
+    )
+    assert result.processed == 0
+    assert assets.get(staged.asset_id).status is AssetStatus.FAILED
+    assert len(result.failures) == 1
+    assert "provider_rejected" in result.failures[0].reason
+    assert "HTTP429" in result.failures[0].reason
