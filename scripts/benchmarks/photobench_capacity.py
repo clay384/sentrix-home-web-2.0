@@ -47,6 +47,7 @@ from scripts.benchmarks.summarize_photobench_capacity import summarize_run  # no
 from scripts.maintenance import embedding_identity  # noqa: E402
 
 Json = dict[str, Any]
+INITIAL_RUN_VISIBILITY_SECONDS = 30
 TERMINAL = {"completed", "completed_with_errors", "failed", "cancelled", "interrupted"}
 RESOURCE_ERROR = re.compile(
     r"out of memory|cuda error|gpu.*(?:fault|error)|database (?:is )?locked|"
@@ -470,8 +471,22 @@ def poll_run(
     client_start: str | None,
     source_rows: Sequence[Json] | None = None,
     cancel_drain_seconds: float = 300,
+    new_run_event: Json | None = None,
 ) -> Json:
     started = time.monotonic()
+    # Only this invocation's acknowledged creation gets a first-checkpoint grace.
+    # Old observation/resume and unknown POST outcomes must never acquire one.
+    visibility_grace = (
+        INITIAL_RUN_VISIBILITY_SECONDS
+        if new_run_event
+        and new_run_event.get("state") == "completed"
+        and new_run_event.get("http_status") == 202
+        and known_run_id(new_run_event) == run_id
+        else 0
+    )
+    visibility_deadline = started + min(visibility_grace, deadline_seconds)
+    state_visible = False
+    initial_not_found_reads = 0
     stop_reason = None
     cancel_event: Json | None = None
     cancellation_drain: Json | None = None
@@ -484,9 +499,14 @@ def poll_run(
             state = json.loads(
                 get_text(
                     bench + "/api/v1/runs/" + urllib.parse.quote(run_id, safe="") + "?include_history=false",
-                    30,
+                    min(30, max(0.001, visibility_deadline - time.monotonic()))
+                    if visibility_grace and not state_visible
+                    else 30,
                 )
             )
+            state_visible = True
+            if visibility_grace and state.get("run_id") != run_id:
+                raise ValueError("new run observation identity differs from acknowledged creation")
             if source_rows is not None:
                 count_seen = state.get("item_count")
                 # Agent traces are immutable when complete, but Judge status is not.
@@ -514,8 +534,34 @@ def poll_run(
                 state = {**state, "items": [observed_items[i] for i in sorted(observed_items)]}
             save_json(output / "latest-run.json", state)
         except Exception as exc:
-            samples.append({"observed_at": time.time(), "read_error_type": type(exc).__name__})
-            stop_reason = stop_reason or "run_observation_unavailable"
+            initial_not_found = (
+                visibility_grace
+                and not state_visible
+                and isinstance(exc, urllib.error.HTTPError)
+                and exc.code == 404
+            )
+            samples.append(
+                {
+                    "observed_at": time.time(),
+                    "read_error_type": type(exc).__name__,
+                    "http_status": exc.code if isinstance(exc, urllib.error.HTTPError) else None,
+                    "initial_run_not_visible": bool(initial_not_found),
+                }
+            )
+            if initial_not_found:
+                initial_not_found_reads += 1
+                remaining = visibility_deadline - time.monotonic()
+                if remaining > 0 and not stop.is_set() and not sampler.failure:
+                    stop.wait(min(poll_seconds, remaining))
+                    if not stop.is_set() and not sampler.failure:
+                        continue
+                stop_reason = (
+                    stop_reason
+                    or sampler.failure
+                    or ("operator_stop" if stop.is_set() else "run_state_not_visible")
+                )
+            else:
+                stop_reason = stop_reason or "run_observation_unavailable"
             stop.set()
         if state.get("status") in TERMINAL:
             # Never call resume or rejudge, even if scoring remains incomplete.
@@ -575,6 +621,11 @@ def poll_run(
         "qa_concurrency": concurrency,
         "judge_concurrency": judge_concurrency,
         "elapsed_seconds": time.monotonic() - started,
+        "initial_state_visibility": {
+            "grace_seconds": visibility_grace,
+            "initial_not_found_reads": initial_not_found_reads,
+            "observed": state_visible,
+        },
         "progress": progress,
         "judge_requests": qa.get("judge_requests"),
         "judge_failure_count": judge_failure_count(state),
@@ -1005,6 +1056,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 2
         sampler.thread.start()
+        new_run_event: Json | None = None
         try:
             if not run_id:
                 if stop.is_set():
@@ -1036,6 +1088,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 save_json(args.output / "request.json", payload)
                 event = post_once(bench + "/api/v1/runs", payload, request_id, ledger)
                 run_id = known_run_id(event)
+                new_run_event = event
                 if not run_id:
                     save_json(
                         args.output / "summary.json",
@@ -1064,15 +1117,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 client_pid=pid,
                 client_start=proc.get("start_time_ticks"),
                 source_rows=source_rows,
+                new_run_event=new_run_event,
             )
             sampler.stop.set()
             sampler.thread.join(timeout=16)
             if sampler.thread.is_alive():
-                result.update(passed=False, failure="model_sampler_did_not_stop")
+                result.update(passed=False, failure=result.get("failure") or "model_sampler_did_not_stop")
             else:
                 sampler.sample_once()
                 if sampler.failure:
-                    result.update(passed=False, failure=sampler.failure)
+                    result.update(passed=False, failure=result.get("failure") or sampler.failure)
             collect_final_evidence(result, bench, run_id, args.output, source_rows)
             save_json(args.output / "summary.json", result)
             print(

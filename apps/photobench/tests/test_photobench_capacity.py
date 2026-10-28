@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import threading
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -228,7 +229,11 @@ def test_model_window_and_embedding_mismatch_rejected():
         capacity.validate_configuration(config, diag, models, **kw)
 
 
-def test_main_resume_observes_known_run_without_replaying_and_rejects_identity_change(tmp_path, monkeypatch):
+@pytest.mark.parametrize("initial_not_found", [0, 2])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_main_resume_observes_known_run_without_replaying_and_rejects_identity_change(
+    tmp_path, monkeypatch, initial_not_found, cleanup_failure
+):
     config, diag, models, kw = config_fixture()
     consumer_root, migration_dir, pid_file, proc_root = consumer_process_fixture(tmp_path)
     actual_binding = capacity.active_consumer_migrations
@@ -260,8 +265,10 @@ def test_main_resume_observes_known_run_without_replaying_and_rejects_identity_c
     (snapshot / "manifest.json").write_text('{"identity":"checked"}\n')
     output = tmp_path / "round"
     run_overview, run_items = detail_fixture(64)
+    initial_reads = 0
 
     def get(url, *_):
+        nonlocal initial_reads
         if url.endswith("/config"):
             return json.dumps(config)
         if url.endswith("/diagnostics"):
@@ -275,6 +282,11 @@ def test_main_resume_observes_known_run_without_replaying_and_rejects_identity_c
         if "/qa-dataset?" in url:
             return json.dumps({"items": rows()})
         if "/runs/known" in url:
+            initial_reads += 1
+            if initial_reads <= initial_not_found:
+                raise urllib.error.HTTPError(url, 404, "first checkpoint pending", {}, None)
+            if cleanup_failure and initial_reads == initial_not_found + 1:
+                raise urllib.error.HTTPError(url, 500, "initial observation failed", {}, None)
             return detail_reader(run_overview, run_items)(url)
         raise AssertionError(url)
 
@@ -290,8 +302,11 @@ def test_main_resume_observes_known_run_without_replaying_and_rejects_identity_c
     )
     monkeypatch.setattr(capacity.signal, "signal", lambda *_: None)
 
+    samplers = []
+
     class FakeSampler:
         def __init__(self, *_):
+            samplers.append(self)
             self.failure = None
             self.peaks = {}
             self.stop = threading.Event()
@@ -320,7 +335,9 @@ def test_main_resume_observes_known_run_without_replaying_and_rejects_identity_c
         def open(self, req, timeout):
             sent.append(req.full_url)
             persisted = capacity.Journal(output / "dispatch.jsonl").latest()
-            assert list(persisted.values())[0]["state"] == "request_outcome_unknown"
+            assert list(persisted.values())[-1]["state"] == "request_outcome_unknown"
+            if req.full_url.endswith("/cancel"):
+                samplers[-1].failure = "qa_cancel_requested"
             return Response()
 
     monkeypatch.setattr(capacity, "opener", lambda: API())
@@ -371,7 +388,18 @@ def test_main_resume_observes_known_run_without_replaying_and_rejects_identity_c
         "64",
         "--min-model-available-gib",
         "0",
+        "--poll-seconds",
+        "0.1",
     ]
+    if cleanup_failure:
+        assert capacity.main(args) == 2
+        summary = json.loads((output / "summary.json").read_text())
+        assert summary["failure"] == "run_observation_unavailable"
+        assert sent == [
+            "http://127.0.0.1:18772/api/v1/runs",
+            "http://127.0.0.1:18772/api/v1/runs/known/cancel",
+        ]
+        return
     assert capacity.main(args) == 0
     assert capacity.main(args + ["--resume"]) == 0
     assert sent == ["http://127.0.0.1:18772/api/v1/runs"]
@@ -1178,3 +1206,165 @@ def test_wrong_consumer_sql_stops_cli_before_any_http_or_post(tmp_path, monkeypa
 def test_capacity_certification_explains_missing_linux_process_evidence(tmp_path):
     with pytest.raises(ValueError, match="requires Linux /proc on the tested Sentrix API host"):
         capacity.active_consumer_migrations(tmp_path, None, tmp_path / "no-proc")
+
+
+def accepted_creation(status=202, run_id="known", outcome="completed"):
+    return {"state": outcome, "http_status": status, "response": {"run_ids": [run_id]}}
+
+
+def visibility_poll(tmp_path, monkeypatch):
+    kw = poll_kwargs(tmp_path)
+    kw["new_run_event"] = accepted_creation()
+    kw["poll_seconds"] = 10
+    now = [0.0]
+
+    class StopClock:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def set(self):
+            self.stopped = True
+
+        def wait(self, seconds):
+            now[0] += seconds
+            return self.stopped
+
+    kw["stop"] = StopClock()
+    monkeypatch.setattr(capacity.time, "monotonic", lambda: now[0])
+    cancels = []
+
+    def cancel(url, payload, key, journal):
+        assert url.endswith("/known/cancel")
+        event = {"request_id": key, "state": "completed", "http_status": 200}
+        journal.append(event)
+        cancels.append(event)
+        return event
+
+    monkeypatch.setattr(capacity, "post_once", cancel)
+    return kw, now, cancels
+
+
+def test_new_202_first_checkpoint_404_wait_is_bounded_and_cancelled_once(tmp_path, monkeypatch):
+    kw, now, cancels = visibility_poll(tmp_path, monkeypatch)
+    reads = []
+
+    def missing(url, timeout):
+        reads.append((url, timeout))
+        raise urllib.error.HTTPError(url, 404, "checkpoint pending", {}, None)
+
+    monkeypatch.setattr(capacity, "get_text", missing)
+    result = capacity.poll_run(**kw)
+    assert result["failure"] == "run_state_not_visible"
+    assert result["initial_state_visibility"]["initial_not_found_reads"] == 4
+    assert now[0] == 30
+    assert len(cancels) == 1
+    assert not result["passed"]
+    assert all("include_history=false" in url for url, _ in reads)
+
+
+def test_first_visibility_grace_respects_whole_round_deadline(tmp_path, monkeypatch):
+    kw, now, cancels = visibility_poll(tmp_path, monkeypatch)
+    kw["deadline_seconds"] = 3
+
+    def missing(url, timeout):
+        raise urllib.error.HTTPError(url, 404, "checkpoint pending", {}, None)
+
+    monkeypatch.setattr(capacity, "get_text", missing)
+    result = capacity.poll_run(**kw)
+    assert now[0] == 3
+    assert result["failure"] == "run_state_not_visible"
+    assert len(cancels) == 1
+
+
+@pytest.mark.parametrize("code", [400, 401, 403, 429, 500])
+def test_initial_visibility_never_hides_other_http_errors(tmp_path, monkeypatch, code):
+    kw, now, cancels = visibility_poll(tmp_path, monkeypatch)
+
+    def rejected(url, timeout):
+        raise urllib.error.HTTPError(url, code, "other failure", {}, None)
+
+    monkeypatch.setattr(capacity, "get_text", rejected)
+    result = capacity.poll_run(**kw)
+    assert result["failure"] == "run_observation_unavailable"
+    assert now[0] == 0
+    assert len(cancels) == 1
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        None,
+        accepted_creation(200),
+        accepted_creation(run_id="other"),
+        accepted_creation(outcome="request_outcome_unknown"),
+    ],
+)
+def test_resume_unknown_and_unacknowledged_creation_have_no_404_grace(tmp_path, monkeypatch, event):
+    kw, now, cancels = visibility_poll(tmp_path, monkeypatch)
+    kw["new_run_event"] = event
+
+    def missing(url, timeout):
+        raise urllib.error.HTTPError(url, 404, "not found", {}, None)
+
+    monkeypatch.setattr(capacity, "get_text", missing)
+    result = capacity.poll_run(**kw)
+    assert result["failure"] == "run_observation_unavailable"
+    assert result["initial_state_visibility"]["grace_seconds"] == 0
+    assert now[0] == 0
+    assert len(cancels) == 1
+
+
+@pytest.mark.parametrize("failure", ["operator_stop", "sustained_remote_swap_growth"])
+def test_stop_or_sampler_failure_interrupts_first_404_wait(tmp_path, monkeypatch, failure):
+    kw, now, cancels = visibility_poll(tmp_path, monkeypatch)
+
+    def stopped_wait(seconds):
+        now[0] += 0.05
+        if failure == "operator_stop":
+            kw["stop"].set()
+        else:
+            kw["sampler"].failure = failure
+
+    kw["stop"].wait = stopped_wait
+
+    def missing(url, timeout):
+        raise urllib.error.HTTPError(url, 404, "checkpoint pending", {}, None)
+
+    monkeypatch.setattr(capacity, "get_text", missing)
+    result = capacity.poll_run(**kw)
+    assert result["failure"] == failure
+    assert now[0] == 0.05
+    assert len(cancels) == 1
+
+
+def test_first_success_closes_404_grace_and_mismatched_run_is_rejected(tmp_path, monkeypatch):
+    kw, now, cancels = visibility_poll(tmp_path, monkeypatch)
+    observed = state()
+    observed["run_id"] = "known"
+    calls = 0
+
+    def read(url, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return json.dumps(observed)
+        raise urllib.error.HTTPError(url, 404, "disappeared after first visibility", {}, None)
+
+    monkeypatch.setattr(capacity, "get_text", read)
+    result = capacity.poll_run(**kw)
+    assert result["failure"] == "run_observation_unavailable"
+    assert result["initial_state_visibility"]["initial_not_found_reads"] == 0
+    assert now[0] == 10
+    assert len(cancels) == 1
+
+    other = tmp_path / "different"
+    other.mkdir()
+    kw, now, cancels = visibility_poll(other, monkeypatch)
+    observed["run_id"] = "wrong"
+    monkeypatch.setattr(capacity, "get_text", lambda *_: json.dumps(observed))
+    result = capacity.poll_run(**kw)
+    assert result["failure"] == "run_observation_unavailable"
+    assert now[0] == 0
+    assert len(cancels) == 1
