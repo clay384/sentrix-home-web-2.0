@@ -182,3 +182,157 @@ def test_2_0_qdrant_dir_is_not_1_0_s(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     assert settings.qdrant_dir == tmp_path / "qdrant"
     assert settings.qdrant_dir != Path("/home/asus/Github/Sentrix-Home-Web/data/qdrant")
+
+
+def test_concurrent_first_search_opens_one_persistent_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A cold shared adapter must not contend with its own directory lock."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Event, Lock
+
+    import qdrant_client
+
+    path = tmp_path / "cold-shared"
+    seed = QdrantVectorIndex(path)
+    seed.upsert([record("synthetic_concurrent_asset")])
+    seed.close()
+    instance = QdrantVectorIndex(path)
+    real_client = qdrant_client.QdrantClient
+    start = Barrier(8)
+    constructed = Event()
+    publish = Event()
+    second_constructor = Event()
+    counter_lock = Lock()
+    attempts = 0
+
+    def slow_constructor(*args, **kwargs):
+        nonlocal attempts
+        with counter_lock:
+            attempts += 1
+            if attempts > 1:
+                second_constructor.set()
+        client = real_client(*args, **kwargs)
+        constructed.set()
+        if not publish.wait(timeout=10):
+            client.close()
+            raise TimeoutError("test did not release the constructor")
+        return client
+
+    monkeypatch.setattr(qdrant_client, "QdrantClient", slow_constructor)
+
+    def search():
+        start.wait(timeout=10)
+        return instance.search(space="visual", vector=(1.0, 0.0, 0.0, 0.0), limit=1, model_name=MODEL)
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(search) for _ in range(8)]
+            try:
+                assert constructed.wait(timeout=10), "first real Qdrant client never opened"
+                # Keep the real directory lock held while other cold callers enter.
+                second_constructor.wait(timeout=0.15)
+            finally:
+                publish.set()
+            outcomes = []
+            failures = []
+            for future in futures:
+                try:
+                    outcomes.append(future.result(timeout=10))
+                except VectorIndexUnavailable as error:
+                    failures.append(str(error))
+        assert failures == [], failures
+        assert attempts == 1
+        assert len(outcomes) == 8
+        assert all([hit.source_id for hit in hits] == ["synthetic_concurrent_asset"] for hits in outcomes)
+        assert instance.status().available
+    finally:
+        publish.set()
+        instance.close()
+
+
+def test_concurrent_initialization_failure_is_cached_and_remains_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Lock
+
+    import qdrant_client
+
+    instance = QdrantVectorIndex(tmp_path / "unavailable")
+    start = Barrier(8)
+    counter_lock = Lock()
+    attempts = 0
+
+    def unavailable_client(*args, **kwargs):
+        nonlocal attempts
+        with counter_lock:
+            attempts += 1
+        raise PermissionError("synthetic read-only vector directory")
+
+    monkeypatch.setattr(qdrant_client, "QdrantClient", unavailable_client)
+
+    def status():
+        start.wait(timeout=10)
+        return instance.status()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: status(), range(8)))
+
+    assert attempts == 1
+    assert all(not result.available and result.degraded for result in results)
+    assert all("PermissionError" in result.reason for result in results)
+    assert all(
+        result.operational_issue and result.operational_issue["failure_code"] == "vector_index_unavailable"
+        for result in results
+    )
+    with pytest.raises(VectorIndexUnavailable, match="PermissionError"):
+        instance.search(space="visual", vector=(1.0, 0.0, 0.0, 0.0), limit=1, model_name=MODEL)
+    assert attempts == 1
+
+
+def test_close_waits_for_in_progress_client_initialization(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    import qdrant_client
+
+    instance = QdrantVectorIndex(tmp_path / "closing")
+    constructor_entered = Event()
+    publish = Event()
+    close_started = Event()
+    close_done = Event()
+
+    class Client:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    client = Client()
+
+    def slow_client(*args, **kwargs):
+        constructor_entered.set()
+        if not publish.wait(timeout=10):
+            raise TimeoutError("test did not release the constructor")
+        return client
+
+    monkeypatch.setattr(qdrant_client, "QdrantClient", slow_client)
+
+    def close():
+        close_started.set()
+        instance.close()
+        close_done.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        opening = pool.submit(instance.status)
+        try:
+            assert constructor_entered.wait(timeout=10)
+            closing = pool.submit(close)
+            assert close_started.wait(timeout=10)
+            assert not close_done.wait(timeout=0.05)
+        finally:
+            publish.set()
+        assert opening.result(timeout=10).available
+        closing.result(timeout=10)
+
+    assert client.closed
+    assert instance._client is None

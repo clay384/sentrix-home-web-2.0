@@ -21,6 +21,7 @@ import re
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from sentrix.domain.retrieval.ports import (
@@ -49,6 +50,7 @@ class QdrantVectorIndex:
         self.prefix = prefix
         self._client: Any = None
         self._error = ""
+        self._client_lock = Lock()
 
     # ---- 客户端 ----------------------------------------------------------
 
@@ -56,22 +58,28 @@ class QdrantVectorIndex:
         """惰性取客户端。失败后缓存原因，不再每次重试——重试只是反复抛同一个异常。"""
         if self._client is not None:
             return self._client
-        if self._error:
-            raise VectorIndexUnavailable(self._error)
-        from qdrant_client import QdrantClient
+        # A restored local index may take time to load before Qdrant acquires its
+        # directory lock. Cold callers must share that one construction attempt.
+        with self._client_lock:
+            if self._client is not None:
+                return self._client
+            if self._error:
+                raise VectorIndexUnavailable(self._error)
+            from qdrant_client import QdrantClient
 
-        try:
-            self.path.mkdir(parents=True, exist_ok=True)
-            self._client = QdrantClient(path=str(self.path))
-        except Exception as error:  # noqa: BLE001 - 目录锁/权限/磁盘满都归为「索引不可用」
-            self._error = f"{type(error).__name__}: {error}"
-            raise VectorIndexUnavailable(self._error) from error
-        return self._client
+            try:
+                self.path.mkdir(parents=True, exist_ok=True)
+                self._client = QdrantClient(path=str(self.path))
+            except Exception as error:  # noqa: BLE001 - 目录锁/权限/磁盘满都归为「索引不可用」
+                self._error = f"{type(error).__name__}: {error}"
+                raise VectorIndexUnavailable(self._error) from error
+            return self._client
 
     def close(self) -> None:
-        if self._client is not None:
-            self._client.close()
-            self._client = None
+        with self._client_lock:
+            if self._client is not None:
+                self._client.close()
+                self._client = None
 
     # ---- 端口 ------------------------------------------------------------
 
