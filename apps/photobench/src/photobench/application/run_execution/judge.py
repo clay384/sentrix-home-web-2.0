@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import copy
 import json
 import os
 import random
@@ -33,7 +34,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from photobench.domain.errors import RequestOutcomeUnknownError
-from photobench.domain.http.ports import JsonHttpClient
+from photobench.domain.http.ports import JsonHttpClient, ObservedJsonHttpClient
 from photobench.domain.runs.analysis import (
     JUDGE_CONSISTENCY_VERSION,
     judge_score_consistency,
@@ -59,6 +60,7 @@ from photobench.domain.runs.operational import (
 )
 
 #: 1.0 的四个模块级常量（``:206-229``），同样由环境变量覆盖。
+JUDGE_HTTP_ATTEMPT_EVIDENCE_ENABLED = os.environ.get("PHOTOBENCH_JUDGE_HTTP_ATTEMPT_EVIDENCE", "0") == "1"
 JUDGE_RETRY_ATTEMPTS = max(1, int(os.environ.get("PHOTOBENCH_JUDGE_RETRY_ATTEMPTS", "6")))
 JUDGE_RETRY_BACKOFF_SECONDS = max(0.1, float(os.environ.get("PHOTOBENCH_JUDGE_RETRY_BACKOFF_SECONDS", "5.0")))
 JUDGE_RETRY_BACKOFF_MAX_SECONDS = max(
@@ -183,6 +185,7 @@ class JudgeRunner:
         cancel: threading.Event | None = None,
         sleep: Callable[[float], None] = time.sleep,
         rand: Callable[[float, float], float] = random.uniform,
+        http_attempt_evidence: bool | None = None,
     ) -> None:
         self.http = http
         self.judge_url = str(judge_url or "").rstrip("/")
@@ -199,6 +202,11 @@ class JudgeRunner:
         self.cancel = cancel
         self.sleep = sleep
         self.rand = rand
+        self.http_attempt_evidence = (
+            JUDGE_HTTP_ATTEMPT_EVIDENCE_ENABLED if http_attempt_evidence is None else http_attempt_evidence
+        )
+        self._http_attempts: list[dict[str, Any]] = []
+        self._http_request_groups = 0
         #: 限流锁与下一次可发时刻。惰性创建（1.0 也是第一次用到才建）。
         self._rate_lock = threading.Lock()
         self._next_request_at = 0.0
@@ -214,14 +222,20 @@ class JudgeRunner:
             "rate_wait_ms": 0.0,
         }
 
-    def request_metrics(self) -> dict[str, int | float]:
-        """Actual HTTP attempts for this run, not question/sub-judge counts."""
+    def request_metrics(self) -> dict[str, Any]:
+        """Keep safe failed-attempt evidence after success, alongside original scalar counters."""
         with self._metrics_lock:
-            return dict(self._request_metrics)
+            result: dict[str, Any] = dict(self._request_metrics)
+            result["http_attempt_evidence_enabled"] = self.http_attempt_evidence
+            if self.http_attempt_evidence:
+                result["http_attempt_evidence_supported"] = isinstance(self.http, ObservedJsonHttpClient)
+                result["http_attempts"] = copy.deepcopy(self._http_attempts)
+            return result
 
-    def _request_metric(self, key: str, amount: int | float = 1) -> None:
+    def _request_metric(self, key: str, amount: int | float = 1) -> int | float:
         with self._metrics_lock:
             self._request_metrics[key] += amount
+            return self._request_metrics[key]
 
     # ---- HTTP ---------------------------------------------------------------
 
@@ -297,7 +311,60 @@ class JudgeRunner:
     def _request(self, payload: dict[str, Any], timeout: int = 180) -> tuple[Any, int]:
         """1.0 ``_judge_request``（``:4433``）：带退避的重试；4xx 立刻抛。"""
         last_error: Exception | None = None
+        request_group = 0
+        if self.http_attempt_evidence:
+            with self._metrics_lock:
+                self._http_request_groups += 1
+                request_group = self._http_request_groups
         for attempt in range(1, JUDGE_RETRY_ATTEMPTS + 1):
+            positions: dict[int, int] = {}
+            request_index = [0]
+
+            def observe(
+                metadata: Mapping[str, Any],
+                positions: dict[int, int] = positions,
+                request_index: list[int] = request_index,
+                judge_attempt: int = attempt,
+            ) -> None:
+                transport = metadata.get("transport_attempt")
+                if type(transport) is not int or transport < 1:
+                    return
+                allowed = {
+                    "transport_attempt",
+                    "started_at",
+                    "started_monotonic",
+                    "finished_at",
+                    "elapsed_ms",
+                    "http_status",
+                    "exception_class",
+                    "retry_after",
+                    "rate_limit_headers",
+                    "provider_error_code",
+                    "provider_error_type",
+                    "transport_retry",
+                    "transport_backoff_seconds",
+                    "metadata_unavailable",
+                }
+                with self._metrics_lock:
+                    if transport not in positions:
+                        positions[transport] = len(self._http_attempts)
+                        self._http_attempts.append(
+                            {
+                                "index": len(self._http_attempts) + 1,
+                                "request_index": request_index[0],
+                                "request_group": request_group,
+                                "judge_retry_attempt": judge_attempt,
+                            }
+                        )
+                    self._http_attempts[positions[transport]].update(
+                        copy.deepcopy({key: value for key, value in metadata.items() if key in allowed})
+                    )
+
+            def annotate(_positions: dict[int, int] = positions, **facts: Any) -> None:
+                if _positions:
+                    with self._metrics_lock:
+                        self._http_attempts[_positions[max(_positions)]].update(facts)
+
             try:
                 if self.cancel is not None and self.cancel.is_set():
                     raise RunCancelledError("cancelled before Judge request dispatch")
@@ -310,12 +377,23 @@ class JudgeRunner:
                     self._request_metric("rate_wait_ms", (time.perf_counter() - wait_started) * 1000)
                 if self.cancel is not None and self.cancel.is_set():
                     raise RunCancelledError("cancelled before Judge request dispatch")
-                self._request_metric("requests_started")
+                request_index[0] = int(self._request_metric("requests_started"))
                 self._request_metric("in_flight")
                 try:
-                    response = self.http.request_json(
-                        judge_chat_url(self.judge_url), payload, "POST", timeout, self._headers()
-                    )
+                    if self.http_attempt_evidence and isinstance(self.http, ObservedJsonHttpClient):
+                        response = self.http.request_json_observed(
+                            judge_chat_url(self.judge_url),
+                            payload,
+                            "POST",
+                            timeout,
+                            self._headers(),
+                            observer=observe,
+                        )
+                    else:
+                        response = self.http.request_json(
+                            judge_chat_url(self.judge_url), payload, "POST", timeout, self._headers()
+                        )
+                    annotate(judge_retry_planned=False)
                     self._request_metric("responses_received")
                 except Exception as exc:
                     self._request_metric("request_errors")
@@ -334,9 +412,15 @@ class JudgeRunner:
                 finally:
                     self._request_metric("in_flight", -1)
                 return response, attempt
-            except (RunCancelledError, RequestOutcomeUnknownError):
+            except (RunCancelledError, RequestOutcomeUnknownError) as exc:
+                annotate(judge_retry_planned=False, retry_reason=type(exc).__name__)
                 raise
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                annotate(
+                    judge_retry_planned=False,
+                    retry_reason="provider_response_invalid",
+                    request_exception_class=type(exc).__name__,
+                )
                 error = RequestOutcomeUnknownError(
                     method="POST", cause_type=type(exc).__name__, attempts=attempt
                 )
@@ -344,14 +428,29 @@ class JudgeRunner:
                 raise error from exc
             except Exception as exc:  # noqa: BLE001 —— 1.0 在这里把一切收成「重试或放弃」
                 last_error = exc
+                annotate(request_exception_class=type(exc).__name__)
                 client_code = self._client_error_code(exc)
                 if client_code is not None:
+                    annotate(judge_retry_planned=False, retry_reason="non_retryable_http")
                     raise RuntimeError(
                         f"judge request rejected with HTTP {client_code} (client error, not retryable): {exc}"
                     ) from exc
                 if attempt >= JUDGE_RETRY_ATTEMPTS:
+                    annotate(judge_retry_planned=False, retry_reason="retry_exhausted")
                     break
-                if self._wait(self._retry_delay(exc, attempt)):
+                delay = self._retry_delay(exc, attempt)
+                annotate(
+                    judge_retry_planned=True,
+                    judge_backoff_seconds=delay,
+                    retry_reason="retryable_request_error",
+                )
+                backoff_started = time.perf_counter()
+                cancelled_backoff = self._wait(delay)
+                annotate(
+                    judge_backoff_elapsed_ms=(time.perf_counter() - backoff_started) * 1000,
+                    judge_backoff_cancelled=bool(cancelled_backoff),
+                )
+                if cancelled_backoff:
                     raise RunCancelledError("cancelled while retrying Judge request") from exc
         raise RuntimeError(
             f"judge request failed after {JUDGE_RETRY_ATTEMPTS} attempts: {last_error}"

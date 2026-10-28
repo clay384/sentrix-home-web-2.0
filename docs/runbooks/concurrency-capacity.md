@@ -262,3 +262,12 @@ judge_completed 计数包含 completed 和 failed，不能当作成功评分数�
 ## 本次隔离部署的服务回滚
 
 100、118、123模型服务及200独立应用的操作目录、身份核验、停止确认和旧服务恢复顺序见[隔离部署回滚](2026-10-27-capacity-rollback.md)。成功交付保留新vLLM，100的WeMM保持停止；数据、结果和未知请求证据不随服务回滚删除。153主服务不在本轮写入范围。
+
+
+### 可选 Judge HTTP 尝试证据
+
+仅在新启动的 PhotoBench 环境设置 `PHOTOBENCH_JUDGE_HTTP_ATTEMPT_EVIDENCE=1` 开启。默认关闭；`qa_eval.judge_requests.http_attempt_evidence_enabled` 记录开关状态。开启后同一运行的 `http_attempts` 保留成功和失败尝试，并沿现有进度快照提供运行中的证据。使用不支持此可选能力的 HTTP 客户端时，`http_attempt_evidence_supported=false`，请求仍按原方式执行。
+
+证据只包含尝试索引、请求分组、开始/结束时间、HTTP 状态、异常类、实际选择的退避及取消状态，以及校验后的 `error.code/type`、数字或 HTTP 日期形式的 `Retry-After` 和数值限流头。错误标识必须是短标识符，且不能回显请求正文或认证头中的值；不保存自由错误消息、URL、请求头、提示词或响应正文。供应商 request ID 不额外记录。已有请求体、评分、重试次数、限速和成功 `raw_response` 不变；HTTP 日期形式的 `Retry-After` 仅记录，现有重试逻辑仍只解析数字形式。连接建立重试会形成独立 transport attempt，不能将缺少 HTTP 状态的尝试冒称为供应商已接收的请求。
+
+容量报告必须注明观测开关与同机辅助测试窗口，避免将不同观测配置或辅助负载混为同一容量结论。

@@ -31,17 +31,22 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import math
 import mimetypes
+import re
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from datetime import UTC
+from email.utils import format_datetime, parsedate_to_datetime
 from typing import Any
 
 import httpx
 
 from photobench.domain.errors import RequestOutcomeUnknownError
-from photobench.domain.http.ports import HttpStream
+from photobench.domain.http.ports import HttpAttemptObserver, HttpStream
 
 _RETRYABLE = (
     httpx.ConnectError,
@@ -54,6 +59,84 @@ _RETRYABLE = (
 )
 _RETRIES = 3
 _RETRY_BACKOFF_S = 0.2
+
+
+_RATE_HEADERS = (
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-tokens",
+    "x-ratelimit-limit-rpm",
+    "x-ratelimit-limit-tpm",
+    "ratelimit-limit",
+    "ratelimit-remaining",
+    "ratelimit-reset",
+)
+
+
+def _safe_response_evidence(
+    response: httpx.Response, content: bytes | None, headers: Mapping[str, str] | None
+) -> dict[str, Any]:
+    """Identifiers/numbers only: never exception prose, request/response bodies or credentials."""
+    result: dict[str, Any] = {}
+    sensitive = [(content or b"").decode(errors="replace").casefold()]
+    sensitive.extend(str(v).casefold() for v in (headers or {}).values())
+
+    def identifier(value: Any) -> str | None:
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,95}", value):
+            return None
+        # A provider may echo a private identifier from the request into error.code/type.
+        if any(value.casefold() in text for text in sensitive):
+            return None
+        return value
+
+    def number(value: str) -> float | None:
+        if not re.fullmatch(r"[0-9]{1,16}(?:\.[0-9]{1,6})?", value):
+            return None
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
+
+    retry_after = response.headers.get("Retry-After", "").strip()
+    if retry_after:
+        seconds = number(retry_after)
+        if seconds is not None:
+            result["retry_after"] = seconds
+        elif len(retry_after) <= 40:
+            try:
+                date = parsedate_to_datetime(retry_after)
+                if date.tzinfo is not None:
+                    result["retry_after"] = format_datetime(date.astimezone(UTC), usegmt=True)
+            except (TypeError, ValueError, OverflowError):
+                pass
+    rate_headers = {}
+    for name in _RATE_HEADERS:
+        raw = response.headers.get(name, "").strip()
+        value = number(raw)
+        if value is not None:
+            rate_headers[name] = value
+    if rate_headers:
+        result["rate_limit_headers"] = rate_headers
+    if response.status_code >= 400 and len(response.content) <= 65536:
+        try:
+            parsed = response.json()
+            error = parsed.get("error") if isinstance(parsed, dict) else None
+            if isinstance(error, dict):
+                for key in ("code", "type"):
+                    identifier_value = identifier(error.get(key))
+                    if identifier_value is not None:
+                        result["provider_error_" + key] = identifier_value
+        except (ValueError, UnicodeDecodeError):
+            pass
+    return result
+
+
+def _notify_attempt(observer: HttpAttemptObserver | None, evidence: Mapping[str, Any]) -> None:
+    if observer is not None:
+        # Diagnostics cannot turn a successful HTTP call into an error or trigger a retry.
+        with contextlib.suppress(Exception):
+            observer(dict(evidence))
 
 
 def build_multipart(fields: Mapping[str, str], files: Sequence[tuple[str, str, bytes]]) -> tuple[bytes, str]:
@@ -148,14 +231,48 @@ class HttpxJsonClient:
         content: bytes | None = None,
         headers: Mapping[str, str] | None = None,
         timeout: int = 120,
+        attempt_observer: HttpAttemptObserver | None = None,
     ) -> httpx.Response:
         """Only connection establishment failures are safe to retry for POST."""
         deadline = self._clock() + timeout
         for attempt in range(_RETRIES):
             budget = timeout if attempt == 0 else deadline - self._clock()
+            evidence: dict[str, Any] = (
+                {
+                    "transport_attempt": attempt + 1,
+                    "started_at": time.time(),
+                    "started_monotonic": self._clock(),
+                    "finished_at": None,
+                    "http_status": None,
+                    "exception_class": None,
+                }
+                if attempt_observer is not None
+                else {}
+            )
+            _notify_attempt(attempt_observer, evidence)
             try:
-                return self._client.request(method, url, content=content, headers=headers, timeout=budget)
+                response = self._client.request(method, url, content=content, headers=headers, timeout=budget)
+                if attempt_observer is not None:
+                    evidence.update(
+                        finished_at=time.time(),
+                        elapsed_ms=(self._clock() - evidence["started_monotonic"]) * 1000,
+                        http_status=response.status_code,
+                        exception_class="HTTPStatusError" if response.is_error else None,
+                    )
+                    try:
+                        evidence.update(_safe_response_evidence(response, content, headers))
+                    except Exception:
+                        evidence["metadata_unavailable"] = True
+                    _notify_attempt(attempt_observer, evidence)
+                return response
             except _RETRYABLE as exc:
+                if attempt_observer is not None:
+                    evidence.update(
+                        finished_at=time.time(),
+                        elapsed_ms=(self._clock() - evidence["started_monotonic"]) * 1000,
+                        exception_class=type(exc).__name__,
+                    )
+                    _notify_attempt(attempt_observer, evidence)
                 safe = method.upper() in {"GET", "HEAD"} or isinstance(
                     exc, (httpx.ConnectError, httpx.ConnectTimeout)
                 )
@@ -171,7 +288,21 @@ class HttpxJsonClient:
                     or remaining <= _RETRY_BACKOFF_S * (attempt + 1)
                 ):
                     raise
+                if attempt_observer is not None:
+                    evidence.update(
+                        transport_retry=True, transport_backoff_seconds=_RETRY_BACKOFF_S * (attempt + 1)
+                    )
+                    _notify_attempt(attempt_observer, evidence)
                 self._sleep(_RETRY_BACKOFF_S * (attempt + 1))
+            except Exception as exc:
+                if attempt_observer is not None:
+                    evidence.update(
+                        finished_at=time.time(),
+                        elapsed_ms=(self._clock() - evidence["started_monotonic"]) * 1000,
+                        exception_class=type(exc).__name__,
+                    )
+                    _notify_attempt(attempt_observer, evidence)
+                raise
         raise AssertionError("bounded retry exhausted")
 
     def request_json(
@@ -182,12 +313,37 @@ class HttpxJsonClient:
         timeout: int = 120,
         extra_headers: Mapping[str, str] | None = None,
     ) -> Any:
+        return self._request_json(url, payload, method, timeout, extra_headers, None)
+
+    def request_json_observed(
+        self,
+        url: str,
+        payload: Mapping[str, Any] | None = None,
+        method: str = "GET",
+        timeout: int = 120,
+        extra_headers: Mapping[str, str] | None = None,
+        *,
+        observer: HttpAttemptObserver,
+    ) -> Any:
+        return self._request_json(url, payload, method, timeout, extra_headers, observer)
+
+    def _request_json(
+        self,
+        url: str,
+        payload: Mapping[str, Any] | None,
+        method: str,
+        timeout: int,
+        extra_headers: Mapping[str, str] | None,
+        observer: HttpAttemptObserver | None,
+    ) -> Any:
         content = None if payload is None else json.dumps(payload, ensure_ascii=False).encode()
         headers = {"Content-Type": "application/json"}
         headers.update(extra_headers or {})
         # 连接错误重试统一由 _request 处理；POST 的不确定结果由 RequestOutcomeUnknownError 表达。
         try:
-            response = self._request(method, url, content=content, headers=headers, timeout=timeout)
+            response = self._request(
+                method, url, content=content, headers=headers, timeout=timeout, attempt_observer=observer
+            )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             response = exc.response
