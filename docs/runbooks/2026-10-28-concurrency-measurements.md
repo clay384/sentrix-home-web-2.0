@@ -89,7 +89,11 @@ d4 已因 `judge_failed` 停止派发，最终 cancelled，**不具容量资格*
 
 只对 item 50 已知六次拒绝的 task 子 Judge 发起一次新的 derived attempt，原 payload SHA256 为 `2760ea6761e85c7e2ee08d20be82cff650299231edb86855f286ba366f30b7db`。实际 1 次 HTTP 200，耗时 1.729 s，无 429，协议正常完成。原 d4 的质量 0 分和未知 item 52 均未修改或重发；这不是原 run 的恢复，也不是容量通过或正式模型总成绩。
 
-内网证据 `evidence/derived-task-judge-single-6ac108974256479fa562fb6d0d06ced7/summary.json`，实算 SHA256 `367bf82e95ff291744fe7e922a8c61e9bed58d439dc3cc981bf4617f8a8a9dc1`。后续独立 32-case Judge-only 负载实验尚未派发：计划间隔 2.0 s、item pool 4，32 cases / 38 turns / 基础 76 个 subscores，另可能有一致性重问及重试；不能算作 32 个 HTTP 请求，也不记为已运行或成功。
+内网证据 `evidence/derived-task-judge-single-6ac108974256479fa562fb6d0d06ced7/summary.json`，实算 SHA256 `367bf82e95ff291744fe7e922a8c61e9bed58d439dc3cc981bf4617f8a8a9dc1`。独立 Judge-only 实验 `judge-only-i2-c4-32-86e36566291f42b3962398fb84b5212c` 已完成：32/32 cases、38 turns；基础 76 个 subscores 对应实际 76 个 HTTP 请求，全部 200，429、重试、unknown 和额外一致性请求均为 0。总耗时 152.51674 s；实际派发间隔 min / median / max 为 1.997209 / 2.000005 / 2.002890 s，HTTP 在途峰值 2，最终队列 0。HTTP 区间 11:20:15–11:22:48 UTC，没有 full CI 竞争。
+
+这是单批、单进程/run 内限速结果，未测跨客户端共享账户的 global 配额或最大并发。建议下一轮单客户端真实 QA 先采用 `PHOTOBENCH_JUDGE_REQUEST_INTERVAL_SECONDS=2.0`、`PHOTOBENCH_JUDGE_HTTP_ATTEMPT_EVIDENCE=1`、Judge 池 4；这是测量配置，不改变产品对所有 provider 的默认设置，也不构成尚未运行的下一轮 QA 成绩。
+
+内网最终审计 `evidence/judge-only-i2-c4-32-86e36566291f42b3962398fb84b5212c/final-audit.json` SHA256 `5e349e5a2e3faff404a1180f0184f43059ebe733c1e34fed0cee7d622de20ca2`；summary SHA256 `3f3df602cbf7b4240e4e5a3e7145fcfaf937001c74f7d09caf5ba8e6bb7c0734`。
 
 200 的只读命令：
 `repo/.venv/bin/python runtime/read_capacity_status.py --round <round-name> --live`。
