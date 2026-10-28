@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 import pytest
+from PIL import Image
 
 from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
@@ -188,7 +189,7 @@ class ScriptedObserver(OpenAIVlmObserver):
 @pytest.fixture
 def image(tmp_path):
     path = tmp_path / "a.jpg"
-    path.write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
+    Image.new("RGB", (12, 8), "red").save(path, format="JPEG")
     return path
 
 
@@ -467,7 +468,7 @@ def test_shared_json_protocol_preserves_inspection_image_order_and_person_appear
     from sentrix.infrastructure.media.photo_inspector import OpenAIPhotoInspector
 
     crop = tmp_path / "crop.jpg"
-    crop.write_bytes(b"synthetic-crop")
+    Image.new("RGB", (6, 4), "blue").save(crop, format="JPEG")
     _Endpoint.reply = {
         "choices": [
             {

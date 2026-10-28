@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from PIL import Image
 
 from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.media.inspection import (
@@ -95,14 +96,14 @@ def _b64(payload: bytes) -> str:
 @pytest.fixture
 def photo(tmp_path: Path) -> Path:
     path = tmp_path / "photo.jpg"
-    path.write_bytes(b"\xff\xd8\xff\xe0full-photo")
+    Image.new("RGB", (12, 8), "red").save(path, format="JPEG")
     return path
 
 
 @pytest.fixture
 def crop(tmp_path: Path) -> Path:
     path = tmp_path / "crop.jpg"
-    path.write_bytes(b"\xff\xd8\xff\xe0person-crop")
+    Image.new("RGB", (6, 4), "blue").save(path, format="JPEG")
     return path
 
 
@@ -230,8 +231,8 @@ def test_the_crop_is_sent_before_the_photo(photo: Path, crop: Path) -> None:
     inspector.inspect(str(photo), QUESTION, target_person="爸爸", crop=str(crop))
 
     assert len(inspector.images[0]) == 2
-    assert inspector.images[0][0].endswith(_b64(b"\xff\xd8\xff\xe0person-crop"))
-    assert inspector.images[0][1].endswith(_b64(b"\xff\xd8\xff\xe0full-photo"))
+    assert inspector.images[0][0].endswith(_b64(crop.read_bytes()))
+    assert inspector.images[0][1].endswith(_b64(photo.read_bytes()))
 
 
 def test_without_a_crop_only_the_photo_is_sent(photo: Path) -> None:
@@ -240,7 +241,7 @@ def test_without_a_crop_only_the_photo_is_sent(photo: Path) -> None:
     inspector.inspect(str(photo), QUESTION)
 
     assert len(inspector.images[0]) == 1
-    assert inspector.images[0][0].endswith(_b64(b"\xff\xd8\xff\xe0full-photo"))
+    assert inspector.images[0][0].endswith(_b64(photo.read_bytes()))
 
 
 def test_an_unreadable_crop_falls_back_to_the_photo_alone(photo: Path, tmp_path: Path) -> None:
@@ -344,8 +345,8 @@ def test_the_wire_body_carries_the_question_and_two_image_blocks(
     assert QUESTION in content[0]["text"]
     assert FACE_MANIFEST_PREFIX_1_0 in content[0]["text"]
     assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
-    assert content[1]["image_url"]["url"].endswith(_b64(b"\xff\xd8\xff\xe0person-crop"))
-    assert content[2]["image_url"]["url"].endswith(_b64(b"\xff\xd8\xff\xe0full-photo"))
+    assert content[1]["image_url"]["url"].endswith(_b64(crop.read_bytes()))
+    assert content[2]["image_url"]["url"].endswith(_b64(photo.read_bytes()))
     # 模型名是**问端点要的**，不是写死的常量。
     assert body["model"] == "fake-vlm"
 
@@ -382,3 +383,56 @@ def test_the_observer_has_no_question_slot_which_is_why_this_port_exists() -> No
     """
     assert "{question}" not in _OBSERVE_PROMPT
     assert "{question}" in INSPECT_PROMPT
+
+
+@pytest.mark.parametrize("suffix", [".mp4", ".jpg", ".png"])
+def test_mp4_magic_never_becomes_image_url_or_discovers_model(tmp_path, suffix, monkeypatch):
+    path = tmp_path / ("not-an-image" + suffix)
+    path.write_bytes(bytes.fromhex("000000206674797069736f6d0000020069736f6d69736f32617663316d703431"))
+    inspector = ScriptedInspector({"observation": "must not be used"})
+
+    def no_discovery(*_args):
+        raise AssertionError("invalid media must fail before model discovery")
+
+    monkeypatch.setattr(ServedModel, "current", no_discovery)
+    with pytest.raises(ModelServiceError) as caught:
+        inspector.inspect(path, QUESTION)
+    assert caught.value.error_code == "request_configuration_invalid"
+    assert caught.value.request_policy["request_outcome_unknown"] is False
+    assert caught.value.request_policy["request_phase"] == "media_validation"
+    assert inspector.images == [] and inspector.prompts == []
+
+
+@pytest.mark.parametrize(
+    ("image_format", "mime"),
+    [
+        ("JPEG", "image/jpeg"),
+        ("PNG", "image/png"),
+        ("WEBP", "image/webp"),
+        ("GIF", "image/gif"),
+        ("BMP", "image/bmp"),
+        ("TIFF", "image/tiff"),
+    ],
+)
+def test_valid_image_magic_preserves_exact_bytes_and_actual_mime(tmp_path, image_format, mime):
+    # A misleading extension must not affect a valid image container's MIME.
+    path = tmp_path / "photo.unrelated"
+    Image.new("RGB", (12, 8), "red").save(path, format=image_format)
+    original = path.read_bytes()
+    inspector = ScriptedInspector({"observation": "fixture"})
+    inspector.inspect(path, QUESTION)
+    url = inspector.images[0][0]
+    assert url.startswith(f"data:{mime};base64,")
+    assert base64.b64decode(url.split(",", 1)[1]) == original
+    assert path.read_bytes() == original
+
+
+def test_corrupt_image_is_an_explicit_local_error_without_a_model_call(tmp_path):
+    path = tmp_path / "corrupt.jpg"
+    path.write_bytes(b"\xff\xd8\xff\xe0truncated-jpeg")
+    inspector = ScriptedInspector({"observation": "must not be used"})
+    with pytest.raises(ModelServiceError) as caught:
+        inspector.inspect(path, QUESTION)
+    assert caught.value.request_policy["input_error"] == "invalid_image_data"
+    assert caught.value.error_code != "provider_rejected"
+    assert inspector.images == []

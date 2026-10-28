@@ -20,7 +20,7 @@
 
 1. **图像不再下采样。** 1.0 的 ``analyze_person_moments`` 走 ``encode_vision_image``
    （``:1107-1125``：最长边 896、JPEG q90、``VISION_CORE_MAX_DIMENSION`` 可配），
-   ``VlmObserver`` 用的是 ``_encode_image``（原图字节、按后缀定 mime）。2.0 保持
+   ``VlmObserver`` 用的是 ``_encode_image``（保留原图字节、校验实际图片格式及 MIME）。2.0 保持
    ``_encode_image`` 这一条口径。``analyze_person_appearance`` 在 1.0 里**本来就不走**
    ``encode_vision_image``（``:1334-1336`` 直接读字节），这一条对它不构成差别。
 2. **``_core_vision_options`` 不搬**（1.0 ``:1097-1105`` 的 ``think`` / ``num_ctx`` /

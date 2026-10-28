@@ -14,17 +14,22 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from sentrix.application.assistant.tools import AssistantToolbox
 from sentrix.domain.assistant.result_set import ResultSet
 from sentrix.domain.identity.models import ENTITY_STATUS_CONFIRMED, FACE_VALIDITY_VERIFIED
 from sentrix.domain.media.models import Asset, AssetStatus, MediaType, Observation
+from sentrix.infrastructure.assistant.model_endpoint import ServedModel
+from sentrix.infrastructure.media.photo_inspector import OpenAIPhotoInspector
 from sentrix.infrastructure.persistence.repositories.assets import (
     SqliteAssetRepository,
     SqliteObservationRepository,
@@ -32,6 +37,7 @@ from sentrix.infrastructure.persistence.repositories.assets import (
 from sentrix.infrastructure.persistence.repositories.entities import SqliteEntityRepository
 from sentrix.infrastructure.persistence.repositories.faces import SqliteFaceRepository
 from sentrix.infrastructure.persistence.repositories.result_sets import SqliteResultSetRepository
+from sentrix.infrastructure.persistence.repositories.video import SqliteVideoRepository
 
 NOW = datetime(2026, 9, 30, 10, 0, tzinfo=UTC)
 SCOPE = "album-inspect"
@@ -158,6 +164,7 @@ def build(bundle, inspector, crops) -> AssistantToolbox:
         observations=bundle["observations"],
         photo_inspector=inspector,
         person_crops=crops,
+        video_repository=bundle.get("video_repository"),
     )
 
 
@@ -555,3 +562,177 @@ def test_operational_visual_error_reaches_tool_evidence_without_becoming_an_answ
     assert outcome.observation["operational_issue"]["request_policy"]["max_model_len"] == 262144
     assert outcome.model_visible["error"] == code
     assert "private provider response" not in str(outcome.model_visible)
+
+
+# Video parents are never image payloads. Tests use real SQLite lineage and real
+# JPEG bytes, with only the final model port replaced by a deterministic reply.
+def add_video_fixture(bundle, tmp_path, timestamps, *, video_id="video_fixture"):
+    original = tmp_path / f"{video_id}.mp4"
+    original.write_bytes(bytes.fromhex("000000206674797069736f6d0000020069736f6d69736f32617663316d703431"))
+
+    def asset(asset_id, path, media_type, **lineage):
+        return Asset(
+            id=asset_id,
+            scope_id=SCOPE,
+            file_name=path.name,
+            media_type=media_type,
+            path=str(path),
+            mime_type="video/mp4" if media_type is MediaType.VIDEO else "image/jpeg",
+            size_bytes=path.stat().st_size,
+            status=AssetStatus.PROCESSED,
+            content_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            captured_at=NOW,
+            captured_location=None,
+            created_at=NOW,
+            updated_at=NOW,
+            **lineage,
+        )
+
+    bundle["assets"].add(asset(video_id, original, MediaType.VIDEO))
+    videos = SqliteVideoRepository(bundle["db"])
+    frames = []
+    for i, timestamp in enumerate(timestamps):
+        path = tmp_path / f"{video_id}-frame{i}.jpg"
+        Image.new("RGB", (12, 8), (i * 60, 20, 30)).save(path, format="JPEG")
+        row = asset(
+            f"{video_id}_frame{i}",
+            path,
+            MediaType.IMAGE,
+            parent_asset_id=video_id,
+            derived_kind="video_keyframe",
+            source_timestamp_sec=timestamp,
+        )
+        videos.add_derived(
+            parent_asset_id=video_id,
+            asset=row,
+            derived_kind="video_keyframe",
+            source_timestamp_sec=timestamp,
+            source_frame_index=i,
+            source_scene_index=i,
+        )
+        frames.append(row)
+    rs_id = f"rs_{video_id}"
+    bundle["result_sets"].add(
+        ResultSet(id=rs_id, scope_id=SCOPE, query="video fixture", asset_ids=(video_id,), created_at=NOW)
+    )
+    bundle["video_repository"] = videos
+    return original, frames, rs_id
+
+
+def test_video_parent_uses_its_only_persisted_jpeg_without_sending_mp4(bundle, tmp_path, monkeypatch):
+    original, frames, rs_id = add_video_fixture(bundle, tmp_path, [5.021])
+    sent = []
+
+    def local_reply(self, prompt, images):
+        sent.append((prompt, list(images)))
+        return {"observation": "fixture observation", "certainty": "supported"}
+
+    monkeypatch.setattr(OpenAIPhotoInspector, "_chat", local_reply)
+    inspector = OpenAIPhotoInspector("http://127.0.0.1:1/v1", ServedModel("http://127.0.0.1:1/v1"))
+    before = original.read_bytes()
+    outcome = run(bundle, inspector, RecordingCrops(), result_set_id=rs_id, question="采样画面里有什么？")
+    assert outcome.ok and len(sent) == 1
+    wire = sent[0][1]
+    assert len(wire) == 1 and wire[0].startswith("data:image/jpeg;base64,")
+    assert base64.b64decode(wire[0].split(",", 1)[1]) == Path(frames[0].path).read_bytes()
+    assert base64.b64decode(wire[0].split(",", 1)[1]) != before
+    assert original.read_bytes() == before
+    assert "单张采样帧" in sent[0][0] and "不能据此确认整段视频" in sent[0][0]
+    expected = {
+        "parent_video_asset_id": "video_fixture",
+        "keyframe_asset_id": frames[0].id,
+        "source_timestamp_sec": 5.021,
+        "visual_coverage": "single_sampled_frame",
+        "whole_video_inspected": False,
+    }
+    assert outcome.observation["video_frame"] == expected
+    assert outcome.model_visible["video_frame"] == expected
+    assert outcome.observation["asset_id"] == "video_fixture"
+
+
+def test_video_without_persisted_frames_is_actionable_business_feedback(bundle, tmp_path):
+    _, _, rs_id = add_video_fixture(bundle, tmp_path, [])
+    inspector = RecordingInspector()
+    outcome = run(bundle, inspector, RecordingCrops(), result_set_id=rs_id, question="看看视频")
+    assert outcome.failure_reason == "video_keyframes_unavailable"
+    assert outcome.model_visible["available_keyframes"] == []
+    assert "operational_issue" not in outcome.observation
+    assert inspector.calls == []
+
+
+def test_multiple_video_frames_require_explicit_selection_not_an_arbitrary_frame(bundle, tmp_path):
+    _, frames, rs_id = add_video_fixture(bundle, tmp_path, [2.0, 8.0])
+    inspector = RecordingInspector()
+    outcome = run(bundle, inspector, RecordingCrops(), result_set_id=rs_id, question="看看视频")
+    assert outcome.failure_reason == "video_keyframe_selection_required"
+    assert outcome.model_visible["available_keyframes"] == [
+        {"keyframe_asset_id": frame.id, "source_timestamp_sec": frame.source_timestamp_sec}
+        for frame in frames
+    ]
+    assert outcome.model_visible["visual_coverage"] == "no_frame_inspected"
+    assert inspector.calls == []
+
+
+def test_selected_video_frame_retains_its_time_and_only_its_coverage(bundle, tmp_path):
+    _, frames, rs_id = add_video_fixture(bundle, tmp_path, [2.0, 8.0])
+    inspector = RecordingInspector()
+    outcome = run(
+        bundle,
+        inspector,
+        RecordingCrops(),
+        result_set_id=rs_id,
+        question="看看这一帧",
+        keyframe_asset_id=frames[1].id,
+    )
+    assert outcome.ok
+    assert inspector.calls[0]["path"] == frames[1].path
+    assert outcome.model_visible["video_frame"]["source_timestamp_sec"] == 8.0
+    assert outcome.model_visible["video_frame"]["keyframe_asset_id"] == frames[1].id
+    assert outcome.model_visible["video_frame"]["whole_video_inspected"] is False
+
+
+def test_keyframe_selection_cannot_escape_the_parent_video(bundle, tmp_path):
+    _, _, rs_id = add_video_fixture(bundle, tmp_path, [2.0])
+    _, outsiders, _ = add_video_fixture(bundle, tmp_path, [3.0], video_id="other_video")
+    inspector = RecordingInspector()
+    outcome = run(
+        bundle,
+        inspector,
+        RecordingCrops(),
+        result_set_id=rs_id,
+        question="看看这一帧",
+        keyframe_asset_id=outsiders[0].id,
+    )
+    assert outcome.failure_reason == "invalid_video_keyframe"
+    assert inspector.calls == []
+
+
+def test_persisted_frame_missing_file_is_explicit_configuration_failure(bundle, tmp_path):
+    _, frames, rs_id = add_video_fixture(bundle, tmp_path, [2.0])
+    Path(frames[0].path).unlink()
+    inspector = RecordingInspector()
+    outcome = run(bundle, inspector, RecordingCrops(), result_set_id=rs_id, question="看看这一帧")
+    issue = outcome.observation["operational_issue"]
+    assert issue["error_code"] == "request_configuration_invalid"
+    assert issue["request_outcome_unknown"] is False
+    assert inspector.calls == []
+
+
+def test_missing_video_repository_is_not_hidden_as_model_quality(bundle, tmp_path):
+    _, _, rs_id = add_video_fixture(bundle, tmp_path, [2.0])
+    bundle["video_repository"] = None
+    inspector = RecordingInspector()
+    outcome = run(bundle, inspector, RecordingCrops(), result_set_id=rs_id, question="看看这一帧")
+    assert outcome.observation["operational_issue"]["error_code"] == "request_configuration_invalid"
+    assert inspector.calls == []
+
+
+def test_video_frame_with_mp4_bytes_cannot_reach_the_chat_port(bundle, tmp_path, monkeypatch):
+    original, frames, rs_id = add_video_fixture(bundle, tmp_path, [2.0])
+    Path(frames[0].path).write_bytes(original.read_bytes())
+    sent = []
+    monkeypatch.setattr(OpenAIPhotoInspector, "_chat", lambda *args: sent.append(args))
+    inspector = OpenAIPhotoInspector("http://127.0.0.1:1/v1", ServedModel("http://127.0.0.1:1/v1"))
+    outcome = run(bundle, inspector, RecordingCrops(), result_set_id=rs_id, question="看看这一帧")
+    assert outcome.observation["operational_issue"]["error_code"] == "request_configuration_invalid"
+    assert sent == []

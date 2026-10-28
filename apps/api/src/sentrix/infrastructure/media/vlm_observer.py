@@ -41,6 +41,7 @@ HTTP 拒绝、超时、连接故障、输出截断或响应协议不完整同样
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import re
@@ -49,11 +50,13 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from PIL import Image
 
 from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.domain.media.models import MODEL_FACT_CONFIDENCE, ObservationFact
 from sentrix.domain.media.ports import ObservationSemantics
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
+from sentrix.infrastructure.media.image_io import ensure_heif_support
 from sentrix.infrastructure.media.json_output_contracts import (
     OBSERVATION_SCHEMA,
     matches_output_contract,
@@ -108,7 +111,36 @@ def _encode_image(path: Path) -> str | None:
     except OSError as error:
         log.warning("观察用的图片读不了: %s (%s)", path, error)
         return None
-    mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+    # Detect the actual image container, not its filename: MP4 bytes must never
+    # become an image/jpeg data URL. Validation does not resize or re-encode.
+    heif = payload[4:8] == b"ftyp" and payload[8:12] in (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1")
+    if heif and not ensure_heif_support():
+        raise ModelServiceError(
+            "本地 HEIF 图片解码器不可用；未发送模型请求。",
+            error_code="request_configuration_invalid",
+            request_policy={
+                "request_phase": "media_validation",
+                "request_outcome_unknown": False,
+                "input_error": "image_decoder_unavailable",
+            },
+        )
+    try:
+        with Image.open(io.BytesIO(payload)) as image:
+            image_format = image.format or ""
+            mime = Image.MIME.get(image_format) or {"HEIF": "image/heif"}.get(image_format)
+            if not mime or not mime.startswith("image/"):
+                raise ValueError("not an image container")
+            image.verify()
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as error:
+        raise ModelServiceError(
+            "输入不是可读取的图片或图片文件已损坏；未发送模型请求。",
+            error_code="request_configuration_invalid",
+            request_policy={
+                "request_phase": "media_validation",
+                "request_outcome_unknown": False,
+                "input_error": "invalid_image_data",
+            },
+        ) from error
     return f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
 
 

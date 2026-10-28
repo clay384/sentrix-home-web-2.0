@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from PIL import Image
 
 from sentrix.domain.identity.moments import PERSON_MOMENT_PROMPT
 from sentrix.domain.identity.portrait import PERSON_PORTRAIT_PROMPT
@@ -81,7 +82,7 @@ class ScriptedVision(OpenAIPersonVision):
 @pytest.fixture
 def image(tmp_path: Path) -> Path:
     path = tmp_path / "p.jpg"
-    path.write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
+    Image.new("RGB", (12, 8), "red").save(path, format="JPEG")
     return path
 
 

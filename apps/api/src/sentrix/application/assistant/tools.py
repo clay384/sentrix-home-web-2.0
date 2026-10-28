@@ -44,8 +44,8 @@ from sentrix.domain.assistant.result_set import ResultSet, ResultSetEntry
 from sentrix.domain.assistant.tools import MAX_DELIVERED_PHOTOS
 from sentrix.domain.identity.ports import FaceRepository, PersonCropRenderer
 from sentrix.domain.media.inspection import CERTAINTY_SUPPORTED
-from sentrix.domain.media.models import Observation
-from sentrix.domain.media.ports import AssetRepository, ObservationRepository, PhotoInspector
+from sentrix.domain.media.models import Asset, MediaType, Observation
+from sentrix.domain.media.ports import AssetRepository, ObservationRepository, PhotoInspector, VideoRepository
 from sentrix.domain.places.ports import AssetPlaceRepository
 from sentrix.domain.retrieval.fact_query import FactRejection
 
@@ -156,6 +156,45 @@ def _failure(reason: str, message: str) -> ToolOutcome:
     )
 
 
+def _inspection_runtime_failure(asset_id: str, error: ModelServiceError) -> ToolOutcome:
+    code = error.error_code or "provider_unavailable"
+    return ToolOutcome(
+        observation={
+            "asset_id": asset_id,
+            "failure_reason": code,
+            "operational_issue": {
+                "kind": code,
+                "error_code": code,
+                "http_status": error.http_status,
+                "request_policy": dict(error.request_policy),
+                "request_outcome_unknown": error.request_policy.get("request_outcome_unknown"),
+                "finish_reason": error.finish_reason,
+                "prompt_tokens": error.prompt_tokens,
+                "completion_tokens": error.completion_tokens,
+            },
+        },
+        model_visible={"error": code, "message": "图片模型调用受到运行限制，本次没有获得可用的复核结果。"},
+        failure_reason=code,
+        blocks=EvidenceType.VISUAL_OBSERVATION,
+    )
+
+
+def _video_frame_feedback(
+    parent_id: str, reason: str, message: str, choices: Sequence[Mapping[str, Any]]
+) -> ToolOutcome:
+    return ToolOutcome(
+        observation={"asset_id": parent_id, "failure_reason": reason},
+        model_visible={
+            "error": reason,
+            "message": message,
+            "parent_video_asset_id": parent_id,
+            "available_keyframes": list(choices),
+            "visual_coverage": "no_frame_inspected",
+        },
+        failure_reason=reason,
+    )
+
+
 def _clamp_limit(value: Any) -> int:
     try:
         parsed = int(value)
@@ -178,6 +217,7 @@ class AssistantToolbox:
         photo_inspector: PhotoInspector,
         person_crops: PersonCropRenderer,
         asset_places: AssetPlaceRepository | None = None,
+        video_repository: VideoRepository | None = None,
     ) -> None:
         self._retrieval = retrieval
         self._assets = assets
@@ -195,6 +235,7 @@ class AssistantToolbox:
         # 头肩裁剪件。裁剪走端口而不是在这里 import PIL——domain-purity 把 PIL 点名禁了。
         self._photo_inspector = photo_inspector
         self._crops = person_crops
+        self._videos = video_repository
 
     def execute(
         self,
@@ -640,6 +681,69 @@ class AssistantToolbox:
 
     # ---- inspect_photo ------------------------------------------------------
 
+    def _inspection_asset(self, asset: Asset, keyframe_id: str) -> tuple[Asset | None, ToolOutcome | None]:
+        if asset.media_type is MediaType.IMAGE:
+            if keyframe_id:
+                return None, _failure("keyframe_requires_video", "只有视频父资产需要指定 keyframe_asset_id。")
+            return asset, None
+        if asset.media_type is not MediaType.VIDEO:
+            return None, _failure("unsupported_inspection_media", "只能复核图片或视频的持久采样帧。")
+        if self._videos is None:
+            return None, _inspection_runtime_failure(
+                asset.id,
+                ModelServiceError(
+                    "视频关键帧查询服务未配置；未发送模型请求。",
+                    error_code="request_configuration_invalid",
+                    request_policy={"request_outcome_unknown": False, "request_phase": "media_validation"},
+                ),
+            )
+        frames = [
+            frame
+            for frame in self._videos.list_derived(asset.id)
+            if frame.media_type == "image"
+            and frame.derived_kind == "video_keyframe"
+            and frame.parent_asset_id == asset.id
+        ]
+        choices = [
+            {"keyframe_asset_id": frame.id, "source_timestamp_sec": frame.source_timestamp_sec}
+            for frame in frames
+        ]
+        selected = next((frame for frame in frames if frame.id == keyframe_id), None) if keyframe_id else None
+        if not frames:
+            return None, _video_frame_feedback(
+                asset.id,
+                "video_keyframes_unavailable",
+                "该视频没有已保存的关键帧，本次无法进行图片复核。",
+                choices,
+            )
+        if not keyframe_id and len(frames) == 1:
+            selected = frames[0]
+        if selected is None:
+            return None, _video_frame_feedback(
+                asset.id,
+                "video_keyframe_selection_required" if not keyframe_id else "invalid_video_keyframe",
+                "请从 available_keyframes 选择 keyframe_asset_id；一次只检查选中的采样帧，不代表整段视频。",
+                choices,
+            )
+        frame_asset = self._assets.get(selected.id)
+        if (
+            frame_asset is None
+            or frame_asset.scope_id != asset.scope_id
+            or frame_asset.media_type is not MediaType.IMAGE
+            or frame_asset.parent_asset_id != asset.id
+            or frame_asset.derived_kind != "video_keyframe"
+            or not Path(frame_asset.path).is_file()
+        ):
+            return None, _inspection_runtime_failure(
+                asset.id,
+                ModelServiceError(
+                    "已保存的关键帧文件或血缘不完整；未发送模型请求。",
+                    error_code="request_configuration_invalid",
+                    request_policy={"request_outcome_unknown": False, "request_phase": "media_validation"},
+                ),
+            )
+        return frame_asset, None
+
     def _inspect_photo(self, arguments: Mapping[str, Any], *, scope_id: str, question: str) -> ToolOutcome:
         """拿一个问题去复核一张照片。1.0 ``tools.py:2123-2267``。
 
@@ -690,11 +794,36 @@ class AssistantToolbox:
                 blocks=EvidenceType.VISUAL_OBSERVATION,
             )
 
+        selected, feedback = self._inspection_asset(
+            asset, str(arguments.get("keyframe_asset_id") or "").strip()
+        )
+        if feedback is not None:
+            return feedback
+        assert selected is not None
+        asset = selected
+        coverage: dict[str, Any] = {}
+        if asset.derived_kind == "video_keyframe" and asset.parent_asset_id:
+            coverage = {
+                "parent_video_asset_id": asset.parent_asset_id,
+                "keyframe_asset_id": asset.id,
+                "source_timestamp_sec": asset.source_timestamp_sec,
+                "visual_coverage": "single_sampled_frame",
+                "whole_video_inspected": False,
+            }
         asked = str(arguments.get("question") or "").strip() or DEFAULT_INSPECT_QUESTION
-        identities = self._faces.list_photo_identities(asset_id)
-        manifest = self._faces.list_face_manifest(asset_id)
+        inspection_question = asked
+        if coverage:
+            frame_time = (
+                f"{asset.source_timestamp_sec} 秒" if asset.source_timestamp_sec is not None else "未知源时间"
+            )
+            inspection_question = (
+                f"输入仅为视频在 {frame_time} 的单张采样帧，"
+                "观察范围仅限这一帧，不能据此确认整段视频。\n" + asked
+            )
+        identities = self._faces.list_photo_identities(asset.id)
+        manifest = self._faces.list_face_manifest(asset.id)
         described = sum(
-            1 for entry in self._observations.latest_people_snapshot(asset_id) if not entry.entity_id
+            1 for entry in self._observations.latest_people_snapshot(asset.id) if not entry.entity_id
         )
 
         target_person = str(arguments.get("target_person") or "").strip()
@@ -732,32 +861,13 @@ class AssistantToolbox:
         try:
             parsed = self._photo_inspector.inspect(
                 asset.path,
-                asked,
+                inspection_question,
                 faces=[dataclasses.asdict(row) for row in manifest],
                 target_person=target_person,
                 crop=crop_path,
             )
         except ModelServiceError as error:
-            code = error.error_code or "provider_unavailable"
-            issue = {
-                "kind": code,
-                "error_code": code,
-                "http_status": error.http_status,
-                "request_policy": dict(error.request_policy),
-                "request_outcome_unknown": error.request_policy.get("request_outcome_unknown"),
-                "finish_reason": error.finish_reason,
-                "prompt_tokens": error.prompt_tokens,
-                "completion_tokens": error.completion_tokens,
-            }
-            return ToolOutcome(
-                observation={"asset_id": asset_id, "operational_issue": issue, "failure_reason": code},
-                model_visible={
-                    "error": code,
-                    "message": "图片模型调用受到运行限制，本次没有获得可用的复核结果。",
-                },
-                failure_reason=code,
-                blocks=EvidenceType.VISUAL_OBSERVATION,
-            )
+            return _inspection_runtime_failure(asset_id, error)
         finally:
             # 临时件由调用方删（``render_person_crop`` 的契约）。
             if crop_path:
@@ -808,6 +918,7 @@ class AssistantToolbox:
                 "target_bbox": target_bbox,
                 "confirms_visual_only": not identities,
                 "unconfirmed_people_count": unconfirmed,
+                **({"video_frame": coverage} if coverage else {}),
             },
             model_visible={
                 "asset_handle": handle,
@@ -819,6 +930,7 @@ class AssistantToolbox:
                 "photo_identities": photo_identities,
                 "face_candidates": face_candidates,
                 "unconfirmed_people_count": unconfirmed,
+                **({"video_frame": coverage} if coverage else {}),
             },
         )
 
