@@ -307,6 +307,10 @@ def _turn_trace(session: _Session, planned: PlannerResult | None) -> Mapping[str
             if event.kind == "guard"
         ],
         "budget_events": [dict(event) for event in state.budget_events],
+        "faithfulness_review": {
+            "attempted": session.judged,
+            "skipped_for_model_step_budget": session.l2_skipped_for_step_budget,
+        },
         "budget": {
             "model_steps": state.model_steps,
             "tool_round_trips": state.tool_round_trips,
@@ -484,6 +488,7 @@ class _Session:
     search_returned_nothing: bool = False
     # 1.0 ``runtime.py:2759`` 的 ``l2_faithfulness_checked``：每问只评审一次。
     judged: bool = False
+    l2_skipped_for_step_budget: bool = False
     # 1.0 ``runtime.py:2786-2788`` 的 ``turn.l2_unverified`` / ``l2_unverified_reason``：
     # 这一次 final 曾被 L2 判过不实。**它是「放行时打标」那一半的依据**——见
     # ``_judge_answer`` 里发 ``l2_soft_release`` 的那一处。
@@ -771,6 +776,9 @@ class RunTurn:
                 state.finish(reason)
                 return self._stop(session, reason)
 
+            if state.needs_reserved_final():
+                return self._finalize_reserved_step(session, messages)
+
             state.model_steps += 1
             state.phase = ACTING
             self._publish(
@@ -819,6 +827,8 @@ class RunTurn:
                 # 「压缩就能救回来」的回合判成了模型故障。每次丢一整轮，所以这个循环
                 # 的步数上界就是历史里的往返数。
                 while True:
+                    if state.needs_reserved_final():
+                        return self._finalize_reserved_step(session, messages)
                     compacted = _drop_oldest_tool_round_trip(messages)
                     if compacted is None:
                         log.warning("提示词超预算，而历史里已经没有可压缩的工具往返: %s", error)
@@ -1274,7 +1284,13 @@ class RunTurn:
         observations = [
             record for record in state.records if record.tool != FINAL_ANSWER_TOOL and record.status == "ok"
         ]
-        if session.judged or not observations or not state.can_step():
+        if session.judged or not observations:
+            return False
+        if not state.can_step():
+            # Observational evidence, not an invented budget failure or a passed
+            # review. Existing L2 eligibility still requires an available step.
+            if state.profile.strict_model_step_budget:
+                session.l2_skipped_for_step_budget = True
             return False
         session.judged = True
         state.model_steps += 1
@@ -1529,8 +1545,46 @@ class RunTurn:
             detail=detail,
         )
 
-    def _force_final_once(self, session: _Session) -> str:
-        """**额外一次纯 final 调用**：让模型明确给出结论。失败返回空串。
+    def _finalize_reserved_step(self, session: _Session, messages: Sequence[ChatMessage]) -> str:
+        """Use the existing tool-free recovery request inside the shared limit.
+
+        No exhaustion event is emitted merely for reserving a final step. The
+        authored reply still goes through the ordinary answer gates; this does
+        not certify its content or create an extra model/review allowance.
+        """
+        state = session.state
+        state.phase = FINALIZING
+        try:
+            answer = self._force_final_once(session, require_reply=True)
+        except Exception as error:
+            return self._model_error_stop(session, error)
+        if not answer:
+            reason = (
+                TerminationReason.TIMEOUT
+                if not state.has_final_reserve()
+                else TerminationReason.STEP_BUDGET_EXHAUSTED
+            )
+            state.finish(reason)
+            return self._stop(session, reason, retry_final=False)
+        session.last_answer = answer
+        accepted = self._judge_answer(session, messages, answer)
+        if accepted is not None:
+            return accepted
+        # A real gate requested another answer after the final slot. Keep the
+        # original budget diagnosis rather than silently adding a 31st call.
+        state.record_budget_limit(
+            "step_budget_exhausted",
+            budget_name="max_steps",
+            used=state.model_steps,
+            limit=state.profile.max_steps,
+        )
+        state.finish(TerminationReason.STEP_BUDGET_EXHAUSTED)
+        return self._stop(session, TerminationReason.STEP_BUDGET_EXHAUSTED, retry_final=False)
+
+    def _force_final_once(self, session: _Session, *, require_reply: bool = False) -> str:
+        """复用纯文本 final 请求：native 计入共享预算，legacy 保留额外恢复。
+
+        ``require_reply`` 用于预算内收尾；传输或协议错误必须保留，不能吞成空回答。
 
         1.0 ``runtime.py:1590-1623``（定义）与 ``:2379-2387``（步数耗尽处调用）。
 
@@ -1569,10 +1623,28 @@ class RunTurn:
         ]
         try:
             reply = self._complete_recorded(session, messages, (), call_type="recovery")
-        except Exception:  # noqa: BLE001 —— 兜底里的兜底：它失败就落回固定文案
+        except Exception:  # noqa: BLE001 —— legacy recovery preserves its fallback behavior
+            if require_reply:
+                raise
             log.warning("强制收尾的模型调用失败，落回确定性兜底", exc_info=True)
             return ""
         text = (reply.content or "").strip()
+        if require_reply and (
+            not text or reply.wants_tools or reply.finish_reason != "stop" or _TEXTUAL_TOOL_CALL.search(text)
+        ):
+            error = ModelServiceError(
+                "模型没有返回可用的纯文本收尾（model_output_invalid）；未重试。",
+                error_code="model_output_invalid",
+                finish_reason=reply.finish_reason,
+                request_policy={**reply.request_policy, "request_outcome_unknown": False},
+            )
+            session.model_calls[-1].update(
+                status="error",
+                error_type=type(error).__name__,
+                error_code=error.error_code,
+                request_policy=dict(error.request_policy),
+            )
+            raise error
         # 这一问不带工具，模型本不该有理由写工具调用标记；真写了就当没答出来，
         # 落回 ``_stop`` 里那版已经存下的答案或确定性兜底。
         if not text or _TEXTUAL_TOOL_CALL.search(text):

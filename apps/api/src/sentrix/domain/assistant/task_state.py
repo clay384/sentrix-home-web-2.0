@@ -200,6 +200,20 @@ class TaskState:
         """
         return self.model_steps < self.profile.max_steps and self.wall_remaining() > 0
 
+    def needs_reserved_final(self) -> bool:
+        """Strict loops keep their last available model step for an authored answer.
+
+        A one-step profile cannot provide both exploration and finalization; it
+        keeps its existing explicit exhaustion behavior if the model asks a tool.
+        Planner remains separate; L2 and context recovery share model_steps.
+        """
+        return (
+            self.profile.strict_model_step_budget
+            and self.model_steps > 0
+            and self.model_steps + 1 == self.profile.max_steps
+            and self.can_step()
+        )
+
     def can_call_tool(self) -> bool:
         return (
             self.profile.max_tool_calls is None or self.tool_round_trips < self.profile.max_tool_calls

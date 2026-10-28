@@ -1744,7 +1744,7 @@ def test_native_multi_tool_calls_do_not_hide_a_28_call_cap(env):
     assert all(model.tool_sets)
 
 
-def test_native_thirty_steps_cannot_dispatch_an_extra_forced_final(env):
+def test_native_reserved_final_rejects_tools_without_dispatching_step31(env):
     _, turns, conversation, _ = env
     replies = [tool_call("search_memories", "search", query="海边")] + [
         tool_call("get_result_page", f"page{i}", result_set_id="rs_1", page=i + 2) for i in range(29)
@@ -1755,11 +1755,16 @@ def test_native_thirty_steps_cannot_dispatch_an_extra_forced_final(env):
     )
     turn_id = start(runner, conversation)
     result = runner.run(turn_id)
-    assert result.termination_reason is TerminationReason.STEP_BUDGET_EXHAUSTED
+    assert result.termination_reason is TerminationReason.MODEL_ERROR
     assert len(model.calls) == 30
     assert len(model.planner_calls) == 1
-    assert turns.get(turn_id).trace["budget"]["model_steps"] == 30
-    assert not any(c["call_type"] == "recovery" for c in turns.get(turn_id).trace["model_calls"])
+    trace = turns.get(turn_id).trace
+    assert trace["budget"]["model_steps"] == 30
+    assert trace["model_calls"][-1]["call_type"] == "recovery"
+    assert trace["model_calls"][-1]["error_code"] == "model_output_invalid"
+    assert model.tool_sets[-1] == []
+    assert trace["budget"]["tool_round_trips"] == 29
+    assert trace["budget_events"] == []
 
 
 def test_native_early_forced_final_uses_one_of_the_thirty_steps(env):
@@ -1808,7 +1813,7 @@ def test_late_final_answer_records_wall_limit_instead_of_hiding_it(env, monkeypa
     assert any(event["error_code"] == "time_limit" for event in turns.get(turn_id).trace["budget_events"])
 
 
-def test_native_context_recovery_cannot_bypass_the_model_step_budget(env):
+def test_native_reserved_final_context_rejection_cannot_bypass_the_budget(env):
     _, turns, conversation, _ = env
     model = ScriptedModel(
         [
@@ -1823,9 +1828,13 @@ def test_native_context_recovery_cannot_bypass_the_model_step_budget(env):
     )
     turn_id = start(runner, conversation)
     result = runner.run(turn_id)
-    assert result.termination_reason is TerminationReason.STEP_BUDGET_EXHAUSTED
+    assert result.termination_reason is TerminationReason.MODEL_ERROR
     assert len(model.calls) == 3
-    assert turns.get(turn_id).trace["budget"]["model_steps"] == 3
+    trace = turns.get(turn_id).trace
+    assert trace["budget"]["model_steps"] == 3
+    assert trace["model_calls"][-1]["call_type"] == "recovery"
+    assert trace["model_calls"][-1]["error_code"] == "context_limit"
+    assert model.tool_sets[-1] == []
 
 
 def test_explicit_search_cap_records_its_gate_even_if_model_later_answers(env):
@@ -1887,3 +1896,174 @@ def test_native_last_l2_step_records_only_a_budget_blocked_rewrite(env, unfaithf
         if unfaithful
         else []
     )
+
+
+# Reserved finalization is an offline state-machine contract, not a model-quality
+# simulation. Scripted replies never call a model endpoint or assign a score.
+def test_native_tool_loop_reserves_step30_for_normal_tool_free_final(env):
+    _, turns, conversation, _ = env
+    replies = (
+        [tool_call("search_memories", "search", query="海边")]
+        + [tool_call("get_result_page", f"page{i}", result_set_id="rs_1", page=i + 2) for i in range(28)]
+        + [final("现有记录不足以确认。")]
+    )
+    model = ScriptedModel(replies)
+    runner = native_runner(
+        env, model, StubToolbox({"search_memories": SEARCH_OK, "get_result_page": PAGE_OK})
+    )
+    turn_id = start(runner, conversation)
+    result = runner.run(turn_id)
+    trace = turns.get(turn_id).trace
+    assert result.answer == "现有记录不足以确认。"
+    assert result.termination_reason in {TerminationReason.ANSWERED, TerminationReason.ANSWERED_WITH_GAP}
+    assert len(model.planner_calls) == 1
+    assert len(model.calls) == 30 and len(model.judge_calls) == 0
+    assert all(model.tool_sets[:-1]) and model.tool_sets[-1] == []
+    assert trace["budget"]["model_steps"] == 30
+    assert trace["budget"]["tool_round_trips"] == 29
+    assert trace["budget_events"] == []
+    assert [c["call_type"] for c in trace["model_calls"]] == ["planner"] + ["agent"] * 29 + ["recovery"]
+    assert trace["model_calls"][-1]["step_id"] == "step_30"
+    assert trace["faithfulness_review"] == {
+        "attempted": False,
+        "skipped_for_model_step_budget": True,
+    }
+
+
+def test_native_context_retry_keeps_the_last_shared_slot_for_final(env):
+    _, turns, conversation, _ = env
+    model = ScriptedModel(
+        [
+            tool_call("search_memories", "search", query="海边"),
+            PromptTooLongError("fixture context limit", error_code="context_limit"),
+            final("现有记录不足以确认。"),
+            final("must not be requested"),
+        ]
+    )
+    runner = native_runner(env, model, StubToolbox({"search_memories": SEARCH_OK}), max_steps=3)
+    turn_id = start(runner, conversation)
+    result = runner.run(turn_id)
+    trace = turns.get(turn_id).trace
+    assert result.answer == "现有记录不足以确认。"
+    assert result.termination_reason in {TerminationReason.ANSWERED, TerminationReason.ANSWERED_WITH_GAP}
+    assert len(model.calls) == 3
+    assert trace["budget"]["model_steps"] == 3
+    assert [c["call_type"] for c in trace["model_calls"]] == ["planner", "agent", "agent", "recovery"]
+    assert trace["model_calls"][2]["error_code"] == "context_limit"
+    assert model.tool_sets[-1] == []
+    assert trace["budget_events"] == []
+
+
+def test_native_penultimate_l2_rewrite_uses_the_reserved_step30(env):
+    _, turns, conversation, _ = env
+    replies = (
+        [tool_call("search_memories", "search", query="海边")]
+        + [tool_call("get_result_page", f"page{i}", result_set_id="rs_1", page=i + 2) for i in range(26)]
+        + [final_call("这是你要的海边照片。", "photo_1", "photo_2"), final("现有记录不足以确认。")]
+    )
+    model = ScriptedModel(replies, judge=judge_reply(("fabrication", "fixture disagreement")))
+    runner = native_runner(
+        env,
+        model,
+        StubToolbox(
+            {"search_memories": SEARCH_OK, "get_result_page": PAGE_OK, FINAL_ANSWER_TOOL: DELIVER_OK}
+        ),
+    )
+    turn_id = start(runner, conversation)
+    result = runner.run(turn_id)
+    trace = turns.get(turn_id).trace
+    assert result.answer == "现有记录不足以确认。"
+    assert len(model.calls) == 29 and len(model.judge_calls) == 1
+    assert trace["budget"]["model_steps"] == 30
+    assert trace["model_calls"][-2]["call_type"] == "faithfulness"
+    assert trace["model_calls"][-1]["call_type"] == "recovery"
+    assert trace["model_calls"][-1]["step_id"] == "step_30"
+    assert model.tool_sets[-1] == []
+    assert trace["budget_events"] == []
+    assert trace["faithfulness_review"]["attempted"] is True
+    assert any(event.payload.get("possibly_fabricated") for event in turns.events_after(turn_id, 0))
+
+
+@pytest.mark.parametrize("max_steps", [0, 1])
+def test_native_insufficient_budget_stays_explicit_without_extra_final(env, max_steps):
+    _, turns, conversation, _ = env
+    model = ScriptedModel([tool_call("search_memories", "search", query="海边")])
+    runner = native_runner(env, model, StubToolbox({"search_memories": SEARCH_OK}), max_steps=max_steps)
+    turn_id = start(runner, conversation)
+    result = runner.run(turn_id)
+    trace = turns.get(turn_id).trace
+    assert result.termination_reason is TerminationReason.STEP_BUDGET_EXHAUSTED
+    assert len(model.calls) == max_steps
+    assert trace["budget"]["model_steps"] == max_steps
+    assert trace["budget_events"] == [
+        {
+            "error_code": "step_budget_exhausted",
+            "budget_name": "max_steps",
+            "used": max_steps,
+            "limit": max_steps,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        final(""),
+        final("<tool_call><function=search_memories>"),
+        ModelReply(content="partial", finish_reason="length"),
+    ],
+)
+def test_native_invalid_forced_final_is_protocol_failure(env, reply):
+    _, turns, conversation, _ = env
+    model = ScriptedModel([tool_call("search_memories", "search", query="海边"), reply])
+    runner = native_runner(env, model, StubToolbox({"search_memories": SEARCH_OK}), max_steps=2)
+    turn_id = start(runner, conversation)
+    result = runner.run(turn_id)
+    trace = turns.get(turn_id).trace
+    assert result.termination_reason is TerminationReason.MODEL_ERROR
+    assert len(model.calls) == 2
+    assert model.tool_sets[-1] == []
+    assert trace["model_calls"][-1]["error_code"] == "model_output_invalid"
+    assert trace["model_calls"][-1]["request_policy"]["request_outcome_unknown"] is False
+    assert trace["budget"]["model_steps"] == 2
+    assert trace["budget_events"] == []
+
+
+def test_native_unknown_forced_final_outcome_is_never_retried(env):
+    _, turns, conversation, _ = env
+    unknown = ModelServiceError(
+        "fixture transport outcome unknown",
+        error_code="provider_unavailable",
+        request_policy={"request_outcome_unknown": True},
+    )
+    model = ScriptedModel(
+        [tool_call("search_memories", "search", query="海边"), unknown, final("must not be requested")]
+    )
+    runner = native_runner(env, model, StubToolbox({"search_memories": SEARCH_OK}), max_steps=2)
+    turn_id = start(runner, conversation)
+    result = runner.run(turn_id)
+    trace = turns.get(turn_id).trace
+    assert result.termination_reason is TerminationReason.MODEL_ERROR
+    assert len(model.calls) == 2
+    assert trace["model_calls"][-1]["request_policy"]["request_outcome_unknown"] is True
+    assert trace["model_calls"][-1]["error_code"] == "provider_unavailable"
+    assert trace["budget"]["model_steps"] == 2
+    assert model.tool_sets[-1] == []
+
+
+def test_native_normal_completed_answer_before_boundary_keeps_l2(env):
+    _, turns, conversation, _ = env
+    model = ScriptedModel(
+        [tool_call("search_memories", "search", query="海边"), final_call("这是你要的海边照片。", "photo_1")]
+    )
+    runner = native_runner(
+        env, model, StubToolbox({"search_memories": SEARCH_OK, FINAL_ANSWER_TOOL: DELIVER_OK})
+    )
+    turn_id = start(runner, conversation)
+    result = runner.run(turn_id)
+    trace = turns.get(turn_id).trace
+    assert result.answer == "这是你要的海边照片。"
+    assert len(model.calls) == 2 and len(model.judge_calls) == 1
+    assert trace["budget"]["model_steps"] == 3
+    assert [c["call_type"] for c in trace["model_calls"]] == ["planner", "agent", "agent", "faithfulness"]
+    assert trace["budget_events"] == []
