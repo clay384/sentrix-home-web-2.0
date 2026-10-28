@@ -1,0 +1,169 @@
+{
+  "schema": "sentrix.shared-memory.public-manifest",
+  "schema_version": 1,
+  "artifact_version": "accepted-memory-v3",
+  "generated_at_utc": "2026-10-28T09:55:51.585764+00:00",
+  "acceptance": {
+    "data_artifact_accepted": true,
+    "basis": "explicit selected-cache assembly with declared historical derivations",
+    "workflow_completed": false,
+    "capacity_qualified": false,
+    "semantic_accuracy_gate": null,
+    "ordinary_model_content_errors": "retained as model-quality observations"
+  },
+  "integrity": {
+    "identity_file_sha256": "b19ce32c68513cf29908ced2c5909043bad0fbf334825a4dda7d6d6c244a76aa",
+    "identity_canonical_sha256": "bdeb971642500126cabc7ab310e934b437f9598b2b50e9e86572e8f8983ed317",
+    "snapshot_manifest_sha256": "b229cccf2f95528f1514e660018d4d319654b8d95725f7c2bd758c6cf4c2b4bc",
+    "snapshot_schema_version": 3,
+    "snapshot_file_count": 1452,
+    "file_inventory_canonical_sha256": "7f8807245a392da5b4c35f3f66036ab20070d34ed37972dbbcb02c82e8b5ed74",
+    "dataset_sha256": "ecc6c88611c29a1490f065936bb374b3c1f875bec2fe9ea577116a2a9717b1f6",
+    "selected_producer_identity_sha256": "0fe155f94fbb2ca43615b66238b01372a2096e4a8a2b898cf6d2441c9046feb4",
+    "source_revision": "e818be8fc3c12af1b7dbfdc31292e19e05c95aac",
+    "producer_source_manifest_sha256": "20937d7fc9ffdcc8af0a3c25427a0b648ce825834b995324868250119d556568",
+    "producer_code_group_sha256": {
+      "observations": "ccb0b1b599258f75ea4203ea4132b299190527ddb0fbfe0150ad0a6f74ed2630",
+      "vectors": "f13d9fed9e1f60bc3f0c0f0552095b31f95fb4e540864c7a3671d275e326293f",
+      "events_and_facts": "773b36e353892ba6ce298269193287fc9f907230e253b090850d02e77d906457",
+      "identity_and_portraits": "2ecf95e5f1de40b10cd1bae35bdb597524c218f0950835b42b0c9d3385a3b119",
+      "graph": "aeb649855b330ac7910b51fdc6c8a45fa57bbcaafdbc4e5640dc0ab39192c55f",
+      "video": "7a279323b61c02a3f3e627b6f8834fca875326aee30901ccb5c6c8a315009b1e",
+      "faces": "8543cc388d361e4fc1d3213812e7c368475b20f4a68817de0228173c5636c22f"
+    }
+  },
+  "compatibility": {
+    "memory_semantics_version": 1,
+    "schema_migration_contract": {
+      "format": "sqlite_migration_sql_v1",
+      "sha256": "c6db0b660270ba65848523955a7570acf71c43cdbd6340db23144b9a19235da1",
+      "migration_count": 14,
+      "versions": [
+        "0001",
+        "0002",
+        "0003",
+        "0004",
+        "0005",
+        "0006",
+        "0007",
+        "0008",
+        "0009",
+        "0010",
+        "0011",
+        "0012",
+        "0013",
+        "0014"
+      ],
+      "consumer_requirement": "Certified restore requires exact equality of the complete migration filename, version and SQL-hash set. Any added or deleted migration, or changed content under the same filename, must be rejected; use an isolated restored copy."
+    },
+    "embedding": {
+      "scheme": "legacy",
+      "identity_version": 1,
+      "text": {
+        "model": "BAAI/bge-m3",
+        "dimension": 1024,
+        "semantic_sha256": "6400aebfc0cfaa533036df8260f79e3d2e5880b67e68fde450c9c2823d1c3fb4",
+        "algorithm_sha256": "2b04d20edf6b8b636149a8c2177c244bb3378d6e2c77620ac1bbeea85e63a640"
+      },
+      "visual": {
+        "model": "ViT-L-14",
+        "dimension": 768,
+        "semantic_sha256": "230aa6dd0cbab71ffce74be6cc16fc8e78a15750bf964ea280be3d21aa6a85de",
+        "algorithm_sha256": "7f8a3f4b3e13fcb5f62966e24631e2313c97b244abeb0f6b400bace61ac777c5"
+      },
+      "consumer_requirement": "match embedding semantic identities, dimensions and preprocessing; service addresses are not compatibility keys"
+    },
+    "isolation": "each run restores its own SQLite and Qdrant copy; never share a writable active database"
+  },
+  "selected_producers": {
+    "kind": "composite_multiple_recorded_producers",
+    "single_engine_claimed": false,
+    "parent_model_manifest_sha256": "1209a7f49e22e0efd259c395b93e124a4978157a183967e60ef0198a254ec35e",
+    "parent_engine_identity_sha256": "1bfe3041738ddfc7d6f201772547aa9ea6448b929c300141495d6ae642a67560",
+    "repair_model_manifest_sha256": "4e2eab671048eee913075b7a2799ad77f28de794fba9962d7fd7c316c639be94",
+    "generation_policy_sha256": "7b5e77473bfb9041e1e8431ebf2ecb55d20417e187bb2ecdf19edfd4363986aa",
+    "output_budget": "native_remaining_context",
+    "max_model_len": 262144,
+    "input_derivation": {
+      "kind": "one source image orientation transpose for inference only",
+      "source_image_sha256": "924201ab2da9a1d8ddc1f1303e6dcb7847b6e05f094dbaa58f436320ffeec73f",
+      "derived_image_sha256": "c28c37f0dcc8efe14b0e5182354f9372a26d2bd2242eb75f32356f552b2a3875",
+      "overlay_sha256": "3d42c0e903d6bc12eada677a3cbb4ec90459f844b2f3a30bbd307b81403c59d7",
+      "derivation_sha256": "07b9f344471ee0d4792969fb0f48d5ed8a3db8d78825fade7e17254f0175f873",
+      "stored_source_unchanged": true,
+      "model_outputs_modified": false
+    },
+    "CPU_embeddings": "frozen legacy BGE and Chinese-CLIP; not attributed to the VLM",
+    "graph": "frozen deterministic projection of mixed-provenance selected data"
+  },
+  "counts": {
+    "original_sources": 344,
+    "scope_assets_processed": 362,
+    "observations": 362,
+    "events": 178,
+    "memory_vectors": 2092,
+    "visual_vectors_SQLite": 344,
+    "visual_points_Qdrant": 344,
+    "text_observation_vectors_expected": 688,
+    "graph_nodes": 7428,
+    "graph_edges": 16071,
+    "inherited_successful_source_observations": 343,
+    "new_target_source_observations": 1,
+    "completed_new_moment_requests": 65,
+    "new_moment_rows": 57,
+    "inherited_moment_rows": 2,
+    "cached_parent_portraits": 10
+  },
+  "cache_lineage": {
+    "selected_rows": "57 new moment rows from 65 completed requests plus 2 unchanged parent moment rows and 10 unchanged parent portraits",
+    "portrait_generation_dependencies": "immutable parent moment versions retained in private manifest",
+    "referenced_unique_moments": 25,
+    "referenced_moment_body_versions_changed": 23,
+    "source_evidence_anchor_changes": 0,
+    "portrait_full_row_hashes_unchanged": true,
+    "limitation": "23 currently referenced moment bodies differ from the historical versions used to generate cached portraits; dependency IDs and source evidence anchors remain valid; do not claim identical dependency bodies",
+    "family": "completed parent cache reused under unchanged evidence and valid existing event watermark"
+  },
+  "verification": {
+    "cold_status": "eligible_for_snapshot_with_declared_cached_derivations",
+    "cold_validation_sha256": "d1d694278442152af2d05433aaaf558af2f5d96ac4a1cd60cdf2f02ab19dee7f",
+    "selection_manifest_sha256": "e3d0aafc1d174c0a6fa139878aac2cbfd53ead14f31f7cf128acaaa2a3d113eb",
+    "approval_archive_index_sha256": "1f61b8a6a403aa1f3142f47424ab20d26f41084d58babf39e0bce54254642329",
+    "restore_status": "verified",
+    "restore_preflight_sha256": "ef77066329ef31e5053a73ba7986405511dd62c6531a6d5f63b7cb057360b1a3",
+    "restore_receipt_sha256": "c7a9f37480fa5dae689b858dbbd48aca92a64a2df23918686016e26d9d22d717",
+    "restore_migration_contract_sha256": "c6db0b660270ba65848523955a7570acf71c43cdbd6340db23144b9a19235da1",
+    "relocated_asset_count": 362,
+    "restore_scope": "persisted offline restore verification and bound receipt; no active database rehash performed for this public export",
+    "SQLite_integrity": [
+      "ok"
+    ],
+    "foreign_key_violations": 0,
+    "missing_or_changed_media": 0,
+    "invalid_vectors": 0,
+    "Qdrant_points_invalid_or_mismatched": 0,
+    "graph_projection_replayed_exactly": true,
+    "content_accuracy_checked": false
+  },
+  "retained_unsuccessful_evidence": {
+    "parent_build_outcome": "completed_with_errors",
+    "parent_unknown_requests": 1,
+    "whole_repair_RPC": "request_outcome_unknown",
+    "unselected_portrait_requests": 1,
+    "unselected_portrait_state": "dispatched_outcome_unknown",
+    "unknown_counted_as_completed": false,
+    "unselected_portrait_applied": false,
+    "resource_guard_outcome": "sustained_remote_swap_growth, followed by a coverage gap after guard exit",
+    "capacity_pass_claimed": false,
+    "resource_evidence_sha256": [
+      "f98d2247c4d7d4a576749b2146b9e6a811867084b1073428892e58824382e377",
+      "05bace02e08f82c82f228ab230b0a6e9c38fec2ef6dfcd39af1ff757b9724d9b"
+    ]
+  },
+  "availability": {
+    "data_entities_location": "company intranet only",
+    "retrieval": "obtain the private snapshot, complete inventory and producer evidence from the intranet custodian using the identity and snapshot manifest hashes above",
+    "actual_entities": "not embedded in this public manifest; obtain by hash",
+    "public_export_contains": "counts, compatibility conditions and digests only; no private file inventory, identities, media, prompts or answers"
+  }
+}
