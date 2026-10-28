@@ -45,8 +45,10 @@ from typing import Any
 
 import httpx
 
-from photobench.domain.errors import RequestOutcomeUnknownError
+from photobench.domain.errors import RequestOutcomeUnknownError, SharedJudgeGateError
 from photobench.domain.http.ports import HttpAttemptObserver, HttpStream
+from photobench.domain.runs.execution import RunCancelledError
+from photobench.infrastructure.http.shared_gate import SharedAccountGate
 
 _RETRYABLE = (
     httpx.ConnectError,
@@ -199,6 +201,7 @@ class HttpxJsonClient:
         keep_alive: bool = False,
         sleep: Callable[[float], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        shared_gate: SharedAccountGate | None = None,
     ) -> None:
         # **默认不保留 keep-alive 连接。** 2026-10-21 的 158 全流程里 131/487 题以
         # ``Server disconnected without sending a response`` / ``Bad file descriptor``
@@ -222,6 +225,8 @@ class HttpxJsonClient:
         self._retry_connections = retry_connections
         self._sleep = sleep or time.sleep
         self._clock = clock
+        self._shared_gate = shared_gate
+        self.shared_gate_enabled = shared_gate is not None
 
     def _request(
         self,
@@ -232,10 +237,44 @@ class HttpxJsonClient:
         headers: Mapping[str, str] | None = None,
         timeout: int = 120,
         attempt_observer: HttpAttemptObserver | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> httpx.Response:
         """Only connection establishment failures are safe to retry for POST."""
         deadline = self._clock() + timeout
         for attempt in range(_RETRIES):
+            lease = None
+            lease_finished = False
+            if self._shared_gate is not None:
+                waiting_started = time.perf_counter()
+                wait_budget_started = self._clock()
+                _notify_attempt(attempt_observer, {"event": "gate_wait_started"})
+                try:
+                    if method.upper() != "POST":
+                        raise SharedJudgeGateError("only_Judge_POST_supported")
+                    lease = self._shared_gate.acquire(
+                        url, (headers or {}).get("Authorization", ""), cancelled=cancelled or (lambda: False)
+                    )
+                except Exception as exc:
+                    _notify_attempt(
+                        attempt_observer,
+                        {
+                            "event": "gate_wait_finished",
+                            "gate_wait_ms": (time.perf_counter() - waiting_started) * 1000,
+                            "gate_error": type(exc).__name__,
+                        },
+                    )
+                    raise
+                deadline += self._clock() - wait_budget_started
+                _notify_attempt(
+                    attempt_observer,
+                    {
+                        "event": "gate_wait_finished",
+                        "gate_wait_ms": (time.perf_counter() - waiting_started) * 1000,
+                    },
+                )
+                if cancelled is not None and cancelled():
+                    self._shared_gate.finish(lease["lease_id"], "not_sent")
+                    raise RunCancelledError("cancelled after shared Judge permit before HTTP")
             budget = timeout if attempt == 0 else deadline - self._clock()
             evidence: dict[str, Any] = (
                 {
@@ -249,9 +288,19 @@ class HttpxJsonClient:
                 if attempt_observer is not None
                 else {}
             )
+            if lease is not None:
+                evidence.update(shared_gate=True, dispatch_started=True, gate_lease_id=lease["lease_id"])
             _notify_attempt(attempt_observer, evidence)
             try:
-                response = self._client.request(method, url, content=content, headers=headers, timeout=budget)
+                if self.shared_gate_enabled:
+                    # A redirect must not issue hidden HTTP requests outside the shared permits.
+                    response = self._client.request(
+                        method, url, content=content, headers=headers, timeout=budget, follow_redirects=False
+                    )
+                else:
+                    response = self._client.request(
+                        method, url, content=content, headers=headers, timeout=budget
+                    )
                 if attempt_observer is not None:
                     evidence.update(
                         finished_at=time.time(),
@@ -264,6 +313,17 @@ class HttpxJsonClient:
                     except Exception:
                         evidence["metadata_unavailable"] = True
                     _notify_attempt(attempt_observer, evidence)
+                if self._shared_gate is not None and lease is not None:
+                    lease_finished = True
+                    redirect = 300 <= response.status_code < 400
+                    self._shared_gate.finish(
+                        lease["lease_id"],
+                        "configuration_error" if redirect else "http_response",
+                        http_status=response.status_code,
+                    )
+                    if redirect:
+                        raise SharedJudgeGateError("redirect_requires_explicit_endpoint")
+                response.extensions["photobench_transport_attempt"] = attempt + 1
                 return response
             except _RETRYABLE as exc:
                 if attempt_observer is not None:
@@ -276,7 +336,10 @@ class HttpxJsonClient:
                 safe = method.upper() in {"GET", "HEAD"} or isinstance(
                     exc, (httpx.ConnectError, httpx.ConnectTimeout)
                 )
-                if self._retry_connections and not safe:
+                if self._shared_gate is not None and lease is not None:
+                    lease_finished = True
+                    self._shared_gate.finish(lease["lease_id"], "not_sent" if safe else "unknown")
+                if (self._retry_connections or self.shared_gate_enabled) and not safe:
                     raise RequestOutcomeUnknownError(
                         method=method, cause_type=type(exc).__name__, attempts=attempt + 1
                     ) from exc
@@ -295,6 +358,13 @@ class HttpxJsonClient:
                     _notify_attempt(attempt_observer, evidence)
                 self._sleep(_RETRY_BACKOFF_S * (attempt + 1))
             except Exception as exc:
+                if self._shared_gate is not None and lease is not None and not lease_finished:
+                    lease_finished = True
+                    self._shared_gate.finish(lease["lease_id"], "unknown")
+                if isinstance(exc, SharedJudgeGateError):
+                    _notify_attempt(
+                        attempt_observer, {"event": "gate_error", "gate_error": type(exc).__name__}
+                    )
                 if attempt_observer is not None:
                     evidence.update(
                         finished_at=time.time(),
@@ -313,7 +383,7 @@ class HttpxJsonClient:
         timeout: int = 120,
         extra_headers: Mapping[str, str] | None = None,
     ) -> Any:
-        return self._request_json(url, payload, method, timeout, extra_headers, None)
+        return self._request_json(url, payload, method, timeout, extra_headers, None, None)
 
     def request_json_observed(
         self,
@@ -324,8 +394,9 @@ class HttpxJsonClient:
         extra_headers: Mapping[str, str] | None = None,
         *,
         observer: HttpAttemptObserver,
+        cancelled: Callable[[], bool] | None = None,
     ) -> Any:
-        return self._request_json(url, payload, method, timeout, extra_headers, observer)
+        return self._request_json(url, payload, method, timeout, extra_headers, observer, cancelled)
 
     def _request_json(
         self,
@@ -335,6 +406,7 @@ class HttpxJsonClient:
         timeout: int,
         extra_headers: Mapping[str, str] | None,
         observer: HttpAttemptObserver | None,
+        cancelled: Callable[[], bool] | None,
     ) -> Any:
         content = None if payload is None else json.dumps(payload, ensure_ascii=False).encode()
         headers = {"Content-Type": "application/json"}
@@ -342,7 +414,13 @@ class HttpxJsonClient:
         # 连接错误重试统一由 _request 处理；POST 的不确定结果由 RequestOutcomeUnknownError 表达。
         try:
             response = self._request(
-                method, url, content=content, headers=headers, timeout=timeout, attempt_observer=observer
+                method,
+                url,
+                content=content,
+                headers=headers,
+                timeout=timeout,
+                attempt_observer=observer,
+                cancelled=cancelled,
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -350,7 +428,15 @@ class HttpxJsonClient:
             raise RuntimeError(
                 f"HTTP {response.status_code} {response.reason_phrase}: {_error_detail(response)}"
             ) from exc
-        return response.json()
+        try:
+            value = response.json()
+        except (ValueError, UnicodeDecodeError):
+            if self.shared_gate_enabled:
+                _notify_attempt(observer, {"event": "json_invalid"})
+            raise
+        if self.shared_gate_enabled:
+            _notify_attempt(observer, {"event": "json_valid"})
+        return value
 
     def request_bytes(self, url: str, timeout: int = 120) -> bytes:
         """1.0 ``:799``。**非 2xx 不做文案转换**——1.0 这一段没有 except，``HTTPError``

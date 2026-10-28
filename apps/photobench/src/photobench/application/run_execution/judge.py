@@ -33,8 +33,8 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from photobench.domain.errors import RequestOutcomeUnknownError
-from photobench.domain.http.ports import JsonHttpClient, ObservedJsonHttpClient
+from photobench.domain.errors import RequestOutcomeUnknownError, SharedJudgeGateError
+from photobench.domain.http.ports import JsonHttpClient, ObservedJsonHttpClient, SharedGateHttpClient
 from photobench.domain.runs.analysis import (
     JUDGE_CONSISTENCY_VERSION,
     judge_score_consistency,
@@ -128,6 +128,21 @@ def _judge_response_problem(raw: Any, payload: Mapping[str, Any]) -> dict[str, A
 
 
 def _judge_request_failure(exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, SharedJudgeGateError):
+        return {
+            "request_failure": exc.facts,
+            "operational_issue": {
+                "version": 1,
+                "scope": "judge",
+                "kind": "configuration_error",
+                "evidence": {
+                    "source": "shared_judge_gate",
+                    "field": "gate",
+                    "error_code": exc.facts["code"],
+                    "request_outcome_unknown": False,
+                },
+            },
+        }
     if not isinstance(exc, RequestOutcomeUnknownError):
         return {}
     result: dict[str, Any] = {"request_failure": exc.facts}
@@ -207,6 +222,9 @@ class JudgeRunner:
         )
         self._http_attempts: list[dict[str, Any]] = []
         self._http_request_groups = 0
+        self.shared_gate_enabled = isinstance(http, SharedGateHttpClient) and http.shared_gate_enabled
+        if self.shared_gate_enabled and not isinstance(http, ObservedJsonHttpClient):
+            raise SharedJudgeGateError("observed_transport_required")
         #: 限流锁与下一次可发时刻。惰性创建（1.0 也是第一次用到才建）。
         self._rate_lock = threading.Lock()
         self._next_request_at = 0.0
@@ -220,6 +238,9 @@ class JudgeRunner:
             "in_flight": 0,
             "rate_waiting": 0,
             "rate_wait_ms": 0.0,
+            "gate_waiting": 0,
+            "gate_wait_ms": 0.0,
+            "gate_failures": 0,
         }
 
     def request_metrics(self) -> dict[str, Any]:
@@ -227,6 +248,7 @@ class JudgeRunner:
         with self._metrics_lock:
             result: dict[str, Any] = dict(self._request_metrics)
             result["http_attempt_evidence_enabled"] = self.http_attempt_evidence
+            result["shared_gate_enabled"] = self.shared_gate_enabled
             if self.http_attempt_evidence:
                 result["http_attempt_evidence_supported"] = isinstance(self.http, ObservedJsonHttpClient)
                 result["http_attempts"] = copy.deepcopy(self._http_attempts)
@@ -319,16 +341,54 @@ class JudgeRunner:
         for attempt in range(1, JUDGE_RETRY_ATTEMPTS + 1):
             positions: dict[int, int] = {}
             request_index = [0]
+            transport_done: set[int] = set()
+            gate_error_seen = [False]
 
             def observe(
                 metadata: Mapping[str, Any],
                 positions: dict[int, int] = positions,
                 request_index: list[int] = request_index,
                 judge_attempt: int = attempt,
+                transport_done: set[int] = transport_done,
+                gate_error_seen: list[bool] = gate_error_seen,
             ) -> None:
+                event = metadata.get("event")
+                if self.shared_gate_enabled:
+                    if event == "gate_wait_started":
+                        self._request_metric("gate_waiting")
+                        return
+                    if event == "gate_wait_finished":
+                        self._request_metric("gate_waiting", -1)
+                        self._request_metric("gate_wait_ms", float(metadata.get("gate_wait_ms", 0)))
+                        if metadata.get("gate_error") and metadata["gate_error"] != "RunCancelledError":
+                            self._request_metric("gate_failures")
+                            gate_error_seen[0] = True
+                        return
+                    if event == "gate_error":
+                        self._request_metric("gate_failures")
+                        gate_error_seen[0] = True
+                        return
+                    if event == "json_valid":
+                        self._request_metric("responses_received")
+                        return
+                    if event == "json_invalid":
+                        self._request_metric("request_errors")
+                        return
                 transport = metadata.get("transport_attempt")
                 if type(transport) is not int or transport < 1:
                     return
+                if self.shared_gate_enabled:
+                    if metadata.get("dispatch_started") and transport not in positions:
+                        request_index[0] = int(self._request_metric("requests_started"))
+                        self._request_metric("in_flight")
+                    if metadata.get("finished_at") is not None and transport not in transport_done:
+                        transport_done.add(transport)
+                        self._request_metric("in_flight", -1)
+                        status = metadata.get("http_status")
+                        if metadata.get("exception_class") or (isinstance(status, int) and status >= 300):
+                            self._request_metric("request_errors")
+                            if status == 429:
+                                self._request_metric("http_429")
                 allowed = {
                     "transport_attempt",
                     "started_at",
@@ -344,6 +404,8 @@ class JudgeRunner:
                     "transport_retry",
                     "transport_backoff_seconds",
                     "metadata_unavailable",
+                    "shared_gate",
+                    "gate_lease_id",
                 }
                 with self._metrics_lock:
                     if transport not in positions:
@@ -377,10 +439,13 @@ class JudgeRunner:
                     self._request_metric("rate_wait_ms", (time.perf_counter() - wait_started) * 1000)
                 if self.cancel is not None and self.cancel.is_set():
                     raise RunCancelledError("cancelled before Judge request dispatch")
-                request_index[0] = int(self._request_metric("requests_started"))
-                self._request_metric("in_flight")
+                if not self.shared_gate_enabled:
+                    request_index[0] = int(self._request_metric("requests_started"))
+                    self._request_metric("in_flight")
                 try:
-                    if self.http_attempt_evidence and isinstance(self.http, ObservedJsonHttpClient):
+                    if (self.http_attempt_evidence or self.shared_gate_enabled) and isinstance(
+                        self.http, ObservedJsonHttpClient
+                    ):
                         response = self.http.request_json_observed(
                             judge_chat_url(self.judge_url),
                             payload,
@@ -388,15 +453,26 @@ class JudgeRunner:
                             timeout,
                             self._headers(),
                             observer=observe,
+                            **(
+                                {
+                                    "cancelled": self.cancel.is_set
+                                    if self.cancel is not None
+                                    else (lambda: False)
+                                }
+                                if self.shared_gate_enabled
+                                else {}
+                            ),
                         )
                     else:
                         response = self.http.request_json(
                             judge_chat_url(self.judge_url), payload, "POST", timeout, self._headers()
                         )
                     annotate(judge_retry_planned=False)
-                    self._request_metric("responses_received")
+                    if not self.shared_gate_enabled:
+                        self._request_metric("responses_received")
                 except Exception as exc:
-                    self._request_metric("request_errors")
+                    if not self.shared_gate_enabled:
+                        self._request_metric("request_errors")
                     current: BaseException | None = exc
                     seen: set[int] = set()
                     while current is not None and id(current) not in seen:
@@ -405,13 +481,20 @@ class JudgeRunner:
                         if code is None:
                             code = getattr(getattr(current, "response", None), "status_code", None)
                         if code == 429:
-                            self._request_metric("http_429")
+                            if not self.shared_gate_enabled:
+                                self._request_metric("http_429")
                             break
                         current = current.__cause__ or current.__context__
                     raise
                 finally:
-                    self._request_metric("in_flight", -1)
+                    if not self.shared_gate_enabled:
+                        self._request_metric("in_flight", -1)
                 return response, attempt
+            except SharedJudgeGateError:
+                if not gate_error_seen[0]:
+                    self._request_metric("gate_failures")
+                annotate(judge_retry_planned=False, retry_reason="shared_gate_failed_closed")
+                raise
             except (RunCancelledError, RequestOutcomeUnknownError) as exc:
                 annotate(judge_retry_planned=False, retry_reason=type(exc).__name__)
                 raise

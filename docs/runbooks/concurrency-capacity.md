@@ -271,3 +271,29 @@ judge_completed 计数包含 completed 和 failed，不能当作成功评分数�
 证据只包含尝试索引、请求分组、开始/结束时间、HTTP 状态、异常类、实际选择的退避及取消状态，以及校验后的 `error.code/type`、数字或 HTTP 日期形式的 `Retry-After` 和数值限流头。错误标识必须是短标识符，且不能回显请求正文或认证头中的值；不保存自由错误消息、URL、请求头、提示词或响应正文。供应商 request ID 不额外记录。已有请求体、评分、重试次数、限速和成功 `raw_response` 不变；HTTP 日期形式的 `Retry-After` 仅记录，现有重试逻辑仍只解析数字形式。连接建立重试会形成独立 transport attempt，不能将缺少 HTTP 状态的尝试冒称为供应商已接收的请求。
 
 容量报告必须注明观测开关与同机辅助测试窗口，避免将不同观测配置或辅助负载混为同一容量结论。
+
+
+### 同机多 PhotoBench 的共享 Judge gate（默认关闭）
+
+独立 PhotoBench 的本地 `PHOTOBENCH_JUDGE_REQUEST_INTERVAL_SECONDS=2` 不构成全局限速。仅同一 Linux 主机、同一用户的进程可选择共用私有目录和明确的账号预算 scope：
+
+```sh
+# 目录应由操作者预建，权限 0700；各进程使用同一 DIR/SCOPE。
+PHOTOBENCH_JUDGE_SHARED_GATE_ENABLED=1
+PHOTOBENCH_JUDGE_SHARED_GATE_DIR=/absolute/private/judge-gates
+PHOTOBENCH_JUDGE_SHARED_GATE_SCOPE=company_coding_plan
+PHOTOBENCH_JUDGE_SHARED_GATE_INTERVAL_SECONDS=2
+PHOTOBENCH_JUDGE_SHARED_GATE_MAX_IN_FLIGHT=2
+PHOTOBENCH_JUDGE_SHARED_GATE_WAIT_TIMEOUT_SECONDS=300
+PHOTOBENCH_JUDGE_CONCURRENCY=4
+PHOTOBENCH_JUDGE_REQUEST_INTERVAL_SECONDS=2
+PHOTOBENCH_JUDGE_HTTP_ATTEMPT_EVIDENCE=1
+```
+
+同 scope 强制相同 endpoint/key 及节拍/在途配置；私有 HMAC 指纹仅在 0600 identity 文件，安全指标和 journal 不记录凭据、指纹、提示词或响应正文。所有同时消费同一预算的进程必须共用 scope；换 scope 不能证明获得独立额度。未显式启用时不改变原请求行为；部分配置、权限/符号链接、身份、状态错误一律拒绝发送，不降级为不限速。
+
+每个实际 transport 尝试，包括安全连接重试，先取得全局发送许可；退避前释放已知完整 HTTP 响应（含 429）和明确连接建立失败的槽。HTTP 在途数、已发请求与 gate 等待/失败分开计量。完整响应的 JSON/模型格式错误不伪称云请求仍在途；评分和未知结果仍沿原规则记录，不能自动重放。启用 gate 后拒绝自动重定向，防止一个许可发出多个隐蔽 HTTP 请求；收到重定向会释放已知槽并将组标为配置错误，需改为明确直连端点。
+
+Read/Write/Protocol 等未取得完整 HTTP 终态、PID/start/boot 丢失或复用会保留 unknown lease 并封组。不能把进程退出或文件锁释放当作云端空闲。封组没有自动清理、自动重置或重放入口；保存私有 state/journal 后由操作者处理。已用 gate 丢失 identity/state 也拒绝重新初始化。等待可取消且默认最多 300 秒；取得许可前取消不算云请求。
+
+此实现不是跨主机文件锁。未来 Sentrix 各自在 M4 时，可将独立 PhotoBench worker 集中在 200，共享 gate 并各自访问所属 Sentrix；不声称各台 Mac 本地 PhotoBench 已实现跨机共享限速。

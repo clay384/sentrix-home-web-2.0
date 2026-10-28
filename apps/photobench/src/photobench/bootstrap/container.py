@@ -66,6 +66,7 @@ from photobench.infrastructure.deploy.sentrix_process import ObservedSentrixProc
 from photobench.infrastructure.deploy.systemd_process import SystemdSentrixProcess
 from photobench.infrastructure.http.client import HttpxJsonClient
 from photobench.infrastructure.http.judge_images import inline_judge_images
+from photobench.infrastructure.http.shared_gate import SharedAccountGate
 from photobench.infrastructure.results.recovery import FileRunStartupRecovery
 from photobench.infrastructure.results.store import FileResultWriter, FileRunStore
 from photobench.infrastructure.runtime.providers import (
@@ -207,7 +208,7 @@ class Container:
             settings.data_root, settings.config_root / "qa_task_actions.json"
         )
         http: JsonHttpClient = HttpxJsonClient(retry_connections=True, keep_alive=False)
-        judge_http: JsonHttpClient = HttpxJsonClient()
+        judge_http: JsonHttpClient = HttpxJsonClient(shared_gate=SharedAccountGate.from_env())
         sentrix: SentrixClient = HttpxSentrixClient(http, lambda: config.sentrix_url)
         result_writer: RunResultWriter = FileResultWriter(settings.results_root)
 

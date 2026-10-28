@@ -113,4 +113,11 @@ class ObservedJsonHttpClient(Protocol):
         extra_headers: Mapping[str, str] | None = None,
         *,
         observer: HttpAttemptObserver,
+        cancelled: Callable[[], bool] | None = None,
     ) -> Any: ...
+
+
+@runtime_checkable
+class SharedGateHttpClient(Protocol):
+    @property
+    def shared_gate_enabled(self) -> bool: ...
