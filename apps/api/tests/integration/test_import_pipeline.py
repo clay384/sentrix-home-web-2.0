@@ -8,9 +8,11 @@
 
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from sentrix.application.media.import_assets import ImportAssets, ImportRequest
 from sentrix.domain.media.models import GpsPoint, MediaType, Observation
@@ -265,7 +267,9 @@ def test_completed_invalid_json_marks_pipeline_asset_failed_without_empty_memory
         ),
     )
     importer = build(tmp_path, recorder, repos, observer=observer)
-    staged = importer.stage(replace(_request(), defer_processing=True))
+    image = BytesIO()
+    Image.new("RGB", (12, 8), "red").save(image, format="JPEG")
+    staged = importer.stage(replace(_request(content=image.getvalue()), defer_processing=True))
     pipeline = ProcessAlbumPipeline(importer=importer, assets=assets, workers=1)
     result = pipeline.execute(AlbumProcessRequest(scope_id="album1", asset_ids=(staged.asset.id,)))
     assert result.processed == 0 and len(result.failures) == 1

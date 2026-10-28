@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from PIL import Image
 
 from sentrix.domain.assistant.ports import ModelServiceError
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
@@ -383,7 +384,7 @@ def test_container_wires_streaming_to_real_observer_without_changing_default_tra
     )
     container = Container.build(settings)
     image = tmp_path / "test.jpg"
-    image.write_bytes(b"local-private-image")
+    Image.new("RGB", (12, 8), "red").save(image, format="JPEG")
     result = container.vlm_observer.observe(image)
     assert result is not None and result.caption == "中文"
     assert len(server.posts) == 1 and server.posts[0]["stream"] is True
@@ -721,7 +722,7 @@ def test_each_visual_business_sends_its_own_existing_contract(server, tmp_path, 
         "choices": [{"message": {"content": json.dumps(outputs[business])}, "finish_reason": "stop"}]
     }
     image = tmp_path / "photo.jpg"
-    image.write_bytes(b"private-local-image")
+    Image.new("RGB", (12, 8), "red").save(image, format="JPEG")
     model = ServedModel(
         server.url,
         json_output_mode="json_schema",
@@ -774,7 +775,7 @@ def test_all_three_observer_stages_use_observation_contract_without_changing_pro
         for value in (empty, recovery, canonical)
     ]
     image = tmp_path / "photo.jpg"
-    image.write_bytes(b"private-image")
+    Image.new("RGB", (12, 8), "red").save(image, format="JPEG")
     model = ServedModel(server.url, json_output_mode="json_schema", native_output_budget=True)
     assert OpenAIVlmObserver(server.url, model).observe(image).caption == "中文"
     assert len(server.posts) == 3
