@@ -11,6 +11,7 @@ import math
 import os
 import re
 import stat
+import struct
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -178,13 +179,51 @@ class SharedAccountGate:
         ):
             raise SharedJudgeGateError("host_or_lock_identity_changed")
         if (
-            state.get("version") != 1
+            state.get("version") not in {1, 2}
             or not isinstance(state.get("active"), dict)
-            or not isinstance(state.get("next_allowed"), (int, float))
-            or not math.isfinite(state["next_allowed"])
+            or (
+                state["version"] == 1
+                and (
+                    not isinstance(state.get("next_allowed"), (int, float))
+                    or not math.isfinite(state["next_allowed"])
+                )
+            )
+            or (
+                state["version"] == 2
+                and (
+                    not isinstance(state.get("last_granted_monotonic"), (int, float))
+                    or not math.isfinite(state["last_granted_monotonic"])
+                    or state["last_granted_monotonic"] < 0
+                )
+            )
         ):
             raise SharedJudgeGateError("state_corrupt")
         return identity, state
+
+    def _ready_clock(self, lock_info: os.stat_result, *, mark: bool = False, fresh: bool = False) -> float:
+        # Same-boot pacing metadata, protected by flock. Critical lease/state/journal
+        # fsyncs finish BEFORE this stamp; adding an fsync after it would move the
+        # dispatch boundary back behind unbounded storage latency. A dead owner is
+        # retained/blocked by its durable lease; a reboot rejects the boot identity.
+        fd = self._open("lock", os.O_RDWR)
+        try:
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) != (lock_info.st_dev, lock_info.st_ino):
+                raise SharedJudgeGateError("lock_identity_changed")
+            if mark:
+                ready = 0.0 if fresh else time.monotonic()
+                if os.pwrite(fd, struct.pack("!d", ready), 32) != 8:
+                    raise SharedJudgeGateError("pacing_clock_unavailable")
+                return ready
+            raw = os.pread(fd, 8, 32)
+            if len(raw) != 8:
+                raise SharedJudgeGateError("pacing_clock_missing")
+            ready = float(struct.unpack("!d", raw)[0])
+            if not math.isfinite(ready) or ready < 0 or ready > time.monotonic():
+                raise SharedJudgeGateError("pacing_clock_corrupt")
+            return ready
+        finally:
+            os.close(fd)
 
     def _block(self, state: dict[str, Any], reason: str, lease_id: str | None = None) -> None:
         if not state.get("blocked"):
@@ -216,7 +255,8 @@ class SharedAccountGate:
         while True:
             with self._locked(deadline, cancelled) as info:
                 identity, state = self._read("identity.json"), self._read("state.json")
-                if identity is None and state is None:
+                fresh = identity is None and state is None
+                if fresh:
                     if info.st_size:
                         raise SharedJudgeGateError("state_missing_no_reset")
                     marker = self._open("lock", os.O_RDWR)
@@ -264,8 +304,23 @@ class SharedAccountGate:
                         self._block(state, "owner_or_outcome_unknown", lease_id)
                 if state.get("blocked"):
                     raise SharedJudgeGateError("group_blocked")
+                if state["version"] == 1:
+                    # Never upgrade across old in-flight work. Version 2 also makes
+                    # old clients reject this scope instead of ignoring the clock.
+                    if state["active"]:
+                        raise SharedJudgeGateError("legacy_active_lease_requires_idle_upgrade")
+                    state["version"] = 2
+                    state.pop("next_allowed")
+                    state["last_granted_monotonic"] = 0.0
+                    self._write("state.json", state)
+                    self._audit("pacing_upgraded", from_version=1, to_version=2)
+                    self._ready_clock(info, mark=True, fresh=fresh)
+                ready = self._ready_clock(info)
+                if ready < state["last_granted_monotonic"]:
+                    raise SharedJudgeGateError("pacing_clock_stale")
+                next_allowed = ready + self.interval_seconds if ready else 0.0
                 now = time.monotonic()
-                if len(state["active"]) < self.max_in_flight and now >= state["next_allowed"]:
+                if len(state["active"]) < self.max_in_flight and now >= next_allowed:
                     lease = {
                         "lease_id": uuid.uuid4().hex,
                         "owner": owner,
@@ -274,11 +329,16 @@ class SharedAccountGate:
                         "granted_monotonic": now,
                     }
                     state["active"][lease["lease_id"]] = lease
-                    state["next_allowed"] = now + self.interval_seconds
+                    state["last_granted_monotonic"] = now
                     self._write("state.json", state)
                     self._audit("acquired", **lease)
-                    return lease
-                delay = max(0.005, min(0.05, state["next_allowed"] - now))
+                    ready = self._ready_clock(info, mark=True)
+                    return {
+                        **lease,
+                        "permit_ready_monotonic": ready,
+                        "permit_ready_at": time.time(),
+                    }
+                delay = max(0.005, min(0.05, next_allowed - now))
             if cancelled():
                 raise RunCancelledError("cancelled waiting for shared Judge gate")
             if time.monotonic() >= deadline:

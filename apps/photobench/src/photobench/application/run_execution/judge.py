@@ -406,6 +406,12 @@ class JudgeRunner:
                     "metadata_unavailable",
                     "shared_gate",
                     "gate_lease_id",
+                    "gate_permit_ready_at",
+                    "gate_permit_ready_monotonic",
+                    "gate_durable_preparation_ms",
+                    "gate_ready_to_dispatch_ms",
+                    "gate_transport_dispatch_at",
+                    "gate_transport_dispatch_monotonic",
                 }
                 with self._metrics_lock:
                     if transport not in positions:

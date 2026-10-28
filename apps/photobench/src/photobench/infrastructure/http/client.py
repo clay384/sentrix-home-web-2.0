@@ -289,9 +289,26 @@ class HttpxJsonClient:
                 else {}
             )
             if lease is not None:
-                evidence.update(shared_gate=True, dispatch_started=True, gate_lease_id=lease["lease_id"])
+                evidence.update(
+                    shared_gate=True,
+                    dispatch_started=True,
+                    gate_lease_id=lease["lease_id"],
+                    gate_permit_ready_at=lease["permit_ready_at"],
+                    gate_permit_ready_monotonic=lease["permit_ready_monotonic"],
+                    gate_durable_preparation_ms=(lease["permit_ready_monotonic"] - lease["granted_monotonic"])
+                    * 1000,
+                )
             _notify_attempt(attempt_observer, evidence)
             try:
+                if lease is not None:
+                    # Observer/checkpoint IO can itself be slow. Capture the final
+                    # handoff AFTER it; the terminal observation preserves this stamp.
+                    dispatch = time.monotonic()
+                    evidence.update(
+                        gate_transport_dispatch_at=time.time(),
+                        gate_transport_dispatch_monotonic=dispatch,
+                        gate_ready_to_dispatch_ms=(dispatch - lease["permit_ready_monotonic"]) * 1000,
+                    )
                 if self.shared_gate_enabled:
                     # A redirect must not issue hidden HTTP requests outside the shared permits.
                     response = self._client.request(

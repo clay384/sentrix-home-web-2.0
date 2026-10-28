@@ -297,3 +297,7 @@ PHOTOBENCH_JUDGE_HTTP_ATTEMPT_EVIDENCE=1
 Read/Write/Protocol 等未取得完整 HTTP 终态、PID/start/boot 丢失或复用会保留 unknown lease 并封组。不能把进程退出或文件锁释放当作云端空闲。封组没有自动清理、自动重置或重放入口；保存私有 state/journal 后由操作者处理。已用 gate 丢失 identity/state 也拒绝重新初始化。等待可取消且默认最多 300 秒；取得许可前取消不算云请求。
 
 此实现不是跨主机文件锁。未来 Sentrix 各自在 M4 时，可将独立 PhotoBench worker 集中在 200，共享 gate 并各自访问所属 Sentrix；不声称各台 Mac 本地 PhotoBench 已实现跨机共享限速。
+
+发送节拍从所有关键 lease/state/journal 持久化完成后的 `permit_ready_monotonic` 起算，不从较早的 `granted_monotonic` 起算。同一 boot、同一 flock 保护的 lock 文件槽保存此节拍时钟；它只用于同机调度，不替代已 fsync 的在途证据。v1 scope 仅在没有在途 lease 且未封组时升级为 v2；升级先完成持久化再等待一个配置间隔，旧客户端拒绝 v2，不能混跑。节拍时钟缺失/损坏、boot 或 lock 身份变化均拒绝发送。
+
+`acquired` journal 表示持久 lease 的准备过程；HTTP 尝试证据的 `gate_permit_ready_*` 表示持久化后的许可就绪，`started_*` 表示初始尝试通知时间，`gate_transport_dispatch_*` 表示初始 observer/快照 IO 返回后紧贴 HTTP 客户端调用的派发边界（终态通知保存）。`gate_durable_preparation_ms` 与 `gate_ready_to_dispatch_ms` 分别记录前段持久化和后段调度延迟。配置保证许可就绪间隔，不承诺网络线上硬实时发送间隔；就绪后的进程调度或 HTTP 库延迟仍可能压缩相邻实际 HTTP 开始间隔，真实实验必须同时报告实际开始间隔及这段误差，不能仅凭许可间隔宣称 wire 间隔通过。

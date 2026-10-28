@@ -409,3 +409,187 @@ def test_unknown_is_not_retried_even_when_connection_retry_option_is_off(tmp_pat
     assert len(calls) == 1 and r.request_metrics()["requests_started"] == 1
     state = json.loads((tmp_path / "budget/state.json").read_text())
     assert state["blocked"] and len(state["active"]) == 1
+
+
+def _slow_persistence_child(root, slow, event, queue):
+    gate = SharedAccountGate(Path(root), "slow-io", interval_seconds=0.65)
+    original = gate._audit
+
+    def audit(name, **fields):
+        original(name, **fields)
+        if slow and name == "acquired":
+            event.set()
+            # Controlled fsync/scheduling lag while durable preparation still
+            # owns the lock. This reproduces the old early-clock compression.
+            time.sleep(0.5)
+
+    gate._audit = audit
+    if not slow:
+        assert event.wait(10)
+    observed = []
+    client = HttpxJsonClient(
+        httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: queue.put(("http", time.monotonic())) or httpx.Response(200, json=GOOD)
+            )
+        ),
+        shared_gate=gate,
+    )
+    client.request_json_observed(
+        URL, {}, "POST", extra_headers={"Authorization": KEY}, observer=observed.append
+    )
+    queue.put(("evidence", [x for x in observed if x.get("dispatch_started")][-1]))
+
+
+def test_slow_durable_preparation_does_not_consume_next_permit_interval(tmp_path):
+    ctx = multiprocessing.get_context("spawn")
+    queue, event = ctx.Queue(), ctx.Event()
+    ps = [
+        ctx.Process(target=_slow_persistence_child, args=(str(tmp_path), slow, event, queue))
+        for slow in (True, False)
+    ]
+    for p in ps:
+        p.start()
+    print(
+        "slow_io_children",
+        json.dumps(
+            [
+                {
+                    "pid": p.pid,
+                    "start_ticks": Path(f"/proc/{p.pid}/stat").read_text().rsplit(")", 1)[1].split()[19],
+                }
+                for p in ps
+            ]
+        ),
+    )
+    events = [queue.get(timeout=15) for _ in range(4)]
+    for p in ps:
+        p.join(10)
+        assert p.exitcode == 0
+    starts = sorted(x[1] for x in events if x[0] == "http")
+    evidence = sorted(
+        (x[1] for x in events if x[0] == "evidence"), key=lambda x: x["gate_permit_ready_monotonic"]
+    )
+    assert starts[1] - starts[0] >= 0.64
+    assert evidence[0]["gate_durable_preparation_ms"] >= 500
+    assert evidence[1]["gate_permit_ready_monotonic"] - evidence[0]["gate_permit_ready_monotonic"] >= 0.65
+    assert all(x["gate_ready_to_dispatch_ms"] >= 0 for x in evidence)
+    print("slow_io_timing", json.dumps({"actual_http_interval": starts[1] - starts[0], "attempts": evidence}))
+
+
+def test_post_ready_scheduler_delay_is_measured_not_claimed_as_wire_guarantee(tmp_path, monkeypatch):
+    monkeypatch.setattr(jm, "JUDGE_REQUEST_INTERVAL_SECONDS", 0)
+    gate = make_gate(tmp_path, interval_seconds=0.65)
+    original = gate.acquire
+    first = True
+
+    def delayed(*args, **kw):
+        nonlocal first
+        lease = original(*args, **kw)
+        if first:
+            first = False
+            time.sleep(0.5)  # Deliberate delay AFTER ready, not fixable by durable IO ordering.
+        return lease
+
+    monkeypatch.setattr(gate, "acquire", delayed)
+    starts = []
+    r = runner(
+        tmp_path, lambda request: starts.append(time.monotonic()) or httpx.Response(200, json=GOOD), gate=gate
+    )
+    assert r._request({}) == (GOOD, 1)
+    assert r._request({}) == (GOOD, 1)
+    attempts = r.request_metrics()["http_attempts"]
+    assert attempts[0]["gate_ready_to_dispatch_ms"] >= 500
+    assert attempts[1]["gate_permit_ready_monotonic"] - attempts[0]["gate_permit_ready_monotonic"] >= 0.65
+    assert starts[1] - starts[0] < 0.6
+    assert r.request_metrics()["requests_started"] == 2
+
+
+def test_v1_idle_upgrade_preserves_identity_and_waits_new_ready_interval(tmp_path):
+    gate = make_gate(tmp_path, interval_seconds=0.08)
+    lease = gate.acquire(URL, KEY)
+    gate.finish(lease["lease_id"], "http_response", http_status=200)
+    directory = tmp_path / "budget"
+    identity = (directory / "identity.json").read_bytes()
+    state = {"version": 1, "next_allowed": 0, "active": {}, "blocked": None}
+    (directory / "state.json").write_text(json.dumps(state))
+    # A real v1 lock has only the durable used marker, no pacing slot.
+    with (directory / "lock").open("r+b") as stream:
+        stream.truncate(len(b"initialized\n"))
+    before = time.monotonic()
+    lease = gate.acquire(URL, KEY)
+    assert lease["permit_ready_monotonic"] - before >= 0.08
+    assert (directory / "identity.json").read_bytes() == identity
+    state = json.loads((directory / "state.json").read_text())
+    assert state["version"] == 2 and "next_allowed" not in state
+    gate.finish(lease["lease_id"], "not_sent")
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_v1_active_or_blocked_scope_cannot_be_upgraded(tmp_path, blocked):
+    gate = make_gate(tmp_path)
+    lease = gate.acquire(URL, KEY)
+    path = tmp_path / "budget/state.json"
+    state = json.loads(path.read_text())
+    state.update(version=1, next_allowed=0)
+    if blocked:
+        state["active"] = {}
+        state["blocked"] = {"reason": "retained_unknown"}
+    path.write_text(json.dumps(state))
+    before = path.read_bytes()
+    with pytest.raises(SharedJudgeGateError, match="blocked" if blocked else "legacy_active"):
+        gate.acquire(URL, KEY)
+    assert path.read_bytes() == before
+    assert lease["lease_id"] in (tmp_path / "budget/journal.jsonl").read_text()
+
+
+def test_v2_missing_ready_clock_fails_closed_without_new_lease(tmp_path):
+    gate = make_gate(tmp_path)
+    lease = gate.acquire(URL, KEY)
+    gate.finish(lease["lease_id"], "not_sent")
+    directory = tmp_path / "budget"
+    with (directory / "lock").open("r+b") as stream:
+        stream.truncate(len(b"initialized\n"))
+    before = (directory / "state.json").read_bytes()
+    with pytest.raises(SharedJudgeGateError, match="pacing_clock_missing"):
+        gate.acquire(URL, KEY)
+    assert (directory / "state.json").read_bytes() == before
+
+
+def test_ready_to_transport_delay_includes_slow_start_observer(tmp_path):
+    observations, starts = [], []
+
+    def observe(evidence):
+        if evidence.get("transport_attempt") and evidence.get("finished_at") is None:
+            time.sleep(0.5)
+        observations.append(dict(evidence))
+
+    client = HttpxJsonClient(
+        httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: starts.append(time.monotonic()) or httpx.Response(200, json=GOOD)
+            )
+        ),
+        shared_gate=make_gate(tmp_path),
+    )
+    client.request_json_observed(URL, {}, "POST", extra_headers={"Authorization": KEY}, observer=observe)
+    initial, final = [e for e in observations if e.get("dispatch_started")]
+    assert "gate_ready_to_dispatch_ms" not in initial
+    assert final["gate_ready_to_dispatch_ms"] >= 500
+    dispatch = final["gate_transport_dispatch_monotonic"]
+    assert starts[0] >= dispatch
+    assert dispatch - final["started_monotonic"] >= 0.5
+
+
+def test_v2_zeroed_ready_clock_cannot_reset_used_pacing(tmp_path):
+    gate = make_gate(tmp_path)
+    lease = gate.acquire(URL, KEY)
+    gate.finish(lease["lease_id"], "not_sent")
+    directory = tmp_path / "budget"
+    with (directory / "lock").open("r+b") as stream:
+        stream.seek(32)
+        stream.write(bytes(8))
+    before = (directory / "state.json").read_bytes()
+    with pytest.raises(SharedJudgeGateError, match="pacing_clock_stale"):
+        gate.acquire(URL, KEY)
+    assert (directory / "state.json").read_bytes() == before
