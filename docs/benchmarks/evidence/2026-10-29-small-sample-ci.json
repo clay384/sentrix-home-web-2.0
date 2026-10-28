@@ -1,0 +1,20 @@
+{
+  "source_revision": "6520527484764d7253e83be3209666251791564c",
+  "full_ci": {
+    "exit_code": 0,
+    "duration_seconds": 606.698926448822,
+    "backend_tests_passed": 3628,
+    "real_environment_tests_deselected": 49,
+    "backend_coverage_percent": 93.04,
+    "main_web_tests_passed": 143,
+    "photobench_web_tests_passed": 496,
+    "mypy_source_files": 340,
+    "source_unchanged_clean": true,
+    "completion_sha256": "f9ac21700ae8e924ef2b330b5a7a321de8e2864189c612bd51d023ea22c3e521",
+    "log_sha256": "c2806eb88ea3c5ed57be34ff106f0f2891ae154d7a7d2a808c80aefaf7262864"
+  },
+  "qualification_boundary": {
+    "offline_ci_is_not_real_endpoint_capacity_test": true,
+    "real_sample_report_independent": true
+  }
+}

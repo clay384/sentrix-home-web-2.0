@@ -1,5 +1,7 @@
 # Sentrix / PhotoBench concurrency capacity
 
+> 当前交付状态与实测配置见[2026-10-29小样本性能报告](2026-10-29-small-sample-performance.md)。下列完整容量认证流程未在本轮全部执行。
+
 This procedure keeps the production instance untouched. Model capacity, client
 CPU capacity, and cloud Judge capacity are separate measurements.
 
