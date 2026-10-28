@@ -285,6 +285,12 @@ class JudgeSettings:
     evidence_enabled: bool = False
 
 
+#: 端点探活的重试次数与间隔。一次瞬断（4/4 slot 饱和时服务端可能直接断开新连接）
+#: 不应该让一整轮 QA 在开跑前失败；最坏约 3×15s 超时 + 2×5s 间隔。
+_ENDPOINT_HEALTH_ATTEMPTS = 3
+_ENDPOINT_HEALTH_BACKOFF_S = 5.0
+
+
 @dataclass
 class RunExecution:
     """跑完一条主链。构造一次跑一轮——状态不跨 run 复用（1.0 是一 run 一个对象）。
@@ -1862,19 +1868,35 @@ class RunExecution:
         用的是 ``InferenceProvider.health()`` —— 这个方法此前**没有任何生产调用者**
         （登记在 ``scripts/check_method_reachability.py`` 的例外表里，理由是「端点探活
         走的是 ``chat``」）。走 ``chat`` 只证明「这一句能通」，而这里问的是「现在值不值得
-        开一轮 487 题」——两件事，所以那个例外登记随本方法一起消失。
+        开一轮题」——两件事，所以那个例外登记随本方法一起消失。
 
         **degraded 算健康**：它表示端点活着但自报状态不全（与 ``sentrix_process.py``
         的启动判据同一条口径）。真正要拦的是不可达与显式 error。
+
+        **带重试。** 158 实测：导入刚结束、4/4 slot 仍在长生成时，一条新的
+        ``GET /v1/models`` 被服务端直接断开（``Server disconnected without sending a
+        response``），1167 题的 run 在开跑前就判失败。一次瞬断不该有这种杀伤力；探活
+        本来就是“现在值不值得开一轮”的采样，采样失败先重采。
         """
-        try:
-            payload = self.inference.health()
-        except Exception as error:  # noqa: BLE001 —— 探活失败本身就是答案
-            return str(error) or type(error).__name__
-        status = str((payload or {}).get("status") or "").strip().lower()
-        if status in {"ok", "ready", "healthy", "available", "degraded"}:
-            return None
-        return status or "unknown_health_status"
+        reason = ""
+        for attempt in range(_ENDPOINT_HEALTH_ATTEMPTS):
+            try:
+                payload = self.inference.health()
+            except Exception as error:  # noqa: BLE001 —— 探活失败本身就是答案
+                reason = str(error) or type(error).__name__
+            else:
+                status = str((payload or {}).get("status") or "").strip().lower()
+                if status in {"ok", "ready", "healthy", "available", "degraded"}:
+                    return None
+                detail = str((payload or {}).get("error") or "").strip()
+                reason = (
+                    f"{status or 'unknown_health_status'}: {detail}"
+                    if detail
+                    else (status or "unknown_health_status")
+                )
+            if attempt + 1 < _ENDPOINT_HEALTH_ATTEMPTS:
+                time.sleep(_ENDPOINT_HEALTH_BACKOFF_S)
+        return reason
 
     def _runtime_max_concurrency(self) -> int | None:
         """**实时问端点**（1.0 ``:3667-3688`` 的 ``_runtime_max_concurrency``）。
@@ -2195,8 +2217,14 @@ class RunExecution:
                     if turn_index < len(conversation) and isinstance(conversation[turn_index], dict)
                     else {}
                 )
+                # **评测必须打开完整轨迹。** 8772 的「模型这一步看到什么/回答什么」
+                # 只能由主 API 在回合终态载荷里带出来；不开这个开关，run.json 里
+                # 永远只有工具入参与摘要，和 1.0 的 debug_trace 对不上。
                 started_turn = self.client.start_turn(
-                    conversation_id=conversation_id, message=message, timeout=300
+                    conversation_id=conversation_id,
+                    message=message,
+                    include_debug=True,
+                    timeout=300,
                 )
                 turn_id = str(started_turn.get("turn_id") or "")
                 if not turn_id:

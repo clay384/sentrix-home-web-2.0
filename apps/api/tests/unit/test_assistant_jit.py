@@ -81,12 +81,20 @@ def test_the_photo_level_tools_wait_for_a_result_set():
     assert {"inspect_photo", "read_photo_text", "query_photo_people"} <= after
 
 
-def test_paging_survives_a_satisfied_photo_set():
-    """翻页**不按需求剪**：``photo_set`` 销账不等于候选看完了。
+def test_the_page_tool_disappears_after_it_has_been_used_once():
+    """翻页是一次性的：成功一次后调用方把 page_available 置假，工具物理上消失。"""
+    ledger = ledger_with(EvidenceType.PHOTO_SET)
 
-    ``search_memories`` 一页 6 条、结果集最多 12 条。1.0 的剪枝只作用在提示词上，
-    模型随时还能调 ``get_result_page``；2.0 走原生 ``tools`` 字段，剪掉就是**物理上
-    不能调**——那会把「看第 7–12 张」这个能力整个拿掉。
+    offered = names(select_tools(ledger, has_result_set=True, tools_exhausted=False, page_available=False))
+
+    assert "get_result_page" not in offered
+
+
+def test_paging_survives_a_satisfied_photo_set():
+    """翻页**不按需求剪**：``photo_set`` 销账不等于候选看完了，第一次翻页仍要可用。
+
+    但它是**一次性**的：成功翻过一次后调用方把 ``page_available`` 置假，工具物理上
+    消失（见下一条）；候选不足一页时从一开始就不出现。
     """
     ledger = ledger_with(EvidenceType.PHOTO_SET)
     ledger.satisfy(EvidenceType.PHOTO_SET, call_id="call_1")

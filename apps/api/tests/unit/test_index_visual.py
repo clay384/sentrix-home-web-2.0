@@ -51,6 +51,17 @@ class FakeVectors:
             for item in self.records
         )
 
+    def get(self, *, space, source_type, source_id, model_name=None):
+        for item in reversed(self.records):
+            if (
+                item.space == space
+                and item.source_type == source_type
+                and item.source_id == source_id
+                and (model_name is None or item.model_name == model_name)
+            ):
+                return item
+        return None
+
     def search_exact(self, *, space, vector, limit, scope_id=None, model_name=None):
         return []
 
@@ -160,15 +171,39 @@ def test_dimension_mismatch_is_reported_not_stored():
     assert vectors.records == []
 
 
-def test_second_index_of_the_same_asset_does_not_re_embed():
+def test_second_index_of_the_same_asset_does_not_re_embed_but_re_mirrors():
+    """**重复导入不再重跑推理，但必须再镜像一次。**
+
+    旧实现在 ``already_indexed`` 上直接返回 ``mirrored=True``——它假设镜像早就在。
+    Qdrant 目录锁导致镜像静默失败之后，那条点就永远补不回来（158 实测 770/1114）。
+    """
     embedder = FakeEmbedder()
-    use_case, _ = build(embedder=embedder)
+    index = FakeIndex()
+    use_case, _ = build(embedder=embedder, index=index)
     first = use_case.index(asset())
     second = use_case.index(asset())
 
     assert first.indexed is True
     assert second == VisualIndexOutcome(indexed=True, mirrored=True, reason="already_indexed")
     assert len(embedder.calls) == 1, "重复导入不该再跑一次推理"
+    assert len(index.records) == 2, "第二次也要 upsert 一次（幂等），才能补回丢失的点"
+
+
+def test_an_already_indexed_asset_repairs_a_lost_mirror():
+    """权威存储有行、派生索引丢了点：再导入/回填一次必须把点补回来，且不重嵌。"""
+    embedder = FakeEmbedder()
+    index = FakeIndex()
+    use_case, _ = build(embedder=embedder, index=index)
+
+    use_case.index(asset())
+    index.records.clear()  # 模拟 Qdrant 镜像写失败/索引被清掉
+
+    outcome = use_case.index(asset())
+
+    assert outcome.indexed is True
+    assert outcome.mirrored is True
+    assert len(index.records) == 1
+    assert len(embedder.calls) == 1
 
 
 def test_unavailable_index_does_not_fail_the_authoritative_write():

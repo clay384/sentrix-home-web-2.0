@@ -3,8 +3,8 @@
 对应 1.0 ``agent_runtime/result_set.py``。三条不变量原样保留，它们在 1.0 里被证明是
 对的：
 
-1. **每页 6 张、1-based、无游标、``page_size`` 硬顶 6**；
-2. **``handle`` 是全局序号**（第 2 页从 ``photo_7`` 开始），跨页稳定——模型只需要记住
+1. **每页 ``PAGE_SIZE`` 张（生产固定 6）、1-based、无游标、``page_size`` 硬顶 ``PAGE_SIZE``**；
+2. **``handle`` 是全局序号**（第 2 页从 ``photo_13`` 开始），跨页稳定——模型只需要记住
    ``photo_N``，分页不会让同一个 handle 指向不同的图；
 3. **``asset_id`` 只存在于结果集里**，不进模型上下文。模型看到的是 handle，真正可交付
    的资产由运行时解引用。1.0 为此在 ``runtime.py:177-179`` 专门把 ``asset_id`` 从模型
@@ -20,6 +20,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 
+#: 生产固定 6 张：检索上限（``DEFAULT_SEARCH_LIMIT``）也是 6，一次给全，
+#: ``has_more`` 恒为假，翻页工具不会出现。分页代码保留给未来提高检索上限的场景。
 PAGE_SIZE = 6
 
 
@@ -63,10 +65,15 @@ class ResultSet:
 
         1.0 也是这个行为（``tools.py:2073``）：越界不是错误，是「没有更多了」。抛异常
         只会让模型把一次正常的翻到底当成系统故障。
+
+        游标分页：第 ``n`` 页从 ``(n-1)*size`` 开始，越界页为空。候选不超过一页时
+        第 2 页为空——工具层会直接拒绝这种请求（``single_page_only``）。
         """
         size = min(PAGE_SIZE, max(1, page_size))
-        start = max(0, (max(1, page_no) - 1) * size)
-        end = start + size
+        page_no = max(1, page_no)
+        total = len(self.asset_ids)
+        start = max(0, (page_no - 1) * size)
+        end = min(total, start + size)
         entries = tuple(
             ResultSetEntry(
                 handle=f"photo_{start + index + 1}",
@@ -76,11 +83,11 @@ class ResultSet:
             for index, asset_id in enumerate(self.asset_ids[start:end])
         )
         return ResultSetPage(
-            page=max(1, page_no),
+            page=page_no,
             page_size=size,
-            total=len(self.asset_ids),
-            has_more=end < len(self.asset_ids),
-            remaining=max(0, len(self.asset_ids) - end),
+            total=total,
+            has_more=end < total,
+            remaining=max(0, total - end),
             entries=entries,
         )
 

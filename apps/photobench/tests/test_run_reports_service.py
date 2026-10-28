@@ -204,3 +204,76 @@ def test_exports_read_the_run_and_apply_the_filters(tmp_path: Path) -> None:
     sft = reports.export_sft("run-1", scores=[0])
     assert [row["qa_id"] for row in sft["items"]] == ["q0"]
     assert sft["count"] == 1
+
+
+# ---- 记忆有效性：按 (run, revision) 缓存 ------------------------------------
+
+
+def test_memory_effectiveness_is_cached_until_the_run_changes(tmp_path: Path) -> None:
+    """同一份 run.json 的第二次请求不再解析文件、也不再打 Sentrix。
+
+    158 实测：面板开着时浏览器约 0.55 次/秒轮询它，每次 0.6–1.2s CPU。这里钉住
+    「命中缓存」与「run 变了就失效」两种行为——只测前一种的话，把 revision 写死也能绿。
+    """
+    store = _write(tmp_path, "run-1", _state(items=[]))
+    http = FakeJsonHttpClient({"/assets?": {"items": [_image("a1")]}})
+    reports = _reports(store, http)
+
+    first = reports.memory_effectiveness("run-1")
+    second = reports.memory_effectiveness("run-1")
+
+    assert first == second
+    assert len(http.calls) == 1
+
+    # 返回的必须是副本：调用方改脏了缓存里的那份，下一次读到的东西就变了。
+    second["data_quality"]["hit_match_source"] = "被调用方改脏"
+    assert reports.memory_effectiveness("run-1")["data_quality"]["hit_match_source"] != "被调用方改脏"
+
+    # run.json 变了 → revision 变 → 必须重算，资产清单要再取一次。
+    (tmp_path / "run-1" / "run.json").write_text(
+        json.dumps(_state(items=[{"qa_id": "q0"}, {"qa_id": "q1"}])), encoding="utf-8"
+    )
+    reports.memory_effectiveness("run-1")
+    assert len(http.calls) == 2
+
+
+def test_memory_effectiveness_cache_expires_after_the_ttl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """revision 没变、但资产清单可能变了：30s 后必须重算。"""
+    import types
+
+    import photobench.application.runs.reports as reports_module
+
+    clock = [1000.0]
+    # 只替换 reports 模块自己的 ``time`` 引用，不去改全局 time 模块。
+    monkeypatch.setattr(reports_module, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+    store = _write(tmp_path, "run-1", _state(items=[]))
+    http = FakeJsonHttpClient({"/assets?": {"items": [_image("a1")]}})
+    reports = _reports(store, http)
+
+    reports.memory_effectiveness("run-1")
+    clock[0] += 29
+    reports.memory_effectiveness("run-1")
+    assert len(http.calls) == 1
+
+    clock[0] += 2  # 累计 31s，越过 TTL
+    reports.memory_effectiveness("run-1")
+    assert len(http.calls) == 2
+
+
+def test_keyframe_analysis_uses_the_same_memo(tmp_path: Path) -> None:
+    """关键帧面板同样会被轮询（158 实测 0.27 次/秒），它也要走同一份缓存。"""
+    store = _write(tmp_path, "run-1", _state(items=[]))
+    http = FakeJsonHttpClient({"/assets?": {"items": [_image("a1")]}})
+    reports = _reports(store, http)
+
+    first = reports.keyframe_analysis("run-1")
+    second = reports.keyframe_analysis("run-1")
+
+    assert first == second
+    assert len(http.calls) == 1
+
+    # 两个面板的缓存键必须分开：同一次修订下，记忆有效性不能把关键帧的结果顶掉。
+    reports.memory_effectiveness("run-1")
+    assert len(http.calls) == 2

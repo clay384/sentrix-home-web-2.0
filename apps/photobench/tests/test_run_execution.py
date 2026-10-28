@@ -126,6 +126,7 @@ def _completed_turn(
             # 助手的**回合级事实**。形状由 ``run_turn._turn_trace`` 组装，这里照抄一份
             # 生产上真的会出现的——三个投影都读它。
             "trace": {
+                "include_debug": True,
                 "model_calls": [
                     {
                         "step_id": "step_1",
@@ -135,6 +136,31 @@ def _completed_turn(
                         "duration_ms": 400.0,
                         "tool_calls": ["search_memories"],
                         "finish_reason": "tool_calls",
+                    }
+                ],
+                # 评测侧 include_debug=true 时的完整模型输入/输出。
+                "debug_calls": [
+                    {
+                        "seq": 0,
+                        "step_id": "step_1",
+                        "call_type": "agent",
+                        "status": "complete",
+                        "messages": [
+                            {"role": "system", "content": "你是相册助手"},
+                            {"role": "user", "content": "看海边的照片"},
+                        ],
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {"name": "search_memories", "description": "检索"},
+                            }
+                        ],
+                        "response": {
+                            "content": "",
+                            "thought": "先检索",
+                            "tool_calls": [{"id": "c1", "name": "search_memories", "arguments": "{}"}],
+                            "finish_reason": "tool_calls",
+                        },
                     }
                 ],
                 "planner": {"status": "ok", "fallback_reason": "", "goal": "看海边的照片"},
@@ -921,6 +947,12 @@ def test_the_turn_facts_are_projected_into_the_three_panels():
         "terminal",
     ]
 
+    # ⑤ 完整模型轨迹原样落进 ``trace_bundle``（8772 的两块面板都从这里取）。
+    debug_calls = item["runtime_turns"][0]["trace_bundle"]["debug_calls"]
+    assert debug_calls[0]["call_type"] == "agent"
+    assert debug_calls[0]["messages"][-1]["content"] == "看海边的照片"
+    assert debug_calls[0]["response"]["tool_calls"][0]["name"] == "search_memories"
+
     # ④ 稳定性卡只认 ``execution_trace`` 里 ``stage == "model"`` 的步骤——模型调用
     #    的事实本来就在手上，不补成那种步骤，那张卡恒显示「未记录」。
     model_steps = [s for s in item["execution_trace"] if s.get("stage") == "model"]
@@ -955,6 +987,8 @@ def test_a_multi_turn_question_reuses_one_conversation():
     assert len(conversations) == 1
     assert [turn["conversation_id"] for turn in turns] == ["conv_1", "conv_1"]
     assert [turn["message"] for turn in turns] == ["第一轮", "第二轮"]
+    # 评测每轮都显式要求完整模型轨迹（8772 的「模型看到什么」数据源）。
+    assert all(turn["include_debug"] is True for turn in turns)
     item = state["items"][0]
     assert item["question"] == "第二轮"
     assert item["conversation_context_mode"] == "shared_conversation_id"
@@ -1387,7 +1421,7 @@ def test_qa_concurrency_follows_the_endpoint_slots():
     assert state["judge_concurrency"] == 0
 
 
-def test_qa_eval_refuses_to_start_when_the_endpoint_is_unhealthy():
+def test_qa_eval_refuses_to_start_when_the_endpoint_is_unhealthy(monkeypatch):
     """入 QA 前先探一次端点；不健康就抛（1.0 ``:3394-3397``）。
 
     487 道题跑在一个不回话的端点上，产出的是一份**看起来正常**的废数据——比直接失败
@@ -1397,13 +1431,46 @@ def test_qa_eval_refuses_to_start_when_the_endpoint_is_unhealthy():
     ``execute`` 把相位异常收成 ``status=failed``（不往外抛，1.0 ``:2404``），
     所以这里钉的是终态与 ``failed_phase``。
     """
-    execution, *_ = _execution(inference=FakeInference(health_status="error"))
+    # 探活现在带重试；测试里把间隔清零，避免 5s×2 的等待。
+    monkeypatch.setattr("photobench.application.run_execution.service._ENDPOINT_HEALTH_BACKOFF_S", 0.0)
+    inference = FakeInference(health_status="error")
+    execution, *_ = _execution(inference=inference)
 
     state = execution.execute(_request())
 
     assert state["status"] == "failed"
     assert state["failed_phase"] == "qa_eval"
     assert "unhealthy before QA evaluation" in state["fatal_error"]
+    assert inference.calls.count("health") == 3
+
+
+def test_a_transient_endpoint_disconnect_is_retried(monkeypatch):
+    """一次 ``Server disconnected`` 不应该让整轮 QA 在开跑前失败。
+
+    158 实测：导入刚结束、4/4 slot 饱和时，新的 ``/v1/models`` 连接被服务端断开，
+    1167 题的 run 直接判 failed。探活重试后，第二次成功就继续。
+    """
+    monkeypatch.setattr("photobench.application.run_execution.service._ENDPOINT_HEALTH_BACKOFF_S", 0.0)
+    inference = FakeInference(health_failures=1)
+    execution, *_ = _execution(inference=inference)
+
+    state = execution.execute(_request())
+
+    assert state["status"] == "completed"
+    assert inference.calls.count("health") == 2
+
+
+def test_an_endpoint_that_stays_disconnected_still_fails_after_retries(monkeypatch):
+    monkeypatch.setattr("photobench.application.run_execution.service._ENDPOINT_HEALTH_BACKOFF_S", 0.0)
+    inference = FakeInference(health_failures=99)
+    execution, *_ = _execution(inference=inference)
+
+    state = execution.execute(_request())
+
+    assert state["status"] == "failed"
+    assert state["failed_phase"] == "qa_eval"
+    assert "Server disconnected" in state["fatal_error"]
+    assert inference.calls.count("health") == 3
 
 
 def test_a_degraded_endpoint_still_starts_the_run():

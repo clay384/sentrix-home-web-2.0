@@ -90,8 +90,8 @@ class SqliteTurnRepository:
             connection.execute(
                 "INSERT INTO agent_turns"
                 " (id, conversation_id, scope_id, question, status, termination_reason, answer,"
-                " attachments_json, requirements_json, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " attachments_json, requirements_json, trace_json, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.id,
                     record.conversation_id,
@@ -102,6 +102,9 @@ class SqliteTurnRepository:
                     record.answer,
                     "[]",
                     "[]",
+                    # ``include_debug`` 要在 ``start`` 与 ``run`` 之间活下来；两者的
+                    # 唯一交接物就是这条记录，所以建回合时就把它写进去。
+                    json.dumps(dict(record.trace), ensure_ascii=False),
                     record.created_at.isoformat(),
                     record.updated_at.isoformat(),
                 ),

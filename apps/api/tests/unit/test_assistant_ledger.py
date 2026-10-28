@@ -135,27 +135,60 @@ def make_result_set(count: int) -> ResultSet:
     )
 
 
-def test_the_first_page_holds_six_photos():
-    page = make_result_set(10).first_page()
+def test_the_first_page_holds_one_page():
+    """2026-10-27：生产固定 6 张。检索给多少就展示多少，一页给全。"""
+    page = make_result_set(2 * PAGE_SIZE).first_page()
 
     assert PAGE_SIZE == 6
     assert page.page == 1
-    assert [entry.handle for entry in page.entries] == [f"photo_{i}" for i in range(1, 7)]
-    assert page.total == 10
+    assert [entry.handle for entry in page.entries] == [f"photo_{i}" for i in range(1, PAGE_SIZE + 1)]
+    assert page.total == 2 * PAGE_SIZE
     assert page.has_more is True
-    assert page.remaining == 4
+    assert page.remaining == PAGE_SIZE
+
+
+def test_a_result_set_shorter_than_one_page_fits_on_one_page():
+    """候选不足一页时 ``has_more`` 必须是假——工具层据此拒绝翻页。"""
+    page = make_result_set(PAGE_SIZE - 1).first_page()
+
+    assert len(page.entries) == PAGE_SIZE - 1
+    assert page.has_more is False
+    assert page.remaining == 0
 
 
 def test_handles_are_global_ordinals_not_page_ordinals():
-    """第 2 页从 ``photo_7`` 开始。模型只需要记住 ``photo_N``，跨页稳定。"""
-    result_set = make_result_set(10)
+    """第 2 页从 ``photo_{PAGE_SIZE+1}`` 开始。模型只需要记住 ``photo_N``，跨页稳定。"""
+    result_set = make_result_set(2 * PAGE_SIZE)
 
-    assert [entry.handle for entry in result_set.page(2).entries] == [f"photo_{i}" for i in range(7, 11)]
+    assert [entry.handle for entry in result_set.page(2).entries] == [
+        f"photo_{i}" for i in range(PAGE_SIZE + 1, 2 * PAGE_SIZE + 1)
+    ]
 
 
-def test_page_size_is_capped_at_six():
-    """``page_size`` 传多大都只给 6 张——1.0 的 ``min(_RESULT_PAGE_SIZE, ...)``。"""
-    page = make_result_set(20).page(1, page_size=100)
+def test_the_second_page_starts_after_the_first_and_runs_to_the_end():
+    """第 1 页 photo_1..PAGE_SIZE，第 2 页从下一页开始直到结尾（不补齐）。"""
+    result_set = make_result_set(2 * PAGE_SIZE - 2)
+
+    first = result_set.page(1)
+    assert [entry.handle for entry in first.entries] == [f"photo_{i}" for i in range(1, PAGE_SIZE + 1)]
+    assert first.has_more is True
+    assert first.remaining == PAGE_SIZE - 2
+
+    second = result_set.page(2)
+    assert [entry.handle for entry in second.entries] == [
+        f"photo_{i}" for i in range(PAGE_SIZE + 1, 2 * PAGE_SIZE - 1)
+    ]
+    assert second.has_more is False
+    assert second.remaining == 0
+
+
+def test_a_single_page_result_set_has_no_second_page():
+    assert make_result_set(PAGE_SIZE).page(2).entries == ()
+
+
+def test_page_size_is_capped_at_one_page():
+    """``page_size`` 传多大都只给 ``PAGE_SIZE`` 张。"""
+    page = make_result_set(2 * PAGE_SIZE).page(1, page_size=100)
 
     assert page.page_size == PAGE_SIZE
     assert len(page.entries) == PAGE_SIZE

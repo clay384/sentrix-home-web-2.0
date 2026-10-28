@@ -186,8 +186,21 @@ class FakeSentrixClient:
             "last_message_at": now_iso(),
         }
 
-    def start_turn(self, *, conversation_id: str, message: str, timeout: int = 300) -> dict[str, Any]:
-        self._record("start_turn", conversation_id=conversation_id, message=message, timeout=timeout)
+    def start_turn(
+        self,
+        *,
+        conversation_id: str,
+        message: str,
+        include_debug: bool = False,
+        timeout: int = 300,
+    ) -> dict[str, Any]:
+        self._record(
+            "start_turn",
+            conversation_id=conversation_id,
+            message=message,
+            include_debug=include_debug,
+            timeout=timeout,
+        )
         self._turn_seq += 1
         return {"turn_id": f"turn_{self._turn_seq}", "conversation_id": conversation_id, "status": "running"}
 
@@ -302,11 +315,16 @@ class FakeInference:
         stream_chunks: list[str] | None = None,
         slots: int | None = None,
         health_status: str = "ok",
+        health_failures: int = 0,
+        health_error: str = "Server disconnected without sending a response.",
     ) -> None:
         self.calls: list[str] = []
         self.chat_error = chat_error
-        # 端点探活自报的状态。``"ok"`` 之外的任何值都表示「现在不值得开一轮 487 题」。
+        # 端点探活自报的状态。``"ok"`` 之外的任何值都表示「现在不值得开一轮题」。
         self.health_status = health_status
+        # 前 N 次探活返回 unavailable（模拟 4/4 slot 饱和时的瞬时断开）。
+        self.health_failures = health_failures
+        self.health_error = health_error
         # 端点自报的并发槽位。``None`` = 问不到（llama.cpp 之外的端点、或端点没起来），
         # 那是 ``_resolve_qa_concurrency`` 退回 1 的那条路。
         self.slots = slots
@@ -323,6 +341,9 @@ class FakeInference:
 
     def health(self) -> dict[str, Any]:
         self.calls.append("health")
+        if self.health_failures > 0:
+            self.health_failures -= 1
+            return {"status": "unavailable", "error": self.health_error}
         return {"status": self.health_status}
 
     def list_models(self) -> dict[str, Any]:

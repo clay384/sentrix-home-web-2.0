@@ -70,6 +70,12 @@ class StartTurnRequest(BaseModel):
     # 一条空消息不是「一轮空对话」，是一次调用方错误，所以这里直接挡在 422。
     message: str = Field(min_length=1, max_length=2000)
     conversation_id: str = ""
+    # **评测/复盘用的开关，默认关闭。** 打开后终态载荷的 ``trace.debug_calls``
+    # 会带每次模型调用实际发送的 messages / tools 与原始回复；产品对话不付这份体积。
+    include_debug: bool = Field(
+        default=False,
+        description="是否在回合轨迹里记录每次模型调用的完整输入与原始输出（默认关闭）",
+    )
 
 
 class StartTurnResponse(BaseModel):

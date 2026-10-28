@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +105,7 @@ class FakePreviewRenderer:
     def __init__(self, tmp_path: Path) -> None:
         self.tmp_path = tmp_path
         self._n = 0
+        self._lock = threading.Lock()
         self.calls: list[tuple[str, list[dict[str, Any]]]] = []
 
     def render(
@@ -113,8 +115,10 @@ class FakePreviewRenderer:
         if not data.startswith(b"\xff\xd8"):
             raise OSError(f"cannot identify image file {asset_path!r}")
         self.calls.append((str(asset_path), [dict(face) for face in faces]))
-        self._n += 1
-        preview = self.tmp_path / f"preview_{self._n}.jpg"
+        with self._lock:
+            self._n += 1
+            number = self._n
+        preview = self.tmp_path / f"preview_{number}.jpg"
         preview.write_bytes(b"\xff\xd8\xff\xd9")
         label_map = {
             f"P{index}": {
@@ -384,6 +388,39 @@ def test_two_photos_are_two_calls(album: Album, db: Database, previews) -> None:
     vision = ScriptedVision([reply(moment("P1")), reply(moment("P1"))])
 
     result = build(db, previews, vision)(scope_id=HOME, selections=[album.add(), album.add()])
+
+    assert len(vision.calls) == 2
+    assert result.moments == 2
+
+
+def test_two_photos_are_extracted_concurrently_when_workers_is_two(
+    album: Album, db: Database, previews
+) -> None:
+    """``workers>1`` 时两张资产**同时在飞**——用 Barrier 证明并发，而不是只看结果。
+
+    顺序实现会在第一次调用里等满 10s 然后抛 ``BrokenBarrierError``（它不在
+    ``OSError/ValueError`` 的吞掉名单里），用例因此红；只有真正并发的两条线程能一起
+    越过 Barrier。
+    """
+    barrier = threading.Barrier(2, timeout=10)
+
+    class BarrierVision(ScriptedVision):
+        def analyze_person_moments(self, path, labels, context=None):
+            barrier.wait()
+            return super().analyze_person_moments(path, labels, context)
+
+    vision = BarrierVision([reply(moment("P1")), reply(moment("P1"))])
+    extract = ExtractMoments(
+        assets=SqliteAssetRepository(db),
+        faces=SqliteFaceRepository(db),
+        entities=SqliteEntityRepository(db),
+        moments=SqliteMomentRepository(db),
+        previews=previews,
+        vision=vision,
+        workers=2,
+    )
+
+    result = extract(scope_id=HOME, selections=[album.add(), album.add()])
 
     assert len(vision.calls) == 2
     assert result.moments == 2

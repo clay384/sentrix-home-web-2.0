@@ -33,7 +33,12 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from sentrix.domain.assistant.evidence_ledger import EvidenceRequirement, EvidenceType
+from sentrix.domain.assistant.evidence_ledger import (
+    REQUIREMENT_SCOPE_KEYS,
+    EvidenceRequirement,
+    EvidenceType,
+    RequirementValueType,
+)
 
 # **一处对 1.0 与对 2.0 自己的双重偏离（2026-10-10 回退）。**
 #
@@ -65,48 +70,46 @@ MIN_REQUIREMENTS = 1
 #    提示词里先说清楚比事后补括号便宜。
 _DECLARATION_PROMPT = """你正在规划家庭记忆任务。只返回一个 JSON 对象，不要解释，不要 Markdown 代码块围栏。
 
-输出格式（<尖括号> 里是占位符，必须替换成这道题的实际内容；不要把占位符原样输出）：
-{{"action":"declare","declaration":{{"goal":"<用户目标>","requirements":[{{"id":"req_1","evidence_type":"<证据类型>","description":"<描述>"}}]}}}}
-
-不要输出 scope_id 字段 —— 相册范围由系统注入，你不需要也不应该填写；填任何值都会被判为错误。
+字段由 schema 固定；每条 requirement 的 predicate 写这条需求要查的具体谓词
+（如 拍摄地点、花费金额）。
 
 evidence_type 只能来自系统注册表，不得创造新类型：
 {evidence_types}
 
-只声明回答问题所必需的最小证据集合，不要把检索步骤本身当成答案证据重复声明。规则：
-- goal 必须用简体中文描述用户目标（家庭记忆系统使用中文，英文目标会导致语义检索
-  与中文图片描述失配、召回失败）；描述要保留完整语义，不要压缩成几个词。
-- 只要用户问的是**关于这个相册/照片的真问题**（不是打招呼、闲聊、让写东西这类与相册
-  无关的话），就声明 photo_set。**同时声明 delivered_photo** 表示「要把照片真的交到
-  用户手上」，只取到候选不算交付。
-  只有**与相册无关的普通聊天**（你好、谢谢、帮我写段文案）才不声明这两条。
-- 问某个已确认人物是谁、什么家庭角色、要人物档案时，声明 person_profile。
-  **问人与人的关系时同样要声明**：「A 和 B 是什么关系」「谁是谁的孩子/爸爸/妻子」
-  「那次是谁陪着她」「都有谁一起去了」——只声明 photo_set 拿到的是照片，
-  照片里没有「谁是谁的谁」这条信息，答不出来。
-- **只有**问**全相册层面的数量/统计**（一共几张、多少次、哪些媒体类型、处理状态）
-  时才声明 structured_fact。单张照片的拍摄时间、地点已经在检索结果的 preview 里
-  （``captured_at`` / ``place``），**不要**为它们声明 structured_fact——先声明
-  photo_set，必要时再声明 visual_observation 确认画面。
-- `photo_set` 与 `delivered_photo` 是**一对基础需求**：只要声明其中一条，就同时声明
-  另一条；这一对**不计入**下面的额度。除此之外，同一道题最多再声明 2 条证据需求，
-  不要为了「找照片 + 查元数据 + 看细节」把预算堆满。
-- **只有**问画面里看得见的**具体属性**——颜色、服饰、动作/道具、物体、建筑或雕塑外观——
-  且检索结果的 preview 摘要不足以回答时，才声明 visual_observation。
-  拍摄时间、地点和事件概述**优先用 photo_set 的 preview**（``captured_at`` / ``place`` /
-  ``evidence_summary``），不要默认精读；preview 没写清楚时再声明 visual_observation。
-- **只有**问画面中出现的**文字、数字、价格、招牌或标签内容**时才声明 visible_text。
-  不要把地点、颜色、服饰、物体、场景这类视觉信息当成 visible_text——那会让系统只去读
-  OCR，看不到照片本身。
-- **只有**问照片里的人是谁、身份归属时才声明 photo_identity；不要用它去识别物体、
-  场景、建筑或雕塑。
-- 一条需求只对应一种证据类型。「先把照片找出来」和「看清照片里的细节」是两条需求，
-  例如同时声明 photo_set 与 visual_observation；只声明 visible_text 通常答不了视觉细节。
-- 同一种 evidence_type 只声明一次；不要为了同一个答案同时声明多个等价需求。
-每个 requirement 都必须能由注册表中的工具直接获得。
-- JSON 示例中的尖括号内容仅用于说明字段，不是要输出的固定值。
-  goal、evidence_type、description 必须替换为当前用户问题对应的真实内容；
-  禁止原样输出 <用户目标>、<证据类型>、<描述> 或任何其他尖括号占位符。
+value_type 是「用户最终想要的值」，不是 evidence_type。只能取：
+place / time / duration / amount / count / person / media_set / description / boolean / value
+判定表（按用户问题的主要诉求选一个）：
+- 是否 / 有没有 / 禁止 / 允许 / 是不是 -> boolean
+- 哪一年 / 哪一天 / 什么时候 / 日期 / 几点 / 季节 -> time
+- 在哪里 / 哪儿 / 地点 / 位置 / 举办地 / 拍摄地 -> place
+- 多少钱 / 金额 / 价格 / 费用 / 花费 / 门票 / 小费 -> amount
+- 几张 / 几个 / 几次 / 多少人 / 数量 / 总数 -> count
+- 多久 / 多长时间 / 时长 / 停留 -> duration
+- 谁 / 哪些人 / 姓名 / 身份 / 关系 -> person
+- 全部记录 / 所有照片 / 找照片 / 找视频 / 合影 / 留影 -> media_set
+- 做了什么 / 什么活动 / 描述 / 画面 / 场景 / 穿着 / 布置 / 动作 -> description
+- 住院号 / 号码 / 客户 / 产品 / 结果 / 数值 / CRP -> value
+- 哪几类 / 哪几种 / 哪些类别 / 哪些种类 / 什么类型 / 哪次活动 / 哪场活动 -> description
+  即使句子里有地点，地点只放 scope，value_type 仍必须是 description。
+问句里同时出现时间/地点和真正诉求时，value_type 由诉求决定，时间和地点只进 scope。
+例如“2017年那场婚礼一共花了多少钱”的 value_type 是 amount，不是 time。
+scope 的键只能是 event / time / place / person；能从问题确定的事件、地点、人物、时间必须写上，
+不确定就输出空对象 {{}}；time 只放时间表达式（年份/日期/季节），地名不能塞进 time。
+任何字段都禁止输出 <...> 占位符；scope 里禁止写“未知”“unknown”“n/a”。
+
+只声明回答问题所必需的最小证据集合，不要把检索步骤本身当成答案证据。规则：
+- goal 用简体中文并保留完整语义（英文 goal 会让检索与中文描述失配）。
+- 关于相册的真问题就声明 photo_set + delivered_photo（成对、不计额度）；
+  只有与相册无关的闲聊或写作请求才不声明。
+- 问已确认人物是谁、家庭角色、人物档案，或问人与人的关系时声明 person_profile——照片本身没有关系信息。
+- 只有全相册级统计（共几张、多少次、哪些媒体类型）才声明 structured_fact；单张的时间、地点在 preview 里。
+- 只有 preview 摘要不足、且问画面可见属性（颜色、服饰、动作、物体、建筑）时才声明 visual_observation。
+- 只有问图内文字、数字、价格、招牌时声明 visible_text；地点、颜色、服饰、场景不算。
+- 只有问照片里的人是谁、身份归属时声明 photo_identity。
+- 一条 requirement 只对应一种 evidence_type；「先找照片」与「看清细节」要分成两条。
+- photo_set + delivered_photo 之外最多再声明 2 条证据需求；同一 evidence_type 可按
+  value_type 拆多条，但不得两条完全相同。
+- 每条 requirement 都必须能由注册表中的工具直接获得。
 
 不要调用工具，不要输出 SQL，不要直接回答用户。"""
 
@@ -146,6 +149,8 @@ _TYPE_ALIASES: Mapping[str, str] = {
 }
 
 _HEX_DIGITS = re.compile(r"^[0-9a-f]+$")
+_ANGLE_PLACEHOLDER = re.compile(r"<[^>]*>")
+_UNKNOWN_SCOPE_VALUES = frozenset({"未知", "unknown", "n/a", "na", "none", "null", "-"})
 
 
 def planner_evidence_types() -> tuple[str, ...]:
@@ -158,6 +163,83 @@ def build_prompt() -> str:
     """规划提示词的最终形态（把注册表渲染进去）。1.0 ``goal_planner.py:113`` 同形。"""
     evidence_lines = "\n".join(f"- {item}" for item in planner_evidence_types())
     return _DECLARATION_PROMPT.format(evidence_types=evidence_lines)
+
+
+def planner_response_format() -> dict[str, Any]:
+    """规划器的 JSON Schema。
+
+    llama.cpp 的 schema 语法对 ``pattern`` / ``minLength`` 支持不稳定：复杂 schema 会直接
+    500（实测 2026-10-26）。因此这里只约束**结构**（必填字段、枚举、布尔），文本层面的
+    占位符与“未知”由 ``parse_declaration`` 再校验一次。``enable_thinking=false`` 同样
+    必须一起发：思考 token 与语法约束冲突时，llama.cpp 会回
+    “does not match the expected peg-native format”。
+    """
+    string = {"type": "string"}
+    scope = {
+        "type": "object",
+        "properties": {
+            "event": string,
+            "time": string,
+            "place": string,
+            "person": string,
+        },
+        "additionalProperties": False,
+    }
+    requirement = {
+        "type": "object",
+        "properties": {
+            "id": string,
+            "evidence_type": string,
+            "description": string,
+            "predicate": string,
+            "value_type": {"type": "string", "enum": [item.value for item in RequirementValueType]},
+            "scope": scope,
+            "required": {"type": "boolean"},
+        },
+        "required": [
+            "id",
+            "evidence_type",
+            "description",
+            "predicate",
+            "value_type",
+            "scope",
+            "required",
+        ],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "planner_declaration",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["declare", "revise"]},
+                    "declaration": {
+                        "type": "object",
+                        "properties": {
+                            "goal": string,
+                            "requirements": {
+                                "type": "array",
+                                "minItems": MIN_REQUIREMENTS,
+                                "items": requirement,
+                            },
+                        },
+                        "required": ["goal", "requirements"],
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["action", "declaration"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def planner_chat_template_kwargs() -> dict[str, Any]:
+    """规划调用关闭 thinking。其他调用方不受影响。"""
+    return {"enable_thinking": False}
 
 
 def history_prompt_suffix(history: str) -> str:
@@ -183,6 +265,13 @@ def correction_hint(reason: str) -> str:
         "no_requirements": (
             "至少要声明一条证据需求。零需求会让这一轮一次检索都不做——"
             "即使你认为可以直接回答，也要声明取到哪些证据才算数。"
+        ),
+        "invalid_requirement": (
+            "每条 requirement 必须带 predicate、value_type、scope、required。"
+            "value_type 只能取 place/time/duration/amount/count/person/media_set/"
+            "description/boolean/value；required 必须是 true 或 false；"
+            "scope 必须是对象且只能有 event/time/place/person 四个键，"
+            "不确定就写空对象 {}；任何字段都不能保留 <...> 占位符或写“未知”。"
         ),
     }
     return (
@@ -216,6 +305,15 @@ def parse_json(raw: str) -> dict[str, Any]:
     if start < 0:
         raise ValueError("planner did not return JSON")
     candidate = text[start:]
+    # **先取第一个完整对象。** 实测 2026-10-26：模型会在 ``</think>`` 后再重复输出一个
+    # JSON，``json.loads`` 因 “Extra data” 整段失败，而第一个对象本身是合法的。
+    # ``raw_decode`` 只读第一个；它失败（例如缺少收尾 ``}``）时再走下面那条有限修复。
+    try:
+        first, _ = json.JSONDecoder().raw_decode(candidate)
+    except json.JSONDecodeError:
+        first = None
+    if isinstance(first, dict):
+        return first
     try:
         payload = json.loads(candidate)
     except json.JSONDecodeError as exc:
@@ -254,7 +352,8 @@ def normalize_payload(payload: Mapping[str, Any], *, scope_id: str, default_goal
     """把小模型可能简化的 declaration 结构归一为严格 schema。1.0 ``_normalize_payload``。
 
     归一的三件事：补 ``scope_id``（模型不产出它）、补 ``goal``、把 ``requirements`` 里
-    的字符串/近义字段拉平。去重按 evidence_type——同一个需求声明两次是模型常见的冗余。
+    的字符串/近义字段拉平。去重按 ``(evidence_type, value_type, description)``：
+    同一 evidence_type 下按 value_type 拆成多条是允许的，只有内容完全相同的才丢。
     """
     if not isinstance(payload, Mapping):
         return dict(payload) if isinstance(payload, Mapping) else {}
@@ -278,13 +377,16 @@ def normalize_payload(payload: Mapping[str, Any], *, scope_id: str, default_goal
 
     raw_requirements = decl.get("requirements") or decl.get("needs") or []
     normalized: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str, str]] = set()
     for index, item in enumerate(raw_requirements if isinstance(raw_requirements, list) else []):
         if isinstance(item, str):
             evidence_type = _TYPE_ALIASES.get(item.lower(), "photo_set")
-            if evidence_type in seen:
+            # 旧形状（字符串需求）没有 value_type，仍按 evidence_type 去重：
+            # ["photo", "image"] 是同一个意思，不应变成两条。
+            fingerprint = (evidence_type, "__legacy__", "")
+            if fingerprint in seen:
                 continue
-            seen.add(evidence_type)
+            seen.add(fingerprint)
             normalized.append(
                 {
                     "id": f"req_{index + 1}",
@@ -296,15 +398,24 @@ def normalize_payload(payload: Mapping[str, Any], *, scope_id: str, default_goal
         elif isinstance(item, Mapping):
             evidence_type = str(item.get("evidence_type") or item.get("type") or "photo_set").strip()
             evidence_type = _TYPE_ALIASES.get(evidence_type.lower(), evidence_type)
-            if evidence_type in seen:
+            description = str(item.get("description") or item.get("desc") or "")
+            value_type = str(item.get("value_type") or "").strip()
+            fingerprint = (evidence_type, value_type, description)
+            if fingerprint in seen:
                 continue
-            seen.add(evidence_type)
+            seen.add(fingerprint)
             normalized.append(
                 {
                     "id": str(item.get("id") or f"req_{index + 1}"),
                     "evidence_type": evidence_type,
-                    "description": str(item.get("description") or item.get("desc") or ""),
-                    "required": bool(item.get("required", True)),
+                    "description": description,
+                    # **不要在这里 ``bool()``。** ``None``/字符串会被悄悄变成
+                    # ``False``/``True``，而 schema 要的是显式布尔；归一阶段保留原值，
+                    # 由 ``parse_declaration`` 判非法并触发一次纠正。
+                    "required": item.get("required", True),
+                    "predicate": str(item.get("predicate") or ""),
+                    "value_type": value_type,
+                    "scope": item.get("scope", {}),
                 }
             )
     decl["requirements"] = normalized
@@ -339,12 +450,48 @@ def parse_declaration(
             evidence_type = EvidenceType(str(item.get("evidence_type") or ""))
         except ValueError:
             return None, "invalid_planner_action"
+
+        description = str(item.get("description") or "").strip()
+        predicate = str(item.get("predicate") or "").strip()
+        raw_value_type = str(item.get("value_type") or "").strip()
+        required = item.get("required", True)
+        if not description or not predicate or _ANGLE_PLACEHOLDER.search(description):
+            return None, "invalid_requirement"
+        try:
+            value_type = RequirementValueType(raw_value_type)
+        except ValueError:
+            return None, "invalid_requirement"
+        if not isinstance(required, bool):
+            return None, "invalid_requirement"
+
+        raw_scope = item.get("scope", {})
+        if not isinstance(raw_scope, Mapping):
+            return None, "invalid_requirement"
+        scope: list[tuple[str, str]] = []
+        for key, value in raw_scope.items():
+            key_text = str(key)
+            if key_text not in REQUIREMENT_SCOPE_KEYS:
+                return None, "invalid_requirement"
+            value_text = str(value or "").strip()
+            # **空值/未知/占位符的 scope 键直接丢弃，不让整条规划失败。**
+            # 这些键本来就是可选的；模型写 ``person: ""`` 或 ``time: "未知"`` 只说明
+            # 它没有这条信息，重试三次仍会得到同样的输出，最后变成 planner_blocked。
+            # 丢弃不丢语义，保留其余可用的 scope。
+            if not value_text or _ANGLE_PLACEHOLDER.search(value_text):
+                continue
+            if value_text.lower() in _UNKNOWN_SCOPE_VALUES:
+                continue
+            scope.append((key_text, value_text))
+
         requirements.append(
             EvidenceRequirement(
                 id=str(item.get("id") or f"req_{len(requirements) + 1}"),
                 evidence_type=evidence_type,
-                description=str(item.get("description") or ""),
-                required=bool(item.get("required", True)),
+                description=description,
+                required=required,
+                predicate=predicate,
+                value_type=value_type,
+                scope=tuple(sorted(scope)),
             )
         )
     if len(requirements) < MIN_REQUIREMENTS:

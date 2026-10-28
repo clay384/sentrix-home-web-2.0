@@ -9,6 +9,7 @@
  * `debugToolsForCall` / `debugPromptAnnotations` / `unboundTools`（`qaShared.ts`）等。
  */
 import type { RunItemDetail } from "../../api/types.ts";
+import { debugCallForCall } from "../../lib/agentTrace.ts";
 import {
   callOutcome,
   callOutcomeClass,
@@ -46,6 +47,7 @@ import {
 } from "../../lib/trace.ts";
 import type { AgentLoopGroup } from "../../lib/trace.ts";
 
+import { ModelCallView } from "./ModelCallView.tsx";
 import { segmentStyle, toolStatusLabel, unboundTools } from "./qaShared.ts";
 
 type Dict = Record<string, unknown>;
@@ -178,6 +180,9 @@ function CallNode({ detail, group, call, callIndex, modelLabel }: CallNodeProps)
   const segments = callLatencySegments(detail, call);
   const observation = callObservation(call);
   const step = debugStepForCallInGroup(detail, group, call);
+  // 2.0 的完整调用（messages / tools / 原始回复）按 step_id 挂在同一轮里；
+  // 老 run 没有它，回退到 1.0 的 debug_trace 投影。
+  const modelCall = debugCallForCall(detail, call);
   const showTools = showToolBranch(call);
   const tools = toolsForGroupedCall(detail, call);
   const toolDebugs = showTools ? debugToolsForCall(detail, group, call) : [];
@@ -261,7 +266,11 @@ function CallNode({ detail, group, call, callIndex, modelLabel }: CallNodeProps)
           {observation.relatedTool !== "-" ? <span>关联工具 {observation.relatedTool}</span> : null}
           {observation.parentStep !== "-" ? <span>父步骤 {observation.parentStep}</span> : null}
         </div>
-        {step && <DebugInline step={step} annotations={debugPromptAnnotations(detail, group, call)} />}
+        {modelCall ? (
+          <ModelCallView call={modelCall} title="模型输入 / 原始输出" />
+        ) : step ? (
+          <DebugInline step={step} annotations={debugPromptAnnotations(detail, group, call)} />
+        ) : null}
         {showTools && tools.length ? (
           <div className="tool-tree">
             {tools.map((trace, toolIndex) => (

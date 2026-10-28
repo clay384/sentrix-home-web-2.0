@@ -92,11 +92,16 @@ _WHITESPACE = re.compile(r"\s+")
 
 @dataclass(frozen=True, slots=True)
 class JudgeVerdict:
-    """评审裁决。``faithful`` 为真时 ``problems`` 为空。"""
+    """评审裁决。``faithful`` 为真时 ``problems`` 为空。
+
+    ``debug_call`` 只在调用方请求 ``include_debug`` 时非空：它是这次评审**实际发出去**
+    的消息与原始回复。裁决本身与它无关，所以默认 ``None``，不参与任何判定。
+    """
 
     faithful: bool = True
     problems: tuple[Mapping[str, Any], ...] = ()
     reason: str = ""
+    debug_call: Mapping[str, Any] | None = None
 
     @property
     def truth_problems(self) -> tuple[Mapping[str, Any], ...]:
@@ -177,14 +182,23 @@ def build_user_prompt(
     )
 
 
-def verdict_from_payload(payload: Mapping[str, Any] | None) -> JudgeVerdict:
+def verdict_from_payload(
+    payload: Mapping[str, Any] | None,
+    *,
+    debug_call: Mapping[str, Any] | None = None,
+) -> JudgeVerdict:
     """把解析出来的 JSON 变成裁决。缺 ``faithful`` 键一律当放行（1.0 同）。"""
     if not payload or "faithful" not in payload:
-        return JudgeVerdict()
+        return JudgeVerdict(debug_call=debug_call)
     if payload.get("faithful") is not False:
-        return JudgeVerdict(reason=str(payload.get("reason") or ""))
+        return JudgeVerdict(reason=str(payload.get("reason") or ""), debug_call=debug_call)
     problems = tuple(item for item in (payload.get("problems") or []) if isinstance(item, Mapping))
-    return JudgeVerdict(faithful=False, problems=problems, reason=str(payload.get("reason") or ""))
+    return JudgeVerdict(
+        faithful=False,
+        problems=problems,
+        reason=str(payload.get("reason") or ""),
+        debug_call=debug_call,
+    )
 
 
 @dataclass(frozen=True, slots=True)

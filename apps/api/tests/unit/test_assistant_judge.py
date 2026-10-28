@@ -195,3 +195,43 @@ def test_a_truth_problem_comes_back_as_unfaithful():
     assert not verdict.faithful
     assert verdict.truth_problems[0]["type"] == "omission"
     assert model.calls[0][0].role is ChatRole.SYSTEM
+
+
+def test_include_debug_records_the_review_prompt_and_raw_reply():
+    model = RecordingJudgeModel('{"faithful": true, "reason": "一致"}')
+
+    verdict = FaithfulnessJudge(model).review(
+        query="车停在哪",
+        answer="地下车库",
+        transcript=[ChatMessage(ChatRole.USER, "车停在哪")],
+        include_debug=True,
+        step_id="step_8",
+    )
+
+    assert verdict.faithful
+    call = verdict.debug_call
+    assert call is not None
+    assert call["step_id"] == "step_8"
+    assert call["call_type"] == "faithfulness_judge"
+    assert call["messages"][0]["content"] == JUDGE_SYSTEM
+    assert "地下车库" in call["messages"][1]["content"]
+    assert call["response"]["content"] == '{"faithful": true, "reason": "一致"}'
+    assert call["tools"] == []
+
+
+def test_a_failing_review_still_records_what_was_sent():
+    model = RecordingJudgeModel(RuntimeError("端点挂了"))
+
+    verdict = FaithfulnessJudge(model).review(
+        query="q",
+        answer="a",
+        transcript=[ChatMessage(ChatRole.USER, "q")],
+        include_debug=True,
+        step_id="step_9",
+    )
+
+    assert verdict.faithful
+    assert verdict.debug_call is not None
+    assert verdict.debug_call["status"] == "error"
+    assert verdict.debug_call["error"] == "端点挂了"
+    assert verdict.debug_call["messages"]

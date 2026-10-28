@@ -107,6 +107,10 @@ def test_sampler_walks_each_process_once_even_when_device_stats_are_collected(mo
     monkeypatch.setattr(jetson, "_meminfo_mib", lambda: {"system_memory_used_mib": 100})
     jetson._nvmap_cache.clear()
     jetson._nvmap_cache.update(at=float("-inf"), table=None)
+    # 这台机器上若有真实的 runtime_connection.json，scope 会覆盖关键词匹配路径，
+    # 于是 pid 42 根本不会被扫到。这条用例验的是「每个进程只走一次 smaps」，
+    # 不是「与机器上的部署配置交互」——把它隔离掉，CI 与开发机给出同一个答案。
+    monkeypatch.setattr(jetson, "load_telemetry_services", lambda: None)
     monkeypatch.setattr(jetson, "_read_nvmap_clients", lambda: "llama 0 42 3072K\n")
     monkeypatch.setattr(jetson, "_process_start_ticks", lambda pid: "123")
     monkeypatch.setattr(

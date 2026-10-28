@@ -5985,6 +5985,11 @@ components:
           type: string
           title: Conversation Id
           default: ''
+        include_debug:
+          type: boolean
+          title: Include Debug
+          description: 是否在回合轨迹里记录每次模型调用的完整输入与原始输出（默认关闭）
+          default: false
       type: object
       required:
       - message

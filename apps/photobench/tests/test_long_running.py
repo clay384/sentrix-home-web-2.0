@@ -45,7 +45,9 @@ def test_terminal_cache_detects_rejudge_updates_and_deletion(tmp_path):
     assert reader.get_run("r")["summary"]["answer_quality_mean"] == 1
     state = _state("r")
     state["items"][0]["judge"]["score"] = 0
-    _write(tmp_path, "r", state)
+    # 走生产写侧（临时文件 + replace）：同 inode 的原地重写在某些文件系统上会与
+    # 上一次共享 ``st_mtime_ns``，revision 于是不变，缓存看起来「没失效」。
+    FileResultWriter(tmp_path).write_snapshot("r", state)
     assert reader.get_run("r")["summary"]["answer_quality_mean"] == 0
     FileResultWriter(tmp_path).delete_run("r")
     with pytest.raises(KeyError):

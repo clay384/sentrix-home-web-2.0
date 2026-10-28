@@ -67,7 +67,15 @@ def planner_reply(*evidence_types: str, goal: str = "看海边的照片") -> Mod
         "declaration": {
             "goal": goal,
             "requirements": [
-                {"id": f"req_{index + 1}", "evidence_type": item, "description": f"需要 {item}"}
+                {
+                    "id": f"req_{index + 1}",
+                    "evidence_type": item,
+                    "description": f"需要 {item}",
+                    "predicate": "check",
+                    "value_type": "media_set",
+                    "scope": {},
+                    "required": True,
+                }
                 for index, item in enumerate(evidence_types)
             ],
         },
@@ -372,3 +380,50 @@ def test_a_turn_without_retrieval_exposes_no_candidates(candidate_client: TestCl
     body = poll_until_terminal(candidate_client, turn["turn_id"])
 
     assert body["result"]["retrieved_candidates"] == []
+
+
+def test_include_debug_puts_the_exact_model_calls_in_the_turn_trace(client: TestClient):
+    """``include_debug=true`` 时终态载荷里的 ``trace.debug_calls`` 带完整输入输出。
+
+    这是 PhotoBench 8772 的唯一数据来源；开关关闭时它必须是空表，不能变成
+    「永远采集」——那会把产品对话的提示词写进 ``agent_turns``。
+    """
+    conversation = make_conversation(client)
+    client.app.state.container = dataclasses.replace(
+        client.app.state.container,
+        chat_model=ScriptedChatModel([final("你好。")]),
+    )
+    response = client.post(
+        f"/api/v1/assistant/conversations/{conversation['id']}/turns",
+        json={"message": "你好", "include_debug": True},
+    )
+    assert response.status_code == 202, response.text
+
+    body = poll_until_terminal(client, response.json()["turn_id"])
+
+    trace = body["result"]["trace"]
+    assert trace["include_debug"] is True
+    calls = trace["debug_calls"]
+    # 第一次正文收尾之后门禁会提醒一次，所以 agent 调用可能不止一条；
+    # 这里只钉住「planner 在最前、其余都是 agent、每条都有原始输入输出」。
+    assert calls[0]["call_type"] == "planner"
+    assert {call["call_type"] for call in calls[1:]} == {"agent"}
+    assert calls[0]["messages"][1]["content"] == "你好"
+    assert calls[1]["messages"][0]["role"] == "system"
+    assert calls[1]["response"]["content"] == "你好。"
+    assert [call["seq"] for call in calls] == list(range(len(calls)))
+
+
+def test_the_debug_trace_is_empty_without_include_debug(client: TestClient):
+    conversation = make_conversation(client)
+    client.app.state.container = dataclasses.replace(
+        client.app.state.container,
+        chat_model=ScriptedChatModel([final("你好。")]),
+    )
+    turn = start_turn(client, conversation["id"], message="你好")
+
+    body = poll_until_terminal(client, turn["turn_id"])
+
+    trace = body["result"]["trace"]
+    assert trace["include_debug"] is False
+    assert trace["debug_calls"] == []

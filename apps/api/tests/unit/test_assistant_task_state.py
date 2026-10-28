@@ -274,17 +274,17 @@ def test_empty_arguments_parse_to_an_empty_mapping():
 def test_the_page_budget_covers_the_whole_result_set():
     """翻页额度**由结果集的容量推出来**，不是一个拍出来的数。
 
-    ``search_memories`` 的 ``limit`` 上限 12、每页 6 张 → 最多两页。额度小于它，模型就
-    看不完自己检索到的东西（那会把「检索到了」变成「检索到了但看不到」）；大于它，
-    多出来的额度只会被用在空页上。这条钉住那个关系——改了 limit 或 PAGE_SIZE 而没改
-    额度，这里立刻红。
+    ``search_memories`` 的 ``limit`` 上限 6、每页 6 张 → 一次给全，翻页工具不出现。
+    额度小于它会让模型看不完自己检索到的东西（「检索到了」变成「检索到了但看不到」）；
+    大于它只会被用在空页上。这条钉住那个关系——改了 limit 或 PAGE_SIZE 而没改额度，
+    这里立刻红。
     """
     pages_in_a_full_result_set = math.ceil(MAX_SEARCH_LIMIT / PAGE_SIZE)
 
     assert DEFAULT_PROFILE.max_page_calls >= pages_in_a_full_result_set
-    # 第 1 页 ``search_memories`` 已经给过，所以「看完」只需要再来 1 次；
-    # 额度留到 2 是余量，但不能大到「可以随便翻」。
-    assert DEFAULT_PROFILE.max_page_calls <= pages_in_a_full_result_set
+    # 6 张 / 6 张一页 = 1 次。允许 +1 的余量，是为了「一次失败后还能重试」
+    # （见 ``test_a_single_failure_does_not_block_the_retry``），但不能大到「可以随便翻」。
+    assert DEFAULT_PROFILE.max_page_calls <= pages_in_a_full_result_set + 1
 
 
 def test_a_denied_page_call_still_counts():

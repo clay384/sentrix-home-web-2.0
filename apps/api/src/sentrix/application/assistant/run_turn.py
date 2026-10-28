@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -34,6 +35,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from sentrix.application.assistant.claim_verifier import ClaimVerifier
+from sentrix.application.assistant.debug_trace import (
+    chat_messages_payload,
+    model_reply_payload,
+    tool_specs_payload,
+)
 from sentrix.application.assistant.goal_planner import (
     PLANNER_CALL_ERROR,
     GoalPlanner,
@@ -47,7 +54,26 @@ from sentrix.application.assistant.tools import (
     is_empty_result,
 )
 from sentrix.domain.assistant import emergency
-from sentrix.domain.assistant.evidence_ledger import EvidenceLedger, EvidenceType
+from sentrix.domain.assistant.claim_verifier import (
+    Claim,
+    ClaimReview,
+    claim_numbers,
+    claim_requirement,
+    high_risk_claims,
+)
+from sentrix.domain.assistant.evidence_binding import (
+    BindingVerdict,
+    Fact,
+    RequirementBinding,
+    bind_requirements,
+    binding_payload,
+    facts_from_state,
+)
+from sentrix.domain.assistant.evidence_ledger import (
+    EvidenceLedger,
+    EvidenceType,
+    RequirementValueType,
+)
 from sentrix.domain.assistant.final_guard import FinalGuard, GuardFacts, answered_with_gap
 from sentrix.domain.assistant.jit import select_tools
 from sentrix.domain.assistant.models import (
@@ -187,15 +213,7 @@ STALLED_ROUNDS_BEFORE_NUDGE = 2
 # 调用过** ``read_photo_text``。两条都不是检索失败，是**规划与执行脱节**；工具层看不见它，
 # 因为**没有任何一次调用是错的**。
 
-# ① 声明了结构化统计需求、却一次都没查过精确统计。
-STRUCTURED_FACT_NUDGE = (
-    "该问题声明了全量结构化统计需求。若要报告数量、日期或分组，"
-    "请调用 query_memory_facts 获取当前相册的精确统计；"
-    "如果条件不支持或没有可确认口径，也可以直接输出 final 如实说明，"
-    "不要把检索候选数当作统计答案。"
-)
-
-# ② 还有**没试过**的必需需求。
+# 还有**没试过**、且工具链确实可能满足的必需需求。
 UNATTEMPTED_NUDGE_TEMPLATE = (
     "还有声明的证据需求尚未尝试：{pending}。当前可用工具：{available}。"
     "请先用兼容工具获取证据；如果确实没有对应的照片或记录可以确认"
@@ -290,7 +308,10 @@ def _turn_trace(session: _Session, planned: PlannerResult | None) -> Mapping[str
         },
         # 账本条目：每条需求**取过没有、取到什么**。``unmet_reason`` 是 W7 加的，
         # 它把「取了没取到」与「根本没去取」分开——那正是这个面板要看的东西。
-        "evidence_ledger": {"entries": requirements},
+        "evidence_ledger": {
+            "entries": requirements,
+            "bindings": binding_payload(session.bindings),
+        },
         "guard": [
             {"code": str(event.payload.get("code") or ""), "hard": bool(event.payload.get("hard"))}
             for event in state.progress
@@ -306,7 +327,14 @@ def _turn_trace(session: _Session, planned: PlannerResult | None) -> Mapping[str
             "max_tool_calls": state.profile.max_tool_calls,
         },
         "delivered": [item.asset_id for item in session.delivered.items],
+        "answer_coverage": session.best_coverage,
         "retrieved_candidates": list(state.retrieved_candidates),
+        # **模型这一步看到什么、回答什么。** 只有 ``include_debug`` 时非空；
+        # 按发生顺序排列（planner → agent → judge），每条都带当时的 messages 与
+        # ``tools``，以及模型原始 content / thought / tool_calls。
+        "include_debug": session.include_debug,
+        "debug_calls": [dict(call) for call in session.debug_calls],
+        "claim_reviews": [dict(item) for item in session.claim_reviews],
     }
 
 
@@ -350,7 +378,7 @@ MODEL_SERVICE_ANSWER = "模型服务当前不可用，因此这一轮没有开�
 
 
 #: 「一张照片集」的两种工具：``search_memories`` 的首页预览与
-#: ``get_result_page`` 的翻页预览。模型回答问题时必须**至少能看到最新的一份六图描述**
+#: ``get_result_page`` 的翻页预览。模型回答问题时必须**至少能看到最新的一页描述**
 #: ——它包含 handle、时间、地点、人物与摘要，是后续 ``inspect_photo`` / 回答的入口。
 #: 把这一轮丢掉，模型就只剩「有结果集但看不见候选」的状态，整道题无法继续。
 _PROTECTED_PREVIEW_TOOLS = frozenset({"search_memories", "get_result_page"})
@@ -407,6 +435,24 @@ def _drop_oldest_tool_round_trip(messages: Sequence[ChatMessage]) -> list[ChatMe
     return None
 
 
+def _page_available(state: TaskState) -> bool:
+    """翻页工具最多出现一次：结果集超过一页，且本回合还没有成功翻过页。
+
+    **由代码收口，不靠模型自觉。** 158 实测：模型会把翻页当成“重读结果集”，
+    15 次翻页里 14 次要的是第 1 页。2.0 走原生 ``tools`` 字段，剪掉 = 物理上
+    不能调；一次成功后它就从工具表里消失，模型只能基于已经看到的内容作答。
+
+    候选不超过一页（``has_more`` 为假）时它从一开始就不出现——这正是
+    “没有满 12 张就别给翻页工具”的那条。
+    """
+    searches = [
+        record for record in state.records if record.tool == "search_memories" and record.status == "ok"
+    ]
+    if not searches or not bool(searches[-1].observation.get("has_more")):
+        return False
+    return not any(record.tool == "get_result_page" and record.status == "ok" for record in state.records)
+
+
 def _planner_failure_answer(planned: PlannerResult) -> str:
     """规划失败时给用户看的那句话。分岔依据是 ``fallback_reason``，不是文案措辞。"""
     if planned.fallback_reason != PLANNER_CALL_ERROR:
@@ -442,6 +488,9 @@ class TurnRequest:
 
     conversation_id: str
     question: str
+    #: 只在评测/复盘时打开：把每次模型调用实际发送的 messages / tools / 原始回复
+    #: 收进 ``TurnRecord.trace["debug_calls"]``。默认关闭——产品对话不为它付体积。
+    include_debug: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -486,6 +535,9 @@ class _Session:
     # 被换成「这一轮检索到 N 张候选照片。（本轮因「模型步数用尽」提前结束。）」，
     # 而**每一道都有一版模型写好、只是没人保存**的答案。
     last_answer: str = ""
+    #: 覆盖率最高的一版答案。守卫打回之后模型可能写得更差，收尾不能拿更差那版。
+    best_answer: str = ""
+    best_coverage: float = -1.0
     # 连续几轮「一条有用的结果都没拿到」。见 ``_converse`` 的护栏。
     stalled_rounds: int = 0
     # **正文工具调用的纠正只给一次。** 再犯说明模型这一轮压不住这个格式，
@@ -494,6 +546,23 @@ class _Session:
     # 每一次模型调用的指标。**不进进度事件**——``public_progress`` 同时是终端用户看的
     # 进度条，往里加事件就是给他每步多加一行噪音。它随收尾一起进 ``TurnRecord.trace``。
     model_calls: list[dict[str, Any]] = field(default_factory=list)
+    #: ``include_debug`` 打开时，每次调用的完整 messages / tools / 原始回复。
+    #: 与 ``model_calls`` 分开：前者是复盘用的输入输出，后者是评测指标；
+    #: 混在一起会把体积带进 ``model_call_metrics`` 这个逐题投影里。
+    include_debug: bool = False
+    debug_calls: list[dict[str, Any]] = field(default_factory=list)
+    #: 最近一次「需求 ↔ 事实」的绑定结果。只读投影，不改变账本状态；
+    #: 守卫用它决定「提醒、放行还是如实报缺口」。
+    bindings: tuple[RequirementBinding, ...] = ()
+    #: L3 每回合最多一次；这张表进轨迹，用来对比旧 L2 的触发率与命中的 claim。
+    claim_reviews: list[dict[str, Any]] = field(default_factory=list)
+    l3_judged: bool = False
+
+    def add_debug_call(self, call: Mapping[str, Any]) -> None:
+        """按发生顺序编号后追加一次模型调用。``seq`` 只在回合内唯一。"""
+        item = dict(call)
+        item["seq"] = len(self.debug_calls)
+        self.debug_calls.append(item)
 
 
 class RunTurn:
@@ -517,6 +586,9 @@ class RunTurn:
         self._planner = GoalPlanner(model)
         # L2 语义评审：与主循环同一个端点（1.0 也是同一个 chat_fn）。
         self._judge = FaithfulnessJudge(model)
+        # L3 claim-level 核验：默认开启；``SENTRIX_CLAIM_VERIFIER=0`` 可整体退回旧 L2。
+        self._claim_verifier = ClaimVerifier(model)
+        self._use_claim_verifier = os.getenv("SENTRIX_CLAIM_VERIFIER", "1") != "0"
 
     # ---- 建回合 -------------------------------------------------------------
 
@@ -541,6 +613,9 @@ class RunTurn:
             status=TurnStatus.PENDING,
             created_at=now,
             updated_at=now,
+            # 开关要跨 ``start`` / ``run`` 两个调用点，而它们之间只有这条落库的记录。
+            # 放进 trace（而不是进程内 dict）：重启后拿到的回合仍然知道自己要不要采。
+            trace={"include_debug": True} if request.include_debug else {},
         )
         self._turns.create(record)
         self._conversations.add_message(
@@ -573,6 +648,7 @@ class RunTurn:
             ),
             ledger=EvidenceLedger(scope_id=record.scope_id, requirements=[]),
             emit=emit,
+            include_debug=bool(record.trace.get("include_debug")),
         )
 
         # 政策拒答那条出口**不经过规划**，所以 ``planned`` 可能从头到尾没被赋值。
@@ -592,7 +668,15 @@ class RunTurn:
                 for message in self._conversations.history_for_prompt(record.conversation_id, HISTORY_LIMIT)
                 if message.turn_id != record.id
             )
-            planned = self._planner.declare(record.question, scope_id=record.scope_id, history=history)
+            planned = self._planner.declare(
+                record.question,
+                scope_id=record.scope_id,
+                history=history,
+                include_debug=session.include_debug,
+            )
+            # 规划发生在主循环之前，所以先把它按发生顺序放进同一条 debug 轨迹。
+            for call in planned.debug_calls:
+                session.add_debug_call(call)
             if not planned.ok:
                 # 1.0 ``runtime.py:1828``：规划不出来就以 planner_blocked 收场，不再往下走。
                 # 拿一条编出来的需求去检索，比诚实地说规划失败更糟。
@@ -615,7 +699,16 @@ class RunTurn:
                         ProgressStatus.COMPLETE,
                         "已确认需要哪些证据。",
                         kind="plan",
-                        payload={"requirements": list(session.ledger.as_payload())},
+                        payload={
+                            "requirements": list(session.ledger.as_payload()),
+                            # 让「规划」步骤能精确对上完整轨迹里的那一次调用；
+                            # 没开 include_debug 时为空。
+                            "call_id": (
+                                str(planned.debug_calls[-1].get("step_id") or "")
+                                if planned.debug_calls
+                                else ""
+                            ),
+                        },
                     ),
                 )
                 try:
@@ -688,12 +781,27 @@ class RunTurn:
         call_type: str = "agent",
     ) -> ModelReply:
         started = time.perf_counter()
+        step_id = _step_id(session.state)
         record: dict[str, Any] = {
-            "step_id": _step_id(session.state),
+            "step_id": step_id,
             "call_type": call_type,
             "attempt": len(session.model_calls) + 1,
             "status": "error",
         }
+        # **完整轨迹与指标分开两份。** 指标要逐题摊平进 ``model_call_metrics``；
+        # 把 messages/tools 也塞进去会让那个投影跟着膨胀。
+        debug_call: dict[str, Any] | None = None
+        if session.include_debug:
+            debug_call = {
+                "step_id": step_id,
+                "call_type": call_type,
+                "attempt": record["attempt"],
+                "started_at": datetime.now(UTC).isoformat(),
+                "status": "error",
+                "messages": chat_messages_payload(messages),
+                "tools": tool_specs_payload(specs),
+                "response": None,
+            }
         try:
             reply = self._model.complete(messages, specs)
             facts = list(reply.tool_argument_parse_facts)
@@ -713,13 +821,29 @@ class RunTurn:
                 tool_calls=[call.name for call in reply.tool_calls],
                 tool_argument_parse_facts=facts,
             )
+            if debug_call is not None:
+                debug_call.update(
+                    status="complete",
+                    prompt_tokens=reply.prompt_tokens,
+                    completion_tokens=reply.completion_tokens,
+                    finish_reason=reply.finish_reason,
+                    tool_calls=[call.name for call in reply.tool_calls],
+                    tool_argument_parse_facts=facts,
+                    response=model_reply_payload(reply),
+                )
             return reply
         except Exception as error:
             record.update(error_type=type(error).__name__, error=str(error))
+            if debug_call is not None:
+                debug_call.update(error_type=type(error).__name__, error=str(error))
             raise
         finally:
-            record["duration_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            duration_ms = round((time.perf_counter() - started) * 1000, 1)
+            record["duration_ms"] = duration_ms
             session.model_calls.append(record)
+            if debug_call is not None:
+                debug_call["duration_ms"] = duration_ms
+                session.add_debug_call(debug_call)
 
     def _converse(self, session: _Session, record: TurnRecord) -> str:
         state = session.state
@@ -756,6 +880,7 @@ class RunTurn:
                 session.ledger,
                 has_result_set=state.current_result_set_id is not None,
                 tools_exhausted=not state.can_call_tool(),
+                page_available=_page_available(state),
             )
             try:
                 reply = self._complete_recorded(session, messages, specs)
@@ -955,7 +1080,12 @@ class RunTurn:
             [item for item in raw_handles if isinstance(item, str)] if isinstance(raw_handles, list) else []
         )
 
-        outcome = self._toolbox.deliver(state.current_result_set_id or "", handles, scope_id=state.scope_id)
+        outcome = self._toolbox.deliver(
+            state.current_result_set_id or "",
+            handles,
+            scope_id=state.scope_id,
+            fallback_result_set_ids=state.result_set_ids,
+        )
         # **交付整体替换，不是累加**（失败时也替换成空）。1.0 是
         # ``turn.selected_image_handles = ...``——最后那个 final 说了算；累加会让一次被
         # 门禁打回的答案留下的图，混进后来那次没选图的交付里。
@@ -993,6 +1123,70 @@ class RunTurn:
         # 从不因此拒绝那个 final。
         return self._judge_answer(session, messages, answer)
 
+    def _refresh_bindings(self, session: _Session) -> None:
+        """把当前工具事实投影成 requirement 的绑定结果。
+
+        **只记录，不在这里改答案。** 判定结果交给提醒与收尾：``unsupported`` 不提醒
+        （工具没这个能力，逼模型只会得到编造），``satisfies`` 关闭需求，``partial`` 允许
+        带缺口回答。绑定事件进轨迹，8772 能看到每条需求为什么没被满足。
+        """
+        session.bindings = bind_requirements(session.ledger.requirements, facts_from_state(session.state))
+        if not session.bindings:
+            return
+        self._publish(
+            session,
+            session.state.emit(
+                ProgressStage.FINALIZING,
+                ProgressStatus.OK,
+                "已核对需求与工具事实。",
+                kind="evidence_binding",
+                payload={"bindings": binding_payload(session.bindings)},
+            ),
+        )
+
+    @staticmethod
+    def _answer_coverage(session: _Session) -> float:
+        """答案的**证据覆盖率**：required 需求里 satisfied 的比例。
+
+        没有需求时给 1.0——普通闲聊不该因为「没证据」被扣分。
+        """
+        required = [item for item in session.ledger.requirements if item.required]
+        if not required:
+            return 1.0
+        satisfied = {
+            binding.requirement_id
+            for binding in session.bindings
+            if binding.verdict is BindingVerdict.SATISFIES
+        }
+        return len(satisfied & {item.id for item in required}) / len(required)
+
+    def _remember_answer(self, session: _Session, answer: str) -> None:
+        """只保留覆盖率更高的答案。等覆盖率时保留最新的（模型通常在后一轮修正表达）。"""
+        text = (answer or "").strip()
+        if not text:
+            return
+        coverage = self._answer_coverage(session)
+        if coverage >= session.best_coverage:
+            session.best_answer = text
+            session.best_coverage = coverage
+        session.last_answer = text
+
+    @staticmethod
+    def _binding_gap(session: _Session) -> bool:
+        """required 需求里是否存在「工具不支持/覆盖不全/scope 不符/矛盾」。"""
+        required = {item.id for item in session.ledger.requirements if item.required}
+        return any(
+            binding.requirement_id in required
+            and binding.verdict
+            in {
+                BindingVerdict.UNSUPPORTED,
+                BindingVerdict.PARTIAL,
+                BindingVerdict.SCOPE_MISMATCH,
+                BindingVerdict.CONFLICT,
+            }
+            for binding in session.bindings
+        )
+
     def _judge_answer(self, session: _Session, messages: Sequence[ChatMessage], answer: str) -> str | None:
         """返回 ``None`` 表示这次不是最终回答（继续循环），返回字符串表示最终答案。
 
@@ -1025,7 +1219,9 @@ class RunTurn:
             facts=GuardFacts.from_state(state),
         )
         if verdict.passed:
-            if self._review_with_l2(session, messages, answer):
+            self._refresh_bindings(session)
+            self._remember_answer(session, answer)
+            if self._review_with_verification(session, messages, answer):
                 # 与门禁拦下同一条路：调用方把 pending_reminder 加回对话后继续循环。
                 return None
             reminder = self._one_shot_evidence_reminder(session, answer)
@@ -1056,7 +1252,7 @@ class RunTurn:
                 )
             state.finish(
                 TerminationReason.ANSWERED_WITH_GAP
-                if answered_with_gap(session.ledger)
+                if answered_with_gap(session.ledger) or self._binding_gap(session)
                 else TerminationReason.ANSWERED
             )
             return answer
@@ -1108,15 +1304,14 @@ class RunTurn:
         return None
 
     def _one_shot_evidence_reminder(self, session: _Session, answer: str) -> str | None:
-        """收尾前的三条一次性提醒。返回提醒文案，或 ``None``（无事可提）。
+        """收尾前的一次性提醒。返回提醒文案，或 ``None``（无事可提）。
 
         位置是**L1 与 L2 都通过之后、``state.finish()`` 之前**：走到这里说明这句回答
-        形式上没毛病，而这三条问的是另一个问题——**模型是不是压根没去取证**。
-        1.0 也把它们排在 L2 之后（``runtime.py:2540`` 起）。
+        形式上没毛病，而它问的是另一个问题——**模型是不是压根没去取证**。
 
-        三条的先后与互斥逐条照 1.0：① 只针对 ``structured_fact``；② 在 ① 已经提醒过时
-        把 ``structured_fact`` 排除掉（否则同一件事会被提醒两遍）；③ 只看「零工具调用」
-        这一条，与账本无关。
+        **``unsupported`` / ``partial`` 不提醒。** 工具没有这种值类型（例如
+        ``query_memory_facts`` 没有金额、时长、住院号），再提醒只会把模型逼向编造。
+        只有「工具可能满足、但这条需求从头到尾没试过」才提醒一次。
         """
         state = session.state
         if not state.can_step():
@@ -1125,41 +1320,30 @@ class RunTurn:
             return None
 
         attempted = _attempted_evidence_types(state)
+        bindings = {binding.requirement_id: binding for binding in session.bindings}
         unattempted = [
-            item for item in session.ledger.open_requirements() if item.evidence_type not in attempted
-        ]
-
-        # ① 声明了结构化统计需求，却一次都没查过精确统计——模型很可能正打算拿
-        # ``search_memories`` 的候选数当答案报出去（1.0 ``runtime.py:116`` 记过这条）。
-        structured = [item for item in unattempted if item.evidence_type is EvidenceType.STRUCTURED_FACT]
-        if structured and state.block_guard_code("structured_fact_reminder"):
-            self._reminder_event(session, "structured_fact_reminder", [item.id for item in structured])
-            return STRUCTURED_FACT_NUDGE
-
-        # ② 还有没试过的必需需求。这里**不问「为什么没满足」**，只问「试过没有」——
-        # 取过没取到是检索的问题，根本没去取是规划与执行脱节，两者修法完全不同。
-        rest = [
             item
-            for item in unattempted
-            if not (
-                item.evidence_type is EvidenceType.STRUCTURED_FACT
-                and "structured_fact_reminder" in state.guard_blocked_codes
-            )
+            for item in session.ledger.open_requirements()
+            if item.evidence_type not in attempted
+            and bindings.get(item.id) is not None
+            and bindings[item.id].verdict not in {BindingVerdict.UNSUPPORTED, BindingVerdict.PARTIAL}
         ]
+
         # 1.0 要求 ``available`` 非空：一个工具都给不出去时，提醒「请用工具」是空话。
         available = select_tools(
             session.ledger,
             has_result_set=state.current_result_set_id is not None,
             tools_exhausted=not state.can_call_tool(),
+            page_available=_page_available(state),
         )
-        if rest and available and state.block_guard_code("gate_unattempted"):
-            self._reminder_event(session, "gate_unattempted", [item.id for item in rest])
+        if unattempted and available and state.block_guard_code("required_evidence_missing"):
+            self._reminder_event(session, "required_evidence_missing", [item.id for item in unattempted])
             return UNATTEMPTED_NUDGE_TEMPLATE.format(
-                pending="、".join(f"{item.id}:{item.evidence_type.value}" for item in rest),
+                pending="、".join(f"{item.id}:{item.evidence_type.value}" for item in unattempted),
                 available="、".join(spec.name for spec in available),
             )
 
-        # ③ 零工具调用，却报出了具体数字/金额/年份。需求为空（模型认为无需证据）**不**
+        # 零工具调用，却报出了具体数字/金额/年份。需求为空（模型认为无需证据）**不**
         # 等于可以凭空编数字——这是一条与账本无关的兜底。
         #
         # 「零工具调用」要**排掉终止动作自己**：走到这里时它刚被记进 ``records``，直接看
@@ -1186,6 +1370,174 @@ class RunTurn:
                 payload={"code": code, "requirements": list(requirement_ids)},
             ),
         )
+
+    def _claim_bound(
+        self,
+        claim: Claim,
+        session: _Session,
+        facts: Sequence[Fact],
+    ) -> bool:
+        """这条 claim 是否已经由绑定到 requirement 的 fact 支撑。
+
+        有 requirement 时以绑定裁决为准；没有 requirement 时做一次**廉价的值匹配**
+        （数字/年份/地点是否出现在 fact 里）。匹配不上就交给 L3——这正是旧的 L2
+        「工具说 5、回答写 3」那类矛盾要抓的东西，而它不该靠每回合全量评审来抓。
+        """
+        requirement = claim_requirement(claim, session.ledger.requirements)
+        if requirement is not None:
+            binding = next(
+                (item for item in session.bindings if item.requirement_id == requirement.id),
+                None,
+            )
+            if binding is not None:
+                if binding.verdict is BindingVerdict.SATISFIES:
+                    return True
+                if binding.verdict in {
+                    BindingVerdict.PARTIAL,
+                    BindingVerdict.SCOPE_MISMATCH,
+                }:
+                    # 覆盖不全 / scope 缺失：L3 也补不出工具没有的 scope 信息，
+                    # 只会空转。记为 gap 并放行；矛盾/不支持才交给 L3。
+                    return True
+                if binding.verdict in {
+                    BindingVerdict.UNSUPPORTED,
+                    BindingVerdict.CONFLICT,
+                    BindingVerdict.UNKNOWN,
+                }:
+                    return False
+        typed = [fact for fact in facts if fact.value_type is claim.value_type]
+        numbers = claim_numbers(claim.text)
+
+        # **计数可以直接由候选集绑定。** 「两张照片」与 media_set 的 asset 数一致时，
+        # 不需要模型再核验；不一致才交给 L3。这是 L3 触发率的主要来源。
+        if claim.value_type is RequirementValueType.COUNT:
+            media_facts = [fact for fact in facts if fact.value_type is RequirementValueType.MEDIA_SET]
+            if numbers and media_facts:
+                return any(
+                    any(float(number) == float(len(fact.value)) for number in numbers)
+                    for fact in media_facts
+                    if isinstance(fact.value, (list, tuple, set))
+                )
+            if numbers and typed:
+                return any(
+                    str(int(number)) == str(fact.value).strip() for number in numbers for fact in typed
+                )
+            return False
+
+        if not typed:
+            return False
+        if claim.value_type is RequirementValueType.TIME:
+            years = re.findall(r"(?:19|20)\d{2}", claim.text)
+            if years:
+                return any(
+                    any(
+                        year in str(fact.value) or any(year in str(value) for value in fact.scope.values())
+                        for year in years
+                    )
+                    for fact in typed
+                )
+            return bool(numbers) and any(
+                any(str(int(number)) in str(fact.value) for number in numbers) for fact in typed
+            )
+        if numbers and claim.value_type in {
+            RequirementValueType.AMOUNT,
+            RequirementValueType.DURATION,
+        }:
+            for fact in typed:
+                haystacks = [str(fact.value), *[str(value) for value in fact.scope.values()]]
+                if all(
+                    any(
+                        (str(int(number)) if float(number).is_integer() else str(number)) in haystack
+                        for haystack in haystacks
+                    )
+                    for number in numbers
+                ):
+                    return True
+            return False
+        if claim.value_type is RequirementValueType.PLACE:
+            claim_text = claim.text.replace(" ", "").lower()
+            return any(
+                bool(fact.scope.get("place"))
+                and (
+                    fact.scope["place"].replace(" ", "").lower() in claim_text
+                    or claim_text in fact.scope["place"].replace(" ", "").lower()
+                )
+                for fact in typed
+            )
+        return True
+
+    def _review_with_verification(
+        self, session: _Session, messages: Sequence[ChatMessage], answer: str
+    ) -> bool:
+        """L3 优先；没有高风险未绑定 claim 时直接放行（不再每回合调 L2）。"""
+        if not self._use_claim_verifier:
+            return self._review_with_l2(session, messages, answer)
+
+        state = session.state
+        facts = facts_from_state(state)
+        claims = high_risk_claims(answer)
+        unbound = [claim for claim in claims if not self._claim_bound(claim, session, facts)]
+
+        # 绑定冲突/未知但回答里没有高风险 claim：退回旧 L2，避免整类语义问题失去兜底。
+        if not unbound:
+            required_ids = {item.id for item in session.ledger.requirements if item.required}
+            risky_binding = any(
+                binding.requirement_id in required_ids
+                and binding.verdict in {BindingVerdict.CONFLICT, BindingVerdict.UNKNOWN}
+                for binding in session.bindings
+            )
+            if not risky_binding:
+                return False
+            if not claims:
+                return self._review_with_l2(session, messages, answer)
+            unbound = [claims[0]]
+
+        if session.l3_judged or not state.can_step():
+            return False
+        session.l3_judged = True
+        state.model_steps += 1
+        step_id = _step_id(state)
+        claim = unbound[0]
+        review: ClaimReview = self._claim_verifier.review(
+            query=state.question,
+            claim=claim,
+            facts=facts,
+            requirement=claim_requirement(claim, session.ledger.requirements),
+            include_debug=session.include_debug,
+            step_id=step_id,
+        )
+        session.claim_reviews.append(
+            {
+                "claim": claim.text,
+                "value_type": claim.value_type.value,
+                "verdict": review.verdict.value,
+                "reason": review.reason,
+                "call_id": step_id,
+            }
+        )
+        if session.include_debug and review.debug_call is not None:
+            session.add_debug_call(review.debug_call)
+        if not review.blocks:
+            return False
+        session.l2_unverified = True
+        session.l2_unverified_reason = review.reason or review.verdict.value
+        state.phase = FINALIZING
+        self._publish(
+            session,
+            state.emit(
+                ProgressStage.RECOVERING,
+                ProgressStatus.RUNNING,
+                f"核验认为「{claim.text[:40]}」缺少证据支撑。",
+                kind="judge",
+                payload={"code": "l3_unfaithful", "call_id": step_id},
+            ),
+        )
+        session.pending_reminder = (
+            f"核验认为回答里的「{claim.text[:60]}」缺少工具证据支撑"
+            f"（{review.reason or review.verdict.value}）。"
+            "请核对工具观察后重新给出回答；如果确实无法确认，请如实说明。"
+        )
+        return state.can_step()
 
     def _review_with_l2(self, session: _Session, messages: Sequence[ChatMessage], answer: str) -> bool:
         """L2 语义评审。返回 ``True`` 表示「继续循环，重新作答」。
@@ -1217,7 +1569,16 @@ class RunTurn:
             return False
         session.judged = True
         state.model_steps += 1
-        verdict = self._judge.review(query=state.question, answer=answer, transcript=messages)
+        judge_step_id = _step_id(state)
+        verdict = self._judge.review(
+            query=state.question,
+            answer=answer,
+            transcript=messages,
+            include_debug=session.include_debug,
+            step_id=judge_step_id,
+        )
+        if session.include_debug and verdict.debug_call is not None:
+            session.add_debug_call(verdict.debug_call)
         if verdict.faithful or not verdict.truth_problems:
             return False
         # 1.0 ``runtime.py:2786-2788``：判过不实就先把标记落下来。**标记在「判不实」那一刻
@@ -1233,7 +1594,8 @@ class RunTurn:
                 ProgressStatus.RUNNING,
                 verdict.reminder,
                 kind="judge",
-                payload={"code": "l2_unfaithful"},
+                # ``call_id`` 让 8772 的「评判步骤」能直接对上完整轨迹里的那一次调用。
+                payload={"code": "l2_unfaithful", "call_id": judge_step_id},
             ),
         )
         session.pending_reminder = verdict.reminder
@@ -1406,8 +1768,8 @@ class RunTurn:
         #
         # 这条界线正是两层的分工：**L2（忠实性）判的是「说没说谎」，打回之后模型没改好
         # 就放行原话——它至多不准确；L1 硬拦判的是「能不能说」，那版答案不能出街。**
-        if reason is not TerminationReason.GUARD_BLOCKED and session.last_answer:
-            return session.last_answer
+        if reason is not TerminationReason.GUARD_BLOCKED and (session.best_answer or session.last_answer):
+            return session.best_answer or session.last_answer
         # 模型到这一步**一个字都没产出过**（端点从头就不通、或输出一直是空）。
         # 非服务故障时再给它一次不占预算的机会。硬拦或已确认模型服务故障时
         # 不再追问：前者可能换回同样不能出街的话，后者会把规划文本误当答案。

@@ -18,11 +18,13 @@
 
 **三处相对 1.0 的差别，前两处继承 ``vlm_observer`` 已落地的决定，不是本模块新做的：**
 
-1. **图像不再下采样。** 1.0 的 ``analyze_person_moments`` 走 ``encode_vision_image``
-   （``:1107-1125``：最长边 896、JPEG q90、``VISION_CORE_MAX_DIMENSION`` 可配），
-   ``VlmObserver`` 用的是 ``_encode_image``（原图字节、按后缀定 mime）。2.0 保持
-   ``_encode_image`` 这一条口径。``analyze_person_appearance`` 在 1.0 里**本来就不走**
-   ``encode_vision_image``（``:1334-1336`` 直接读字节），这一条对它不构成差别。
+1. **图像按 ``IMAGE_MAX_SIDE`` 缩放，与观察器/精读同一条。** 1.0 的
+   ``analyze_person_moments`` 走 ``encode_vision_image``（``:1107-1125``：最长边 896、
+   JPEG q90、``VISION_CORE_MAX_DIMENSION`` 可配）。2.0 早先直接发原图，158 上实测
+   album3-14 的 ``person_insights`` 因此要 418s、moments 每次 ~28s：预览图是**整张原图**，
+   一张 3264×2448 就是 4,034 个图片 token。现在与 ``OpenAIVlmObserver`` /
+   ``OpenAIPhotoInspector`` 共用 1280 上限——比 1.0 的 896 大，是质量优先的折中。
+   ``analyze_person_appearance`` 的入图是头肩裁剪件（本来就小），走同一条不影响结果。
 2. **``_core_vision_options`` 不搬**（1.0 ``:1097-1105`` 的 ``think`` / ``num_ctx`` /
    ``num_predict`` 是 llama.cpp 与 ollama 的私有字段）。``chat_json`` 发的是
    ``MAX_ANSWER_TOKENS``，与 ``VlmObserver`` 同一个预算。
@@ -49,7 +51,7 @@ from typing import Any
 from sentrix.domain.identity.moments import PERSON_MOMENT_PROMPT, normalize_person_moments
 from sentrix.domain.identity.portrait import PERSON_PORTRAIT_PROMPT, normalize_writer_output
 from sentrix.infrastructure.assistant.model_endpoint import ServedModel
-from sentrix.infrastructure.media.vlm_observer import _encode_image, chat_json
+from sentrix.infrastructure.media.vlm_observer import IMAGE_MAX_SIDE, _encode_image, chat_json
 
 # 1.0 ``model_clients.py:1350`` 的 ``normalize_confidence(..., 0.55)`` 里的那个默认值。
 # 提示词只列了 clothing 与 confidence 两个字段，没有约束取值范围，所以拿不到数时是一个
@@ -134,7 +136,7 @@ class OpenAIPersonVision:
         ``labels`` 是这张预览图上真实画出的 P 编号。``normalize_person_moments`` 只认这个
         集合里的标签，模型认领一个不存在的编号时整条被丢掉——那一步在 domain 里，不在这里。
         """
-        image = _encode_image(Path(path))
+        image = _encode_image(Path(path), max_side=IMAGE_MAX_SIDE)
         if image is None:
             return None
         prompt = PERSON_MOMENT_PROMPT
@@ -154,7 +156,7 @@ class OpenAIPersonVision:
         （不描述背景与他人、不猜姓名性别关系）与那个裁剪框是一对：框放宽一点，背景里
         别人的衣服就会被算到这个头上。
         """
-        image = _encode_image(Path(path))
+        image = _encode_image(Path(path), max_side=IMAGE_MAX_SIDE)
         if image is None:
             return None
         prompt = _APPEARANCE_PROMPT + json.dumps(dict(metadata or {}), ensure_ascii=False)

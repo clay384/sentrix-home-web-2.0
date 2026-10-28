@@ -146,6 +146,23 @@ class TaskState:
         return None
 
     @property
+    def result_set_ids(self) -> tuple[str, ...]:
+        """本轮出现过的结果集 id，最近的在前。
+
+        收尾交付不能只认「最后一次检索」：模型可能先检索 A、再检索 B、最后交付 A 里的
+        handle，而 ``current_result_set_id`` 只剩 B。这里按记录倒序去重，交付时依次尝试。
+        """
+        ids: list[str] = []
+        for record in reversed(self.records):
+            if record.status != "ok" or record.tool not in RETRIEVAL_TOOLS:
+                continue
+            value = record.observation.get("result_set_id")
+            text = str(value) if value else ""
+            if text and text not in ids:
+                ids.append(text)
+        return tuple(ids)
+
+    @property
     def retrieved_candidates(self) -> tuple[str, ...]:
         """**检索捞回来的那批候选**（``asset_id``，按名次），不是交付的那批。
 

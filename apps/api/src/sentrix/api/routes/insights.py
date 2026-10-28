@@ -51,6 +51,9 @@ def _extract_moments(container: Container) -> ExtractMoments:
         moments=container.moment_repository,
         previews=container.person_preview_renderer,
         vision=container.person_vision,
+        # 与整册导入的推理池同一个数：8100 有 4 个 slot，4 个并发请求正好铺满；
+        # 逐张串行会把 4 个 slot 用成 1 个（album3-14 实测 insights 418s）。
+        workers=container.settings.album_workers,
     )
 
 

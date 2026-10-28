@@ -406,3 +406,13 @@ def observe_appearance():
         )
 
     return _build
+
+
+@pytest.fixture(autouse=True)
+def _legacy_l2_for_existing_suite(monkeypatch: pytest.MonkeyPatch) -> None:
+    """现有用例的剧本是按「每回合一次 L2」写的。
+
+    L3 默认在生产开启；这里把它关掉，避免既有 fake 模型因为多出一次 claim 核验而
+    错位。专门测 L3 的用例在测试体内把它重新打开。
+    """
+    monkeypatch.setenv("SENTRIX_CLAIM_VERIFIER", "0")

@@ -140,14 +140,18 @@
 |---|---|---|---|---|
 | §3.1 | 检索 preview 的字段 | `_RETRIEVAL_PREVIEW_KEEP` 7 个字段 + 复合 `evidence_summary`（caption → activity → place → objects[:8] → clothing[:8] → 文字：…，单段 120 字 / 整串 300 字上限） | **补齐同一套**，另加 `media_kind` / `level` / 顶层 `can_inspect` | 2.0 只暴露了 `caption` 一个列，而 `Observation` 上有八个。`objects` / `clothing` / `ocr_text` 恰恰是模型要调 `inspect_photo` / `read_photo_text` 才拿得到的东西——精读从 0.97 次/题涨到 3.4 次/题，撞上 `max_inspections = 3` 之后成片被拒（拒绝率 1.4% → 26.7%） |
 | §3.1 | preview 的 `level` | `exact` / `strong` / `approximate`，判据是「是不是事件成员」（`tools.py:1770`） | **同三个词，判据换成 `fusion.evidence_class_for`**：`anchor → exact`、`semantic → strong`、`expander → approximate` | 1.0 那个判据在 2.0 没有对应物；而 2.0 的融合层一直在算 `evidence_class`，只是 `RetrieveEvidence` 转 `EvidenceHit` 时把它丢了 |
-| §3.1 | preview 每页条数 | `preview[:5]` | **6**（`ResultSet.page_size`） | 1.0 那个 5 是它自己的上限裁切，没有证据说 5 比 6 好 |
+| §3.1 | preview 每页条数 | `preview[:5]` | **6**（`ResultSet.PAGE_SIZE`，等于 `MAX_SEARCH_LIMIT`） | 1.0 的 5 是它自己的上限裁切。2026-10-27 最终定 6：153 的 30 题扫描（6/8/10/12）时间 15.7→20.1s、质量在噪声内；153 487 验证 judge 0.901→1.058、墙钟 22→16s、翻页 0 |
 | §3.1 | preview 缺失时的键 | 键恒在、值取空 | **同** | 空值的意思是「这张图没记录到」，缺键会让模型以为链路坏了 |
 | §3.2 | 每一转发几份工具契约 | JIT，`LITE_TOOL_SCHEMAS` 每工具 <40 token，单步 150–300 token | **JIT**，`ToolSpec.brief`（≤40 字）+ `jit.select_tools`。实测第一转 863 字符 / 检索后 1839 / 交付题 1246（全量是 5509） | 2.0 原先每转发全量八份完整 schema = 5509 字符 ≈ 2704 token；1.0 的真实 `prompt_tokens` 中位数是 1437 |
 | §3.2 | JIT 剪枝的效力 | **只剪提示词渲染**，准入白名单是 `profile.tools`——模型看不见但仍能调 | **剪掉即不能调**（原生 `tools` 字段既是广告也是约束） | 所以 2.0 的规则一律**比 1.0 保守**：只剪「现在根本用不上」的。`get_result_page` 只要已有结果集就一直在——`photo_set` 销账不等于候选看完了（一页 6 条、结果集最多 12 条） |
 | §3.3 | max_tokens | `min(1501, 4400 - prompt)`，下限 64 | **`min(1501, context - prompt)`**，`context` 由 `Settings.vlm_context_tokens` 给（生产 6144）；剩余 < 256 时抛 `PromptTooLongError`，调用方压缩一整轮工具往返后再试一次 | 见上面 §3.3 那段 |
 | §3.4A | 工具计价 | 只数**成功**的调用 | **数所有工具往返**（`tool_round_trips`） | 见上面 §3.4A 那段 |
 | §3.4C | 工具额度用尽时 | 1.0 被拒即 `break` 结束回合 | **一个工具都不发**（`select_tools` 返回空集），模型只剩「说话」 | 实测 `step_budget_exhausted` 的 123 道里 **102 道判 0、2 分一道没有**——根子是模型到最后几步仍在撞墙，从没被逼着开口 |
-| §3.5 | 收尾前的一次性提醒 | 三条（`structured_fact_reminder` / `gate_unattempted` / `fabrication_check`），各一个 `*_prompted` 标志 | **搬回同样三条**，闩用 2.0 既有的 `block_guard_code` | 实测 212 道声明 `delivered_photo`、145 道零交付，而这 145 道里交付工具**一次都没被调用过**；`visible_text` 155 道未满足，其中 147 道从未调用过 `read_photo_text`。两条都不是检索失败，是**规划与执行脱节**——工具层看不见它，因为没有任何一次调用是错的 |
+| §3.5 | 收尾前的一次性提醒 | 三条（`structured_fact_reminder` / `gate_unattempted` / `fabrication_check`），各一个 `*_prompted` 标志 | **两条**：`required_evidence_missing`（仅 required + 未尝试 + 绑定不是 unsupported/partial）与 `fabrication_check`；`structured_fact_reminder` 已删除 | `structured_fact_reminder` 只按 evidence_type 判断「没查过」，对金额/时长/住院号这类工具根本没有的值类型也会逼模型去查 `query_memory_facts`；实测制造 9 道「362/95 张照片」式跑偏。`unsupported` / `partial` 现在允许如实报缺口 |
+| §3.9 | requirement 的结构化字段 | 1.0 只有 `id/evidence_type/description/required` | **增加** `predicate/value_type/scope`；planner 用 JSON Schema 约束解码，`enable_thinking=false`，非法字段一次纠正重试 | 只有 evidence_type 时，「照片候选数」与「婚宴金额」在账本层没有区别，守卫只能用类型打勾 + 全局 aggregate |
+| §3.10 | 证据绑定 | 无 | **`EvidenceBindingEvaluator`**：按 value_type + scope + coverage 给出 `satisfies/partial/unsupported/scope_mismatch/conflict/unknown`，进轨迹 | 让「工具没这个能力」与「取过没取到」分开：前者不提醒、不逼编造；后者才定向重试 |
+| §3.11 | 语义评审 | 每回合一次 L2（整段回答 + 最近 8 条消息） | **L3 claim-level**：只对高风险且未绑定的数字/日期/金额/地点断言调用；`SENTRIX_CLAIM_VERIFIER=0` 可回退旧 L2 | 旧 L2 531 次调用 / 1.19M prompt tokens，224 次 no-change；claim-level 把输入收窄到一条 claim + 相关 facts |
+| §3.12 | final_answer 结果集 | 只认 `current_result_set_id`；空 result_set 时 `unknown_result_set` | **按本轮出现过的结果集依次回退**；无结果集时空交付合法 | 实测 41 次 / 34 题 `unknown_result_set`，是 result set 生命周期而非模型错误 |
 | §3.6 | 规划提示词的 `delivered_photo` | 无条件：「声明 photo_set……**同时声明** delivered_photo」 | **有条件**：只有用户明确要看图时才同时声明 | **有意的偏离。** 实测 487 道里 212 道声明了 `delivered_photo`，而问题文本里真正要求看图的只有 **3 道** |
 | §3.7 | `delivery_contradiction` 规则 | 有（`final_guard.py:106-112`） | **已删除**，连同它的输入 `delivery_state` / `delivered_count` | 判据取不到（`deliver()` 成功恒 ≥ 1、失败记成 `error` 被 `from_state` 跳过），且前提变了：W6 之后交付字段必填，零交付是**明确写下的 `[]`** 而不是遗漏。让它活起来会在约 300 道题上各花一个模型步，打回的是模型的显式选择 |
 | §3.8 | 候选集 | item 里有 `retrieved_candidate_media` | **有**（`TurnRecord.retrieved_candidates` → `agent_turns.candidates_json` → 终态载荷 → `item["retrieved_candidate_media"]` + `candidate_retrieval_*`） | 见「2.0 不再暴露的轨迹」那一节 |
@@ -699,6 +703,19 @@ S9b-2 把 1.0 `BenchmarkRun`（`benchmark_orchestrator.py:1895`）的六个相�
 | 交付集的媒体类型 | `AttachmentSummary` 只有 `handle` / `asset_id` / `file_name`，**没有 media_type**——类型由 `assets` 表回查 |
 | `agent_turn_events` 表 | 存在的，但**唯一读取者**是轮询与 SSE 两个端点，没有别的指标端点 |
 
+> **2026-10-26 收回「模型输入输出不可得」（仅评测侧显式开启）。**
+> 1.0 的 `include_debug` 会把每次模型调用的完整 `prompt` / `raw_full` 放进
+> `runtime_turns[*].debug_trace`；2.0 此前没有任何等价物。现在
+> `POST /assistant/conversations/{id}/turns` 接受 `include_debug: true`（默认 `false`），
+> 打开后终态载荷的 `trace.debug_calls` 按发生顺序带 planner / Agent / judge 每次调用
+> 的 **实际 `messages`、实际 `tools`、原始 `content` / `thought` / `tool_calls`**。
+> 产品对话不打开这个开关，所以 `agent_turns.trace_json` 的体积不随日常使用增长。
+> PhotoBench 的 QA 主链固定打开它，并原样落进 `run.json` 的
+> `runtime_turns[*].trace_bundle.debug_calls`；8772 的「全流程完整轨迹」与 Agent Loop
+> 调用树都从这里取数。旧 run 没有这一格，界面明确显示「未记录」，不做推断。
+> 验证：`apps/api/tests/integration/test_run_turn.py::test_include_debug_records_planner_agent_and_judge_with_exact_messages`、
+> `apps/photobench/web/src/features/qa/DebugTracePanel.test.tsx`。
+
 ### 参数与常量
 
 | 项 | 值 | 出处 |
@@ -942,3 +959,19 @@ QA阶段的规范进度存于`phases.qa_eval.progress`：`agent_completed`为已
 Agent和Judge仍使用独立线程池，协调器等待任一池完成即提交结果，不再等全部Agent结束才回收Judge。恢复运行从已有明确Judge终态初始化计数，跳过事实单列，不重新请求既有评分。Agent阶段墙钟在最后Agent结果返回时结束，不包含等待Judge尾部。前端阶段卡和列表共用同一读取函数，优先内层、缺失时兼容外层；没有记录显示?，不以0替代未知。历史原文不改写，旧运行自身未更新的计数仍属于旧检查点事实，不能据有效评分数补造完整Judge终态。
 
 复现测试覆盖一题Agent阻塞时另一题Judge的合法0分、返回失败和抛异常及时可见；resume既有评分、失败/跳过、取消未开始题不假报完成、可空投影及历史外层字段UI。仅本地验证，未触碰四机或启动真实测评；后续发布按公共执行路径影响验证。
+
+## 2026-10-27 158 性能修正（页面容量 / 图像上限 / 建库并发 / 索引自愈）
+
+依据 `~/Downloads/sentrix-158-性能调查.md`（158 Mac 全链路实测）。四下改动的共同点是
+**只改被实测证明的路径，不引入可选档位**：数值全部落成常量。
+
+| # | 项 | 旧行为 | 现在 | 为什么 |
+|---|---|---|---|---|
+| P1 | 结果集每页条数 | 6 | **12**（`ResultSet.PAGE_SIZE`，与 `MAX_SEARCH_LIMIT` 相同） | 检索上限就是 12，一页给全；6 张一页让几乎每题多一次 `get_result_page` 模型步（Mac 实测约 16.9s） |
+| P2 | 发给视觉模型的图片长边 | 原图，无上限 | **1280**（`vlm_observer.IMAGE_MAX_SIDE`），人物预览先缩再画框 | 3264px 原图观察 4,260 prompt token / 48s，1280 为 1,445 / 24s；精读 ~4,100 → ~1,295；观察/精读语义抽检 8/8 一致 |
+| P3 | 人物瞬间抽取并发 | 串行 | **4**（`settings.album_workers`） | 建库 `person_insights` 418s → 236s；已确认人物的 moments 条数不变 |
+| P4 | 派生索引补写 | `already_indexed` 直接返回 `mirrored=True` | 从权威向量**幂等补写**镜像 | 嵌入式 Qdrant 写失败只记警告；旧路径永远补不回来（158 实测缺 344 条，`_staleness_reason` 全局比较，拖累所有 scope） |
+| P5 | 检索结果集容量 | 12 | **6**（生产固定：`DEFAULT_SEARCH_LIMIT`/`MAX_SEARCH_LIMIT` = `PAGE_SIZE`）；`total` 进 `model_visible` | 30 题扫描 6/8/10/12：时间随 N 上升、质量在噪声内；153 487 验证 6 张 judge +0.157、墙钟 −27%。`total` 明写「这是本次检索的候选数，不是相册真实数量」 |
+| P6 | 翻页语义 | 游标式第 2 页 = 剩余候选，工具随时可调 | **一次性翻页**：只在「检索 `has_more` 且本回合未成功翻过页」时出现，成功一次后 JIT 剪掉；生产 6/6 下 `has_more` 恒假，工具不出现；page<2 直接拒绝 | 158 实测 15 次翻页里 14 次要的是第 1 页，每次白花一个约 22s 的模型步。153 487：8.10→3.36 agent 步/题，翻页 0 |
+| P7 | 旧 preview 压缩 | 全文保留到回合结束 | **不做压缩**；改由一次性翻页从源头消除重复调用 | 实测压缩会让模型反复重读（单题 4–5 次翻页、254s vs 118s）；两页内容互补，压缩必然丢信息。一次成功翻页后工具消失，重复调用不再可能 |
+| P8 | planner 提示词 | 1,435 tok | **868 tok（−40%）** | 删掉 JSON Schema 已强制的字段形状/scope_id 禁令（合计 ~106 tok），合并证据声明规则 777→287 tok；value_type 判定表 465 tok 原样保留 |

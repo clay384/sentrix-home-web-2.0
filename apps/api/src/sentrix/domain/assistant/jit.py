@@ -47,6 +47,7 @@ def select_tools(
     *,
     has_result_set: bool,
     tools_exhausted: bool,
+    page_available: bool = True,
 ) -> tuple[ToolSpec, ...]:
     """这一步发给模型的工具集，**描述已经换成 ``brief``**。返回空元组是合法结果。
 
@@ -60,7 +61,12 @@ def select_tools(
     """
     return tuple(
         replace(spec, description=spec.brief)
-        for spec in _select_offered(ledger, has_result_set=has_result_set, tools_exhausted=tools_exhausted)
+        for spec in _select_offered(
+            ledger,
+            has_result_set=has_result_set,
+            tools_exhausted=tools_exhausted,
+            page_available=page_available,
+        )
     )
 
 
@@ -69,6 +75,7 @@ def _select_offered(
     *,
     has_result_set: bool,
     tools_exhausted: bool,
+    page_available: bool,
 ) -> tuple[ToolSpec, ...]:
     if tools_exhausted:
         return ()
@@ -89,10 +96,10 @@ def _select_offered(
             continue
         offered.update(tools if has_result_set else tools - _PHOTO_LEVEL_TOOLS)
 
-    if has_result_set:
-        # 翻页**不按需求剪**：``photo_set`` 被满足只说明检索成功过，不说明候选看完了
-        # （``search_memories`` 一页 6 条、结果集最多 12 条）。1.0 的模型在任何时候都能
-        # 调它；在 2.0 剪掉它就等于把「看第 7–12 张」这个能力整个拿掉。
+    if has_result_set and page_available:
+        # **翻页是一次性能力。** 生产固定「检索 = 页宽 = 6」，一次给全，这个工具
+        # 根本不会出现；若未来提高检索上限，第 2 页从第 ``PAGE_SIZE+1`` 张起直到
+        # 结束，成功翻过一次后由调用方把 ``page_available`` 置假，工具物理消失。
         offered.add("get_result_page")
 
     return tuple(spec for spec in TOOL_SPECS if spec.name in offered)

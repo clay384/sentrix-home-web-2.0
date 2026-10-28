@@ -57,13 +57,16 @@ class ScriptedModel:
         *,
         planner: object = None,
         judge: object = None,
+        claim: object = None,
     ) -> None:
         self._replies = list(replies)
         self._planner = planner_reply("photo_set", "delivered_photo") if planner is None else planner
         self._judge = judge_reply() if judge is None else judge
+        self._claim = claim
         self.calls: list[Sequence[ChatMessage]] = []
         self.planner_calls: list[Sequence[ChatMessage]] = []
         self.judge_calls: list[Sequence[ChatMessage]] = []
+        self.claim_calls: list[Sequence[ChatMessage]] = []
         # 主循环每一次拿到的那份工具名单（JIT 剪枝之后每次都可能不同）。
         self.tool_sets: list[list[str]] = []
 
@@ -73,6 +76,15 @@ class ScriptedModel:
         # （额度用尽时 ``select_tools`` 返回空集，见 §3.4 的 C/B′）——那时这条假件会把
         # 主循环当成评审，测出来的东西与跑的东西不是一回事。
         system = messages[0].content if messages else ""
+        if CLAIM_MARKER in system:
+            self.claim_calls.append(list(messages))
+            if isinstance(self._claim, Exception):
+                raise self._claim
+            if isinstance(self._claim, PlannerScript):
+                return ModelReply(content=self._claim.next(), finish_reason="stop")
+            if self._claim is None:
+                return ModelReply(content='{"verdict":"ambiguous"}', finish_reason="stop")
+            return self._claim  # type: ignore[return-value]
         if JUDGE_MARKER in system:
             self.judge_calls.append(list(messages))
             if isinstance(self._judge, Exception):
@@ -121,7 +133,14 @@ class StubToolbox:
         self.calls.append((name, dict(arguments)))
         return self._stubbed(name)
 
-    def deliver(self, result_set_id: str, handles: Sequence[str], *, scope_id: str) -> ToolOutcome:
+    def deliver(
+        self,
+        result_set_id: str,
+        handles: Sequence[str],
+        *,
+        scope_id: str,
+        fallback_result_set_ids: Sequence[str] = (),
+    ) -> ToolOutcome:
         # **交付走的是 ``deliver`` 而不是 ``execute``**——它是终止动作 ``final_answer``
         # 上的一个字段，不是一次工具调用。假件必须收这个形参，理由与 ``execute`` 那段
         # 相同：少一个就是运行时 ``TypeError``，而它会被吞成 ``model_error``，
@@ -167,6 +186,7 @@ def final_call(answer: str, *handles: str, call_id: str = "c_final") -> ModelRep
 
 JUDGE_MARKER = "事实一致性评审"
 PLANNER_MARKER = "你正在规划家庭记忆任务"
+CLAIM_MARKER = "事实一致性检查器"
 
 
 def judge_reply(*problems: tuple[str, str], faithful: bool | None = None) -> ModelReply:
@@ -189,7 +209,11 @@ class PlannerScript:
         return self._replies.pop(0) if len(self._replies) > 1 else self._replies[0]
 
 
-def planner_reply(*evidence_types: str, goal: str = "看海边的照片") -> ModelReply:
+def planner_reply(
+    *evidence_types: str,
+    goal: str = "看海边的照片",
+    value_type: str = "media_set",
+) -> ModelReply:
     """规划那次模型调用的回复。
 
     规划与主循环共用同一个模型端口（1.0 也是同一个 ``chat_fn``），测试里靠 ``tools`` 区分：
@@ -200,7 +224,15 @@ def planner_reply(*evidence_types: str, goal: str = "看海边的照片") -> Mod
         "declaration": {
             "goal": goal,
             "requirements": [
-                {"id": f"req_{index + 1}", "evidence_type": item, "description": f"需要 {item}"}
+                {
+                    "id": f"req_{index + 1}",
+                    "evidence_type": item,
+                    "description": f"需要 {item}",
+                    "predicate": "check",
+                    "value_type": value_type,
+                    "scope": {},
+                    "required": True,
+                }
                 for index, item in enumerate(evidence_types)
             ],
         },
@@ -209,12 +241,18 @@ def planner_reply(*evidence_types: str, goal: str = "看海边的照片") -> Mod
 
 
 SEARCH_OK = ToolOutcome(
-    observation={"result_set_id": "rs_1", "query": "海边", "total": 2, "has_more": False},
+    observation={
+        "result_set_id": "rs_1",
+        "query": "海边",
+        "total": 2,
+        "has_more": False,
+        "asset_ids": ["asset_1", "asset_2"],
+    },
     model_visible={
         "result_set_id": "rs_1",
         "query": "海边",
         "page": 1,
-        "page_size": 6,
+        "page_size": 12,
         "has_more": False,
         "preview": [
             {"handle": "photo_1", "file_name": "a.jpg", "captured_at": "2017-11-05T16:44:57"},
@@ -223,17 +261,22 @@ SEARCH_OK = ToolOutcome(
     },
 )
 
-#: 第二页预览。压缩测试用它证明**最新的一份六图集**被保留、更老的检索轮被丢掉。
+#: 第二页预览。压缩测试用它证明**最新的一份结果集页**被保留、更老的检索轮被丢掉。
 PAGE_OK = ToolOutcome(
-    observation={"result_set_id": "rs_1", "page": 2, "has_more": False},
+    observation={
+        "result_set_id": "rs_1",
+        "page": 2,
+        "has_more": False,
+        "asset_ids": [f"asset_{index}" for index in range(1, 15)],
+    },
     model_visible={
         "result_set_id": "rs_1",
         "page": 2,
-        "page_size": 6,
+        "page_size": 12,
         "has_more": False,
         "preview": [
-            {"handle": "photo_7", "file_name": "g.jpg", "captured_at": "2019-01-01T00:00:00"},
-            {"handle": "photo_8", "file_name": "h.jpg", "captured_at": "2019-01-02T00:00:00"},
+            {"handle": "photo_13", "file_name": "g.jpg", "captured_at": "2019-01-01T00:00:00"},
+            {"handle": "photo_14", "file_name": "h.jpg", "captured_at": "2019-01-02T00:00:00"},
         ],
     },
 )
@@ -248,7 +291,13 @@ DELIVER_OK = ToolOutcome(
 )
 
 SEARCH_EMPTY = ToolOutcome(
-    observation={"result_set_id": "rs_2", "query": "海边", "total": 0, "has_more": False},
+    observation={
+        "result_set_id": "rs_2",
+        "query": "海边",
+        "total": 0,
+        "has_more": False,
+        "asset_ids": [],
+    },
     model_visible={"result_set_id": "rs_2", "query": "海边", "page": 1, "preview": [], "has_more": False},
 )
 
@@ -601,26 +650,27 @@ def reminder_count(model: ScriptedModel, needle: str) -> int:
     )
 
 
-def test_a_declared_but_unused_structured_fact_earns_one_reminder(env):
-    """声明了 ``structured_fact`` 却一次都没查过精确统计 → 提醒一次（①）。
+def test_an_unsupported_structured_fact_does_not_earn_a_reminder(env):
+    """工具没有金额能力时**不提醒**——提醒只会把模型逼向编造。
 
-    模型在这个形态下最容易拿 ``search_memories`` 的候选数当答案报出去——1.0
-    ``runtime.py:116`` 就是为这条才把 ``total`` 从模型可见的观察里剥掉的。
+    旧实现只按 ``structured_fact`` 这个 evidence_type 判断「没查过」，于是「婚宴花了
+    多少钱」也会被提醒去查 ``query_memory_facts``，而该工具根本没有金额字段；实测
+    这一条制造了 9 道「362/95 张照片」式的跑偏。
     """
     _conversations, _turns, conversation, _db = env
     model = ScriptedModel(
         [
             tool_call("search_memories", "c1", query="海边"),
-            final_call("一共有 12 张海边的照片。", "photo_1"),
+            final_call("婚宴一共花了 3000 元。", "photo_1"),
         ],
-        planner=planner_reply("photo_set", "structured_fact"),
+        planner=planner_reply("photo_set", "structured_fact", value_type="amount"),
     )
     run_turn = build(env, model, StubToolbox({"search_memories": SEARCH_OK}))
     turn_id = start(run_turn, conversation)
 
     run_turn.run(turn_id)
 
-    assert reminder_count(model, "该问题声明了全量结构化统计需求") == 1
+    assert reminder_count(model, "该问题声明了全量结构化统计需求") == 0
 
 
 def test_an_unattempted_requirement_earns_one_reminder(env):
@@ -697,6 +747,49 @@ def test_the_reminder_lets_the_model_insist(env):
 
     assert result.answer == "海边有两张，但照片里的字读不到。"
     assert result.status is TurnStatus.PARTIAL
+
+
+def test_l3_verifies_an_unbound_count_and_allows_a_corrected_answer(env, monkeypatch):
+    """高风险、未绑定的数字由 L3 核验；模型改对后放行，且每回合只核验一次。"""
+    monkeypatch.setenv("SENTRIX_CLAIM_VERIFIER", "1")
+    _conversations, _turns, conversation, _db = env
+    model = ScriptedModel(
+        [
+            tool_call("search_memories", "c1", query="海边"),
+            final_call("一共有 12 张海边的照片。", "photo_1"),
+            final_call("一共有 2 张海边的照片。", "photo_1"),
+        ],
+        planner=planner_reply("photo_set", "structured_fact", value_type="count"),
+        claim=PlannerScript(['{"verdict":"contradicted","reason":"工具 total=2"}']),
+    )
+    run_turn = build(env, model, StubToolbox({"search_memories": SEARCH_OK}))
+    turn_id = start(run_turn, conversation)
+
+    result = run_turn.run(turn_id)
+
+    assert "2 张" in result.answer
+    assert len(model.claim_calls) == 1
+    assert result.termination_reason is TerminationReason.ANSWERED_WITH_GAP
+
+
+def test_a_count_matching_the_candidate_set_does_not_trigger_l3(env, monkeypatch):
+    """「两张照片」与 media_set 的 2 个 asset 一致——确定性绑定，不花 L3。"""
+    monkeypatch.setenv("SENTRIX_CLAIM_VERIFIER", "1")
+    _conversations, _turns, conversation, _db = env
+    model = ScriptedModel(
+        [
+            tool_call("search_memories", "c1", query="海边"),
+            final_call("一共有两张海边的照片。", "photo_1"),
+        ],
+        planner=planner_reply("photo_set", value_type="media_set"),
+        claim=PlannerScript(['{"verdict":"ambiguous"}']),
+    )
+    run_turn = build(env, model, StubToolbox({"search_memories": SEARCH_OK}))
+    turn_id = start(run_turn, conversation)
+
+    run_turn.run(turn_id)
+
+    assert model.claim_calls == []
 
 
 # ---- 需求的收尾记账：分清「没去取」与「取了没取到」 --------------------------
@@ -920,7 +1013,7 @@ def assert_tool_messages_are_paired(messages: Sequence[ChatMessage]) -> None:
 def test_compaction_drops_oldest_round_but_keeps_latest_preview(env):
     """压缩丢**整轮**，但**最新一次检索/翻页的六图 preview 必须留下**。
 
-    丢一半会留下没有配对结果的 ``tool_calls``，端点直接 400。丢最新那份六图集则更糟：
+    丢一半会留下没有配对结果的 ``tool_calls``，端点直接 400。丢最新那份结果集页则更糟：
     模型知道「有结果集」却看不见任何候选，整道题只能猜。所以这里先 search 再 page，
     压缩时丢更老的 search 轮，保留 page 轮。
     """
@@ -946,7 +1039,7 @@ def test_compaction_drops_oldest_round_but_keeps_latest_preview(env):
     assert len(model.calls) == 4, "第四次是压缩之后的那次重试"
     # 压缩前：两轮工具结果都在。
     assert sum(1 for m in model.calls[2] if m.role is ChatRole.TOOL) == 2
-    # 压缩后：只剩最新的 page 轮（六图集），更老的 search 轮被丢。
+    # 压缩后：只剩最新的 page 轮（结果集页），更老的 search 轮被丢。
     remaining = [m for m in model.calls[3] if m.role is ChatRole.TOOL]
     assert len(remaining) == 1
     assert '"page": 2' in remaining[0].content
@@ -955,9 +1048,9 @@ def test_compaction_drops_oldest_round_but_keeps_latest_preview(env):
 
 
 def test_a_prompt_that_still_does_not_fit_ends_the_turn_honestly(env):
-    """只剩受保护的六图集时**不再往下丢**，如实收尾。
+    """只剩受保护的结果集页时**不再往下丢**，如实收尾。
 
-    再压就只能删掉六图集本身——那会让模型看不见任何候选，继续跑也只是猜。宁可
+    再压就只能删掉结果集页本身——那会让模型看不见任何候选，继续跑也只是猜。宁可
     以 ``MODEL_ERROR`` 收尾，也不产出无依据的答案。
     """
     _conversations, _turns, conversation, _db = env
@@ -1633,3 +1726,87 @@ def test_the_fallback_text_is_never_used_when_the_model_said_anything(env):
 
     assert "这一轮检索到" not in result.answer
     assert "提前结束" not in result.answer
+
+
+# ---- 完整模型轨迹（include_debug） -----------------------------------------
+
+
+def test_include_debug_persists_the_switch_before_the_turn_runs(env):
+    _conversations, turns, conversation, _db = env
+    run_turn = build(
+        env,
+        ScriptedModel([final("给你。")]),
+        StubToolbox({"search_memories": SEARCH_OK}),
+    )
+
+    turn_id = run_turn.start(
+        TurnRequest(conversation_id=conversation.id, question=QUESTION, include_debug=True)
+    ).id
+
+    assert turns.get(turn_id).trace == {"include_debug": True}
+
+
+def test_include_debug_records_planner_agent_and_judge_with_exact_messages(env):
+    """每一步的模型输入 / 原始输出都要在：planner、主 Agent、L2 评审。"""
+    _conversations, turns, conversation, _db = env
+    model = ScriptedModel(
+        [
+            tool_call("search_memories", "c1", query="海边"),
+            final_call("这是你要的两张海边照片。", "photo_1", "photo_2"),
+        ]
+    )
+    toolbox = StubToolbox({"search_memories": SEARCH_OK, FINAL_ANSWER_TOOL: DELIVER_OK})
+    run_turn = build(env, model, toolbox)
+    turn_id = run_turn.start(
+        TurnRequest(conversation_id=conversation.id, question=QUESTION, include_debug=True)
+    ).id
+
+    run_turn.run(turn_id)
+
+    trace = turns.get(turn_id).trace
+    assert trace["include_debug"] is True
+    calls = trace["debug_calls"]
+    assert [call["seq"] for call in calls] == list(range(len(calls)))
+
+    planners = [call for call in calls if call["call_type"] == "planner"]
+    assert len(planners) == 1
+    assert planners[0]["messages"][1] == {"role": "user", "content": QUESTION}
+    assert planners[0]["tools"] == []
+    assert planners[0]["response"]["content"]
+
+    agents = [call for call in calls if call["call_type"] == "agent"]
+    assert len(agents) == 2
+    first, second = agents
+    assert first["step_id"] == "step_1"
+    assert first["messages"][0]["role"] == "system"
+    assert first["messages"][1] == {"role": "user", "content": QUESTION}
+    tool_names = [entry["function"]["name"] for entry in first["tools"]]
+    assert "search_memories" in tool_names
+    assert first["response"]["tool_calls"][0]["name"] == "search_memories"
+    assert json.loads(first["response"]["tool_calls"][0]["arguments"]) == {"query": "海边"}
+
+    assert second["step_id"] == "step_2"
+    tool_messages = [message for message in second["messages"] if message["role"] == "tool"]
+    assert tool_messages and "rs_1" in tool_messages[-1]["content"]
+    assert second["response"]["tool_calls"][-1]["name"] == FINAL_ANSWER_TOOL
+    final_arguments = json.loads(second["response"]["tool_calls"][-1]["arguments"])
+    assert final_arguments["answer"] == "这是你要的两张海边照片。"
+
+    judges = [call for call in calls if call["call_type"] == "faithfulness_judge"]
+    assert len(judges) == 1
+    assert judges[0]["messages"][0]["role"] == "system"
+    assert "事实一致性评审" in judges[0]["messages"][0]["content"]
+    assert judges[0]["response"]["content"]
+
+
+def test_debug_trace_is_off_by_default(env):
+    _conversations, turns, conversation, _db = env
+    model = ScriptedModel([tool_call("search_memories", "c1", query="海边"), final("给你。")])
+    run_turn = build(env, model, StubToolbox({"search_memories": SEARCH_OK}))
+    turn_id = start(run_turn, conversation)
+
+    run_turn.run(turn_id)
+
+    trace = turns.get(turn_id).trace
+    assert trace["include_debug"] is False
+    assert trace["debug_calls"] == []

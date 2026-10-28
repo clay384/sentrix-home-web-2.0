@@ -289,6 +289,44 @@ class OpenAIChatModel:
         self._context_tokens = context_tokens
 
     def complete(self, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> ModelReply:
+        return self._complete(messages, tools)
+
+    def complete_structured(
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec],
+        *,
+        response_format: Mapping[str, Any],
+        chat_template_kwargs: Mapping[str, Any] | None = None,
+    ) -> ModelReply:
+        """JSON Schema 约束解码。端点不认这两个字段时退回普通请求。
+
+        llama.cpp 在「thinking 开启 + 复杂 schema」下会回 500（peg-native format），
+        vLLM 的 ``response_format`` 支持范围也不一致。规划器把 schema 当**增强**而不是
+        前提：失败一次就退回原路径，不会因为端点不支持而让整轮规划失败。
+        """
+        try:
+            return self._complete(
+                messages,
+                tools,
+                response_format=response_format,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+        except (PromptTooLongError, OutputTruncatedError):
+            # 这两条与 schema 无关，回退普通请求只会再失败一次。
+            raise
+        except ModelServiceError as error:
+            log.warning("端点不接受结构化输出，回退普通请求：%s", error)
+            return self._complete(messages, tools)
+
+    def _complete(
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec],
+        *,
+        response_format: Mapping[str, Any] | None = None,
+        chat_template_kwargs: Mapping[str, Any] | None = None,
+    ) -> ModelReply:
         if not messages or messages[0].role is not ChatRole.SYSTEM:
             raise ChatModelError("对话必须以一条 system 消息开头（严格 chat template 的硬要求）")
         if any(message.role is ChatRole.SYSTEM for message in messages[1:]):
@@ -296,7 +334,13 @@ class OpenAIChatModel:
 
         # 名字先拿到再请求：拿不到就在这里失败，不会带着一个空名字去问端点。
         model_name = self._model.current()
-        response = self._post(model_name, messages, tools)
+        response = self._post(
+            model_name,
+            messages,
+            tools,
+            response_format=response_format,
+            chat_template_kwargs=chat_template_kwargs,
+        )
 
         if response.status_code == 404:
             # 名字对不上时 vLLM 回的就是 404（llama.cpp 不校验名字，这条只在 vLLM 上出现），
@@ -307,7 +351,13 @@ class OpenAIChatModel:
             refreshed = self._model.current()
             if refreshed != model_name:
                 model_name = refreshed
-                response = self._post(model_name, messages, tools)
+                response = self._post(
+                    model_name,
+                    messages,
+                    tools,
+                    response_format=response_format,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
 
         if response.status_code != 200:
             # **先认「这一句是被切断的」。** llama.cpp 解析不了工具调用的参数时会回 500，
@@ -361,7 +411,13 @@ class OpenAIChatModel:
         )
 
     def _post(
-        self, model_name: str, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]
+        self,
+        model_name: str,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec],
+        *,
+        response_format: Mapping[str, Any] | None = None,
+        chat_template_kwargs: Mapping[str, Any] | None = None,
     ) -> httpx.Response:
         prompt_tokens = self.estimate_prompt_tokens(messages, tools)
         budget = self._max_tokens(messages, tools)
@@ -392,6 +448,10 @@ class OpenAIChatModel:
         if tools:
             payload["tools"] = list(openai_tools(tools))
             payload["tool_choice"] = "auto"
+        if response_format is not None:
+            payload["response_format"] = dict(response_format)
+        if chat_template_kwargs is not None:
+            payload["chat_template_kwargs"] = dict(chat_template_kwargs)
 
         try:
             with httpx.Client(timeout=self._timeout_s) as client:

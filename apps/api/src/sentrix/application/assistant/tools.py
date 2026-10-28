@@ -37,10 +37,11 @@ from typing import Any
 from sentrix.application.assistant.query_memory_facts import QueryMemoryFacts
 from sentrix.application.retrieval.retrieve_evidence import EvidenceRequest, RetrieveEvidence
 from sentrix.application.retrieval.retrieve_graph import graph_direction, graph_intent
+from sentrix.domain.assistant.evidence_binding import fact_value_type
 from sentrix.domain.assistant.evidence_ledger import EvidenceType
 from sentrix.domain.assistant.models import Attachment
 from sentrix.domain.assistant.ports import PersonDirectory, ResultSetRepository
-from sentrix.domain.assistant.result_set import ResultSet, ResultSetEntry
+from sentrix.domain.assistant.result_set import PAGE_SIZE, ResultSet, ResultSetEntry
 from sentrix.domain.assistant.tools import MAX_DELIVERED_PHOTOS
 from sentrix.domain.identity.ports import FaceRepository, PersonCropRenderer
 from sentrix.domain.media.inspection import CERTAINTY_SUPPORTED
@@ -54,15 +55,15 @@ log = logging.getLogger("sentrix.assistant.tools")
 # 1.0 ``tools.py:2125`` 的 ``arguments.get("question") or "请描述这张照片"``。
 DEFAULT_INSPECT_QUESTION = "请描述这张照片"
 
-DEFAULT_SEARCH_LIMIT = 12
-MAX_SEARCH_LIMIT = 12
+DEFAULT_SEARCH_LIMIT = 6
+MAX_SEARCH_LIMIT = 6
 
 # 复合摘要的三个上限，逐条取自 1.0 ``agent_runtime/tools.py:371-414`` 的
 # ``_observation_summary``（单段文字 120 字、整串 300 字、列表取前 8 项）。
 #
 # **它们不是节流阀。** 实测这份摘要在真机上的中位数只有 136 字，上限几乎从不生效；
 # 它是防「一条异常长的 caption 或一份 1000 字的 OCR 把上下文吃掉」的兜底。
-# 不加的话，一页 6 条 preview 的摘要最坏可以是 6×1000 字——而 2.0 的窗口只有 6144。
+# 不加的话，一页 12 条 preview 的摘要最坏可以是 12×1000 字——而最小窗口只有 6144。
 _SUMMARY_TEXT_LIMIT = 300
 _SUMMARY_OCR_LIMIT = 120
 _SUMMARY_LIST_LIMIT = 8
@@ -239,16 +240,44 @@ class AssistantToolbox:
         )
         if isinstance(answer, FactRejection):
             return ToolOutcome(
-                observation={"status": answer.status, "reason": answer.reason},
+                observation={
+                    "status": answer.status,
+                    "reason": answer.reason,
+                    "filters_applied": {},
+                    "filters_not_applied": [],
+                },
                 model_visible={"status": answer.status, "reason": answer.reason},
                 failure_reason=answer.reason,
             )
+        raw_filters = arguments.get("filters")
+        requested = (
+            {
+                str(key): str(value)
+                for key, value in raw_filters.items()
+                if key in {"time", "media", "place", "person"} and str(value or "").strip()
+            }
+            if isinstance(raw_filters, Mapping)
+            else {}
+        )
+        applied = dict(answer.filters_applied)
+        not_applied = sorted(key for key in requested if key not in applied)
+        value_type = fact_value_type(answer.fact_type)
         return ToolOutcome(
             observation={
                 "fact_type": answer.fact_type,
+                # **把「这个工具实际产出的是什么值类型」写在观察里。** 绑定器读它，
+                # 轨迹也读它；少了这一格，``asset_count`` 与「婚宴花了多少钱」在
+                # 观察层就没有区别。
+                "value_type": value_type.value if value_type else "",
                 "value": answer.value,
                 "total": answer.total,
-                "filters_applied": dict(answer.filters_applied),
+                "filters_applied": applied,
+                "filters_requested": requested,
+                # 参数里有、实际没应用：不能当已应用。时间表达式解析失败就是这条，
+                # 静默忽略会把「2017 年那场婚礼」的统计退化成整个相册。
+                "filters_not_applied": not_applied,
+                "coverage": dict(answer.coverage),
+                "confidence": 1.0,
             },
             model_visible=answer.visible(),
         )
@@ -317,6 +346,25 @@ class AssistantToolbox:
             page_no = max(1, int(arguments.get("page") or 1))
         except (TypeError, ValueError):
             page_no = 1
+        total = len(result_set.asset_ids)
+        # **候选只有一页时没有“下一页”可翻。** 旧行为是照常返回第 1 页，模型于是
+        # 养成“检索完再翻一次”的习惯（158 实测 15 次翻页里 14 次要的是第 1 页，
+        # 每次白花一个约 22s 的模型步）。现在直接拒绝，并在文案里说清“已经全给过”。
+        if total <= PAGE_SIZE:
+            return _failure(
+                "single_page_only",
+                f"这次检索只找到 {total} 张候选，已经在 search_memories 的返回里全部给出，"
+                "没有第二页。请直接基于已经看到的内容作答。",
+            )
+        # 第 1 页就是 search 的返回，再要一次是纯重复；而翻页工具整个回合只会出现
+        # 一次（成功后 JIT 剪掉），把这一次用在重读第 1 页上等于放弃了第 13 张之后的
+        # 候选。直接拒绝，并告诉它该用 page=2。
+        if page_no < 2:
+            return _failure(
+                "first_page_already_shown",
+                "第 1 页就是 search_memories 返回的那 6 张，内容相同。"
+                "翻页请用 page=2（第 7 张起，直到最后）。",
+            )
         return self._page_outcome(result_set, page_no=page_no)
 
     def _page_outcome(
@@ -332,6 +380,11 @@ class AssistantToolbox:
             "query": result_set.query,
             "page": page.page,
             "page_size": page.page_size,
+            # ``total`` 从 2026-10-27 起进 model_visible：模型需要知道“一共几张、
+            # 还有没有第二页”。1.0 隐藏它是怕模型把候选池数量直接当成答案里的统计
+            # 数字；工具描述里已明确写「这是本次检索的候选数，不是相册里的真实数量」，
+            # ``has_more`` 的布尔语义也保留。
+            "total": page.total,
             "has_more": page.has_more,
             # 1.0 ``_RETRIEVAL_TOP_KEEP`` 里的一个字段：这一页**有没有东西可以精读**。
             # 与 ``has_more`` 不是一件事——前者问「这批候选能不能继续取证」，后者问
@@ -470,18 +523,47 @@ class AssistantToolbox:
 
     # ---- 交付（终止动作上的一个字段）-----------------------------------------
 
-    def deliver(self, result_set_id: str, handles: Sequence[Any], *, scope_id: str) -> ToolOutcome:
+    def deliver(
+        self,
+        result_set_id: str,
+        handles: Sequence[Any],
+        *,
+        scope_id: str,
+        fallback_result_set_ids: Sequence[str] = (),
+    ) -> ToolOutcome:
         """把终止动作里的 ``selected_image_handles`` 解成可打开的附件。
 
         **它不是一次工具调用**：调用方是 ``run_turn`` 的收尾分支，交付与作答在同一步里
         完成（1.0 ``runtime.py:309`` 的 ``final`` 动作字段）。走 ``execute()`` 那条路
         等于把它重新变成一次独立的工具调用——那正是这一版要修掉的东西。
+
+        ``fallback_result_set_ids`` 是本轮更早的结果集。模型可能先检索 A、再检索 B，
+        最后交付 A 里的 handle；只认 ``current_result_set_id`` 会把这种正确交付判成
+        ``unknown_result_set``（实测 41 次）。按顺序尝试，第一个存在且 scope 匹配的胜出。
         """
-        result_set = self._result_sets.get(result_set_id)
+        candidates = [result_set_id, *fallback_result_set_ids]
+        result_set = None
+        for candidate in candidates:
+            if not candidate:
+                continue
+            found = self._result_sets.get(candidate)
+            if found is not None and found.scope_id == scope_id:
+                result_set = found
+                break
         if result_set is None:
+            # **空交付在没有结果集时是合法的。** 模型明确回答「这轮不交图」，
+            # 不该因为一次检索都没做就变成 unknown_result_set。
+            if not handles:
+                return ToolOutcome(
+                    observation={"result_set_id": "", "delivered": 0, "rejected": []},
+                    model_visible={
+                        "result_set_id": "",
+                        "delivered": 0,
+                        "rejected": [],
+                        "note": "这一轮没有要展示给用户的照片。",
+                    },
+                )
             return _failure("unknown_result_set", "结果集不存在。请先调用 search_memories。")
-        if result_set.scope_id != scope_id:
-            return _failure("scope_mismatch", "这个结果集不属于当前相册。")
 
         raw_handles = handles
         if not isinstance(raw_handles, (list, tuple)):

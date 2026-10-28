@@ -32,6 +32,10 @@
   expire after three source periods and are never re-stamped as new observations.
 - Product model-call traces add optional tool-argument parse counts and outcomes.
   They contain execution facts, not benchmark judgments or raw prompts.
+  **2026-10-26:** raw prompts are available only through the opt-in
+  `include_debug=true` turn request, as `trace.debug_calls` (actual messages,
+  actual tools, raw content/thought/tool calls). The flag is off by default;
+  PhotoBench turns it on for evaluation. Absence is not an empty model call.
 - Native tool-argument JSON parsing has its own denominator; plain-text answers
   are not JSON attempts. Legacy JSON-action metrics remain available for legacy
   structured-action traces. Missing observations are not inferred successes.

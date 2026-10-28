@@ -64,7 +64,15 @@ def planner_reply(*evidence_types: str, goal: str = "看海边的照片") -> Mod
         "declaration": {
             "goal": goal,
             "requirements": [
-                {"id": f"req_{index + 1}", "evidence_type": item, "description": f"需要 {item}"}
+                {
+                    "id": f"req_{index + 1}",
+                    "evidence_type": item,
+                    "description": f"需要 {item}",
+                    "predicate": "check",
+                    "value_type": "media_set",
+                    "scope": {},
+                    "required": True,
+                }
                 for index, item in enumerate(evidence_types)
             ],
         },

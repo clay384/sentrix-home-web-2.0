@@ -41,12 +41,12 @@ wait_http() {
   return 1
 }
 
-if [ ! -f "$VLM_MODEL" ] || [ ! -f "$VLM_MMPROJ" ] || [ ! -f "$CLIP_CHECKPOINT" ]; then
-  echo "模型权重缺失：VLM=$VLM_MODEL / mmproj=$VLM_MMPROJ / CLIP=$CLIP_CHECKPOINT" >&2
-  exit 1
-fi
-
 if ! port_in_use "$VLM_PORT"; then
+  # 权重只在真的要拉起进程时才必须存在：模型已在跑时，这里只是一个重启入口。
+  if [ ! -f "$VLM_MODEL" ] || [ ! -f "$VLM_MMPROJ" ]; then
+    echo "VLM 权重缺失：$VLM_MODEL / $VLM_MMPROJ" >&2
+    exit 1
+  fi
   echo "启动 VLM :$VLM_PORT"
   nohup llama-server \
     --model "$VLM_MODEL" \
@@ -79,6 +79,10 @@ wait_http "http://127.0.0.1:$BGE_PORT/health" 180 || {
 }
 
 if ! port_in_use "$CLIP_PORT"; then
+  if [ ! -f "$CLIP_CHECKPOINT" ]; then
+    echo "Chinese-CLIP 权重缺失：$CLIP_CHECKPOINT" >&2
+    exit 1
+  fi
   echo "启动 Chinese-CLIP :$CLIP_PORT"
   CHINESE_CLIP_CHECKPOINT="$CLIP_CHECKPOINT" nohup .venv/bin/python scripts/maintenance/legacy_clip_sidecar.py \
     --port "$CLIP_PORT" > logs/legacy-clip.log 2>&1 < /dev/null &
