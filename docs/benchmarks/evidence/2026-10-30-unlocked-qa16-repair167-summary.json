@@ -1,0 +1,87 @@
+{
+  "original_run_id": "20261030-113629-album3-max-video10-unlocked-embedding-qa16-487-39d2af9-215a6f",
+  "run_id": "20261030-122033-album3-max-video10-unlocked-repair-167-timeout10800-39d2af9-e28e97",
+  "user_authorized_single_replay": true,
+  "source": "39d2af92c13fec55f8720c72772dea9d4de9fa10",
+  "qa_id": "album3v4-167",
+  "status": "completed",
+  "qa_seconds": 7.7671,
+  "progress": {
+    "operational": {
+      "not_evaluable_count": 0,
+      "by_kind": {
+        "configuration_error": 0,
+        "context_limit": 0,
+        "model_output_invalid": 0,
+        "output_limit": 0,
+        "provider_rejected": 0,
+        "resource_error": 0,
+        "step_limit": 0,
+        "time_limit": 0
+      },
+      "judge_incomplete_count": 0,
+      "judge_by_kind": {
+        "configuration_error": 0,
+        "context_limit": 0,
+        "model_output_invalid": 0,
+        "output_limit": 0,
+        "provider_rejected": 0,
+        "resource_error": 0,
+        "step_limit": 0,
+        "time_limit": 0
+      }
+    },
+    "total": 1,
+    "completed": 1,
+    "agent_completed": 1,
+    "agent_total": 1,
+    "agent_waiting": 0,
+    "agent_running": 0,
+    "judge_waiting": 0,
+    "judge_running": 0,
+    "outcome_unknown": 0,
+    "judge_completed": 1,
+    "judge_total": 1,
+    "judge_skipped": 0,
+    "qa_concurrency": 1,
+    "judge_concurrency": 4
+  },
+  "item": {
+    "execution_status": "completed",
+    "turn_status": "complete",
+    "termination_reason": "answered",
+    "wall_clock_ms": 6600.2,
+    "evaluation_status": null,
+    "judge_status": "completed"
+  },
+  "judge_scores": {
+    "judge": 1,
+    "evidence_judge": null
+  },
+  "judge_requests": {
+    "version": 1,
+    "requests_started": 2,
+    "responses_received": 2,
+    "request_errors": 0,
+    "http_429": 0,
+    "in_flight": 0,
+    "rate_waiting": 0,
+    "rate_wait_ms": 0.006624963134527206,
+    "gate_waiting": 0,
+    "gate_wait_ms": 233493.7769640237,
+    "gate_failures": 0,
+    "http_attempt_evidence_enabled": true,
+    "shared_gate_enabled": true,
+    "http_attempt_evidence_supported": true
+  },
+  "budget": {
+    "context": 262144,
+    "agent_steps": 30,
+    "chat_timeout_s": 10800,
+    "vlm_timeout_s": 10800,
+    "agent_wall_time_s": 14400,
+    "turn_timeout_s": 15000
+  },
+  "original_timing_unchanged": true,
+  "at": 1793334355.8269098
+}

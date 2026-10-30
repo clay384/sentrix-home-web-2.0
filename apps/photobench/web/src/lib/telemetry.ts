@@ -579,6 +579,16 @@ export function memoryProfileRows(rawProfile: unknown = {}): MetricRow[] {
   ];
 }
 
+function measuredThroughputDetail(summary: unknown): string {
+  const s = dict(summary);
+  const wall = Number(s.agent_phase_wall_ms);
+  const count = Number(s.agent_phase_completed_count);
+  if (!(wall > 0) || !Number.isFinite(wall) || !(count > 0) || !Number.isFinite(count)) return "";
+  const excluded = dict(s.operational).not_evaluable_count;
+  const qualifier = excluded == null ? "" : `（含 ${excluded} 题不可评估）`;
+  return ` · QA 用时 ${(wall / 60000).toFixed(2)} 分钟 · 处理速率 ${(count * 60000 / wall).toFixed(2)} 题/分钟${qualifier}`;
+}
+
 // ── 1.0 :1212-1253 聚合指标行 ────────────────────────────────────────────
 
 /**
@@ -597,7 +607,7 @@ export function aggregateMetricRows(run: unknown, summary: unknown): MetricRow[]
   const throughputSamples = Number(s.agent_throughput_latency_sample_count);
   const throughputTotal = Number(s.agent_throughput_latency_total_count ?? s.total);
   const throughputNote = s.agent_throughput_latency_mode === "measured_agent_phase"
-    ? `Agent 阶段实际墙钟 ÷ ${s.agent_phase_completed_count ?? throughputTotal} 题 · 并发 ${r.qa_concurrency ?? "-"} · 不含 Judge，Judge 可与 Agent 并行`
+    ? `Agent 阶段实际墙钟 ÷ ${s.agent_phase_completed_count ?? throughputTotal} 题 · 并发 ${r.qa_concurrency ?? "-"} · 不含 Judge，Judge 可与 Agent 并行${measuredThroughputDetail(s)}`
     : Number.isFinite(throughputSamples) && Number.isFinite(throughputTotal)
       ? `历史记录按 Agent/Judge 时间线回退估算 · ${throughputSamples}/${throughputTotal} 题，不能视为实测`
       : "历史记录未保存 Agent 独立阶段墙钟";
@@ -660,7 +670,7 @@ export function keyMetricRows(run: unknown, summary: unknown): KeyMetric[] {
         : "主模型 VmRSS 峰值 · Orin 无独立显存，这是进程驻留"
       : "主模型显存峰值 · NVML 按模型 PID 汇总";
   const throughputNote = s.agent_throughput_latency_mode === "measured_agent_phase"
-    ? `Agent 阶段实际墙钟 ÷ ${s.agent_phase_completed_count ?? s.total ?? 0} 题 · 并发 ${r.qa_concurrency ?? "-"} · 不含 Judge（Judge 与 Agent 并行）`
+    ? `Agent 阶段实际墙钟 ÷ ${s.agent_phase_completed_count ?? s.total ?? 0} 题 · 并发 ${r.qa_concurrency ?? "-"} · 不含 Judge（Judge 与 Agent 并行）${measuredThroughputDetail(s)}`
     : "历史记录按时间线回退估算，不是实测值";
   const operational = dict(s.operational);
   return [

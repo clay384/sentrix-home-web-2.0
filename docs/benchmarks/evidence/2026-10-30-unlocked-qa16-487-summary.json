@@ -1,0 +1,157 @@
+{
+  "schema": "sentrix-487qa-unlocked-v1",
+  "captured_at": 1793333557.323764,
+  "source": "39d2af92c13fec55f8720c72772dea9d4de9fa10",
+  "run_id": "20261030-113629-album3-max-video10-unlocked-embedding-qa16-487-39d2af9-215a6f",
+  "frontend": "http://192.168.0.224:18773/",
+  "model_node": "200 single RTX3090",
+  "model": "Qwen3.5-4B AWQ W4A16 group32 BF16 vision",
+  "window": 262144,
+  "agent_max_steps": 30,
+  "QA_concurrency": 16,
+  "questions": 487,
+  "dataset_sha256": "73fa4512dde072fb0df9cf45ff3ebd192192db606f9764054bde002dcbf0be47",
+  "QA_seconds": 2132.1771,
+  "QA_per_minute": 13.70430251783494,
+  "QA_per_hour": 822.2581510700965,
+  "amortized_seconds_per_QA": 4.37818706365503,
+  "QA_started_at": "2026-10-30T11:36:32.394948+08:00",
+  "QA_finished_at": "2026-10-30T12:12:04.572018+08:00",
+  "operational": {
+    "not_evaluable_count": 1,
+    "by_kind": {
+      "configuration_error": 0,
+      "context_limit": 0,
+      "model_output_invalid": 0,
+      "output_limit": 0,
+      "provider_rejected": 0,
+      "resource_error": 0,
+      "step_limit": 0,
+      "time_limit": 1
+    },
+    "judge_incomplete_count": 0,
+    "judge_by_kind": {
+      "configuration_error": 0,
+      "context_limit": 0,
+      "model_output_invalid": 0,
+      "output_limit": 0,
+      "provider_rejected": 0,
+      "resource_error": 0,
+      "step_limit": 0,
+      "time_limit": 0
+    }
+  },
+  "outcome_unknown": 1,
+  "Judge_completed_at_capture": 74,
+  "Judge_total": 487,
+  "run_status_at_capture": "running",
+  "Judge_request_stats": {
+    "version": 1,
+    "requests_started": 175,
+    "responses_received": 175,
+    "request_errors": 0,
+    "http_429": 0,
+    "in_flight": 0,
+    "rate_waiting": 0,
+    "rate_wait_ms": 4253361.334373592,
+    "gate_waiting": 4,
+    "gate_wait_ms": 3622033.3136401605,
+    "gate_failures": 0,
+    "http_attempt_evidence_enabled": true,
+    "shared_gate_enabled": true,
+    "http_attempt_evidence_supported": true
+  },
+  "resource_samples": 355,
+  "resource_interval_seconds": 1989.935230731964,
+  "GPU_memory_peak_MiB": 21952.0,
+  "GPU_utilization_sample_mean_pct": 75.39154929577465,
+  "host_available_memory_min_GiB": 31.96258544921875,
+  "CPU_average_cores_sample_interval": {
+    "sentrix": 0.1695783836521527,
+    "photobench": 0.9185273830885796,
+    "bge": 0.07477630311880375,
+    "clip": 0.023875148932623422
+  },
+  "swap_out_pages_sample_delta": 15283,
+  "inference_locks_removed": [
+    "BGE forward",
+    "Chinese-CLIP text/image torch and ONNX forward"
+  ],
+  "reranker_in_this_legacy_deployment": false,
+  "snapshot_baseline_unchanged": true,
+  "functional_vector_checks": [
+    {
+      "role": "bge",
+      "dimension": 1024,
+      "max_abs_delta": 0.0,
+      "old_port": 18111,
+      "new_port": 18121
+    },
+    {
+      "role": "clip-text",
+      "dimension": 768,
+      "max_abs_delta": 0.0,
+      "old_port": 18113,
+      "new_port": 18123
+    },
+    {
+      "role": "clip-image",
+      "dimension": 768,
+      "max_abs_delta": 0.0,
+      "old_port": 18113,
+      "new_port": 18123
+    }
+  ],
+  "stress_test": false,
+  "matched_lock_on_control_run": false,
+  "maximum_safe_concurrency_certified": false,
+  "judge_excluded_from_QA_rate": true,
+  "items_status": {
+    "at": 1793333557.7696767,
+    "items": 487,
+    "execution_status": {
+      "completed": 486,
+      "outcome_unknown": 1
+    },
+    "turn_status": {
+      "partial": 417,
+      "complete": 70
+    },
+    "evaluation_status": {
+      "null": 486,
+      "not_evaluable": 1
+    },
+    "termination_reason": {
+      "answered_with_gap": 401,
+      "answered": 65,
+      "policy_refusal": 5,
+      "parse_failure": 2,
+      "planner_blocked": 14
+    },
+    "turn_count": 561,
+    "items_without_valid_answer": [
+      {
+        "qa_id": "album3v4-167",
+        "execution_status": "outcome_unknown",
+        "turn_status": "partial",
+        "evaluation_status": "not_evaluable",
+        "termination_reason": "planner_blocked",
+        "error_type": null,
+        "error": null,
+        "request_failure": null,
+        "operational_failure": null,
+        "wall_clock_ms": 1801140.8
+      }
+    ]
+  },
+  "QA_returned_results": 486,
+  "QA_result_per_minute": 13.676162266258277,
+  "QA_result_per_hour": 820.5697359754967,
+  "QA_per_minute_definition": "all 487 terminal records including one outcome_unknown; not 487 successful answers",
+  "first_486_results_sample_seconds": 1179.9713344573975,
+  "first_486_results_per_minute": 24.712464742551603,
+  "first_486_sample_uncertainty_seconds": 6,
+  "GPU_KV_peak_fraction": 0.14271749755620722,
+  "GPU_preemptions_max": 0.0,
+  "swap_out_MiB_sample_delta": 59.69921875
+}
