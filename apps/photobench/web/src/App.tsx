@@ -6,7 +6,7 @@
  * 并复刻 1.0 `App.vue`（只读权威）里唯一一处横跨全部区块的逻辑：`init()`（`:2731-2767`）。
  *
  * 两处视图切换照搬 1.0：只有 `activeView` 一个状态（`"runs"` / `"qa-browser"`），
- * 没有 URL 语义（计划 §2 裁决），所以不引 react-router。
+ * 用 ?run=<id> 直达已归档的运行详情；视图切换仍不引入 react-router。
  *
  * ## 组合层持有的跨切片状态
  *
@@ -197,6 +197,12 @@ export function App({ initialLoading = false }: AppProps) {
       return;
     }
     autoSelected.current = true;
+    const requestedRun = new URLSearchParams(window.location.search).get("run");
+    if (requestedRun && /^[A-Za-z0-9_-]{1,256}$/.test(requestedRun)) {
+      runs.selectRun({ run_id: requestedRun });
+      runs.startPolling();
+      return;
+    }
     const current = runs.runs.find((run) => ["running", "pending"].includes(String(run.status)));
     if (!current) return;
     runs.selectRun(current);
