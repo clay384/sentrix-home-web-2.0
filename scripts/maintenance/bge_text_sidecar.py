@@ -12,7 +12,6 @@ import contextlib
 import json
 import os
 import sys
-import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
@@ -31,7 +30,6 @@ _model = None
 _tokenizer = None
 _device = "cpu"
 _error = ""
-_lock = threading.Lock()
 _identity: dict[str, object] | None = None
 _identity_error = ""
 _identity_runtime: dict[str, object] = {}
@@ -105,7 +103,7 @@ def _embed(text: str) -> list[float]:
         max_length=max_length,
         return_tensors="pt",
     )
-    with _lock, torch.inference_mode():
+    with torch.inference_mode():
         outputs = _model(**inputs)
         hidden = outputs.last_hidden_state
         mask = inputs["attention_mask"].unsqueeze(-1).to(hidden.dtype)

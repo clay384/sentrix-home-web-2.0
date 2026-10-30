@@ -33,7 +33,6 @@ import contextlib
 import json
 import os
 import sys
-import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -74,7 +73,6 @@ _torch_preprocess = None
 _backend = ""  # BACKEND_ONNX | BACKEND_TORCH
 _device = "cpu"
 _error = ""
-_lock = threading.Lock()
 _identity: dict[str, object] | None = None
 _identity_error = ""
 _identity_runtime: dict[str, object] = {}
@@ -223,8 +221,7 @@ def _embed_image_onnx(path: str) -> list[float]:
     if not Path(path).is_file():
         raise FileNotFoundError(path)
     img = _preprocess_image_numpy(Image.open(path))
-    with _lock:
-        out = _img_session.run(None, {"image": img})[0]
+    out = _img_session.run(None, {"image": img})[0]
     return _normalize_numpy(out.astype(np.float32).flatten())
 
 
@@ -236,8 +233,7 @@ def _embed_query_onnx(text: str) -> list[float]:
     from cn_clip.clip import tokenize
 
     tokens = tokenize([str(text)], context_length=CONTEXT_LENGTH).numpy()
-    with _lock:
-        out = _txt_session.run(None, {"text": tokens})[0]
+    out = _txt_session.run(None, {"text": tokens})[0]
     return _normalize_numpy(out.astype(np.float32).flatten())
 
 
@@ -354,7 +350,7 @@ def _embed_image_torch(path: str) -> list[float]:
     if not Path(path).is_file():
         raise FileNotFoundError(path)
     image = _torch_preprocess(Image.open(path).convert("RGB")).unsqueeze(0).to(_device)
-    with _lock, torch.no_grad():
+    with torch.no_grad():
         vector = _torch_model.encode_image(image)
     return _normalize_list([float(v) for v in vector[0].cpu().tolist()])
 
@@ -366,7 +362,7 @@ def _embed_query_torch(text: str) -> list[float]:
     if _torch_model is None:
         raise RuntimeError(_error or "model not loaded")
     tokens = tokenize([str(text)]).to(_device)
-    with _lock, torch.no_grad():
+    with torch.no_grad():
         vector = _torch_model.encode_text(tokens)
     return _normalize_list([float(v) for v in vector[0].cpu().tolist()])
 
